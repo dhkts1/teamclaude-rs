@@ -232,12 +232,22 @@ final class PeersPanelStateWiringTests: XCTestCase {
         XCTAssertTrue(
             name < buttons,
             "the controls are drawn above the sentence they are an answer to")
-        let block = try XCTUnwrap(card.range(of: "\"Block\", PeerCommand.block")).lowerBound
-        let accept = try XCTUnwrap(card.range(of: "\"Accept\", PeerCommand.accept")).lowerBound
+        // Block is no longer a button on this row at all. It is forever, and
+        // it sat as the rightmost equal of two reversible answers; it is now
+        // in the row's own menu, destructive, asking before it writes, the
+        // shape the found row already uses. What is left in the button row is
+        // Ignore and Accept, the two ordinary answers.
+        XCTAssertFalse(
+            card.contains("\"Block\", PeerCommand.block"),
+            "Block is a same-weight button beside Ignore and Accept again, and it is the one "
+                + "answer on this card that cannot be taken back")
         XCTAssertTrue(
-            accept < block,
-            "the destructive control leads the row again: a card that opens with Block reads "
-                + "as a warning before anyone has read who is asking")
+            card.contains("blockMenu("),
+            "the knock row has no menu, so Block is reachable nowhere on the card")
+        XCTAssertTrue(
+            card.contains("arguments: PeerCommand.block(instance: knock.instanceId)"),
+            "the knock's Block no longer runs the instance-shaped verb, and the proposed "
+                + "name two knocks can share is not an identity")
     }
 
     /// A sheet that goes away takes its subprocess with it.
@@ -386,24 +396,33 @@ final class PeersPanelStateWiringTests: XCTestCase {
     func testAFoundRowCanBeBlocked() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let menu = try slice(
-            tab, from: "private func rowMenu(", to: "/// The glyph the live `Menu`")
+            tab, from: "private func rowMenu(", to: "/// One menu, for the two rows")
         XCTAssertTrue(
-            menu.contains("Button(\"Block \\(address)…\", role: .destructive) { blocking = row }"),
+            menu.contains("arguments: PeerCommand.block(address: address)"),
             "a found row cannot be blocked again, so an address can only be banned while it "
                 + "is knocking")
         XCTAssertTrue(
             menu.contains("row.trust != .trusted, let address = row.address"),
             "the menu is offered without an address to aim at, or on a trusted row whose "
                 + "trailing column has no width for it")
+        let shared = try slice(
+            tab, from: "private func blockMenu(", to: "/// The glyph the live `Menu`")
         XCTAssertTrue(
-            menu.contains("if snapshotMode {"),
+            shared.contains("Button(\"Block \\(address)…\", role: .destructive)"),
+            "the menu's one item is not the destructive Block any more")
+        XCTAssertTrue(
+            shared.contains("if snapshotMode {"),
             "the render harness draws a live Menu again, which ImageRenderer rasterises as "
                 + "the prohibited placeholder")
         let confirm = try slice(
             tab, from: "\"Block this Mac?\"", to: "private var blockingIsPresented")
         XCTAssertTrue(
-            confirm.contains("controller.run(PeerCommand.block(address: address))"),
-            "the tab's Block confirm no longer runs the address-shaped verb")
+            confirm.contains("controller.run(target.arguments)"),
+            "the tab's Block confirm no longer runs the argv the chosen row handed it")
+        XCTAssertTrue(
+            confirm.contains("Block \\(target.address)"),
+            "the question no longer names the address, which is the part an operator can "
+                + "check: a proposed name is a string the other Mac chose")
     }
 
     /// A trusted Mac can be blocked from its own sheet, which is where every

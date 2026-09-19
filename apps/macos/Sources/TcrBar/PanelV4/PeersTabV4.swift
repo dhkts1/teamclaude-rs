@@ -1009,6 +1009,27 @@ final class PeerController: ObservableObject {
     }
 }
 
+// MARK: - A Block that has been chosen and not yet confirmed
+
+/// What the Block confirm is about: the address the question names, and the
+/// argv the answer runs.
+///
+/// Both halves, built where the row was chosen, because they are not the same
+/// string and neither is derivable from the other. A found row is banned by
+/// ADDRESS; a knock is banned by its INSTANCE ID, the argument every verb on
+/// that card takes, because the name in a knock is only proposed and two
+/// knocks can propose one. The question still names the address either way:
+/// that is the part an operator can check.
+///
+/// One type rather than two confirms, so the sentence an operator reads
+/// before a ban cannot be written twice and drift.
+struct PeerBlockTarget: Identifiable, Equatable {
+    let address: String
+    let arguments: [String]
+
+    var id: String { arguments.joined(separator: " ") }
+}
+
 // MARK: - The tab
 
 /// The Peers tab: two switches, the Macs between them, and one count line.
@@ -1044,9 +1065,9 @@ struct PeersTabV4: View {
     /// is up. One value beside ``trusting`` for the same reason: two rows
     /// cannot start two pairings.
     @State private var pairing: PeerPairRun?
-    /// The row whose Block was chosen, while the confirm is up. Same reason:
-    /// one value, so two rows cannot arm two bans.
-    @State private var blocking: PeerRowModel?
+    /// The Block that was chosen, while the confirm is up. One value, so two
+    /// rows cannot arm two bans.
+    @State private var blocking: PeerBlockTarget?
 
     private var snapshot: PeersSnapshot { controller.snapshot }
 
@@ -1156,16 +1177,14 @@ struct PeersTabV4: View {
             isPresented: blockingIsPresented,
             titleVisibility: .visible,
             presenting: blocking
-        ) { row in
-            if let address = row.address {
-                Button("Block \(address)", role: .destructive) {
-                    controller.run(PeerCommand.block(address: address))
-                }
+        ) { target in
+            Button("Block \(target.address)", role: .destructive) {
+                controller.run(target.arguments)
             }
             Button("Cancel", role: .cancel) {}
-        } message: { row in
+        } message: { target in
             Text(
-                "Nothing from \(row.address ?? row.title) is answered again: its address, and "
+                "Nothing from \(target.address) is answered again: its address, and "
                     + "its key too once this Mac has learned one. A block does not lift by "
                     + "itself. Settings > Peers > Advanced is where it is lifted.")
         }
@@ -1564,27 +1583,45 @@ struct PeersTabV4: View {
     @ViewBuilder
     private func rowMenu(_ row: PeerRowModel) -> some View {
         if row.trust != .trusted, let address = row.address {
-            if snapshotMode {
-                // `ImageRenderer` rasterises a `Menu` as the macOS
-                // "prohibited" placeholder, measured again here, as
-                // `accountActionsMenu` records for the Accounts tab: the
-                // first render of this row drew a yellow circle-slash where
-                // the glyph goes. The still label is what the live panel
-                // shows, so the PNG pictures the control rather than the
-                // harness's own limit.
-                rowMenuLabel
-            } else {
-                Menu {
-                    Button("Block \(address)…", role: .destructive) { blocking = row }
-                } label: {
-                    rowMenuLabel
+            blockMenu(
+                address: address,
+                arguments: PeerCommand.block(address: address),
+                accessibilityLabel: "More for \(row.title)",
+                help: "Block this address, whether or not it is asking to connect.")
+        }
+    }
+
+    /// One menu, for the two rows that may ban: a found row and a knock.
+    ///
+    /// Its single item is destructive and it asks before it writes. Shared
+    /// rather than written twice, because the two rows differ in exactly one
+    /// thing, the argv, and a second spelling of a ban's own control is how
+    /// one of them ends up without a confirm in front of it.
+    @ViewBuilder
+    private func blockMenu(
+        address: String, arguments: [String], accessibilityLabel: String, help: String
+    ) -> some View {
+        if snapshotMode {
+            // `ImageRenderer` rasterises a `Menu` as the macOS "prohibited"
+            // placeholder, measured again here, as `accountActionsMenu`
+            // records for the Accounts tab: the first render of this row drew
+            // a yellow circle-slash where the glyph goes. The still label is
+            // what the live panel shows, so the PNG pictures the control
+            // rather than the harness's own limit.
+            rowMenuLabel
+        } else {
+            Menu {
+                Button("Block \(address)…", role: .destructive) {
+                    blocking = PeerBlockTarget(address: address, arguments: arguments)
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .accessibilityLabel("More for \(row.title)")
-                .help("Block this address, whether or not it is asking to connect.")
+            } label: {
+                rowMenuLabel
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel(accessibilityLabel)
+            .help(help)
         }
     }
 
@@ -1709,10 +1746,12 @@ struct PeersTabV4: View {
         // in-flight check watching the command it used to run, so a button
         // could be enabled on one argv and press another. Two spellings of
         // one decision, and the one that drifts is the one nobody reads.
-        // Block goes LAST: it is the destructive one, and a row that leads
-        // with the destructive verb reads as a warning before an operator has
-        // even read who is asking. Ignore and Accept are the two ordinary
-        // answers to "wants to connect" and sit together first.
+        // Block is NOT here. It is forever, and it sat as the rightmost equal
+        // of two reversible answers: Ignore is quiet for an hour, Accept opens
+        // a two-minute window, and the third button next to them never lifts
+        // by itself. It is in the row's own menu now, destructive and behind a
+        // confirm, the shape the found row already uses. What is left is the
+        // two ordinary answers to "wants to connect".
         let verbs: [(title: String, argv: [String], help: String, destructive: Bool)] = [
             (
                 "Ignore", PeerCommand.ignore(instance: knock.instanceId),
@@ -1725,12 +1764,6 @@ struct PeersTabV4: View {
                 "Opens a two-minute window for this one Mac. Both screens then show six "
                     + "digits and nothing is shared until you press Trust on both.",
                 false
-            ),
-            (
-                "Block", PeerCommand.block(instance: knock.instanceId),
-                "Never hear from that Mac again: its address, and its key too once this Mac "
-                    + "has learned one. Lift it in Settings > Peers > Advanced.",
-                true
             ),
         ]
         return V4Card {
@@ -1753,7 +1786,17 @@ struct PeersTabV4: View {
                 // (10.0.1.24) wants to connect" truncated to "loft-mini
                 // (10.0.1…" mid address, which is exactly the part an operator
                 // is meant to be able to check.
-                NameText(text: PeerAdmission.knockNameLine(knock), lineLimit: 2)
+                HStack(alignment: .top, spacing: V4.pillGap) {
+                    NameText(text: PeerAdmission.knockNameLine(knock), lineLimit: 2)
+                    Spacer(minLength: 0)
+                    // The ban, one press away from the row it is about and
+                    // never a button beside the two reversible answers.
+                    blockMenu(
+                        address: knock.addr,
+                        arguments: PeerCommand.block(instance: knock.instanceId),
+                        accessibilityLabel: "More for \(PeerAdmission.knockNameLine(knock))",
+                        help: "Block this address, whether or not it is asking to connect.")
+                }
                 if let address = PeerAdmission.knockAddressLine(knock) {
                     MuteText(text: address, lineLimit: 1)
                 }
