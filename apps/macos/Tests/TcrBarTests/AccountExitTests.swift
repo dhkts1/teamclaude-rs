@@ -169,6 +169,27 @@ final class AccountExitTests: XCTestCase {
         XCTAssertEqual(exit.note?.hasPrefix("\(id) is down."), true)
     }
 
+    // MARK: The must control's own label
+
+    /// The switch names what it does: `must use <peer>`, not a bare "must"
+    /// with no verb and no object.
+    func testMustLabelNamesTheChosenPeer() {
+        let exit = AccountExit(route: .via("studio-mac"), strict: true)
+        XCTAssertEqual(exit.mustLabel, "must use studio-mac")
+    }
+
+    /// The resolved form reads the peer's name through `peers`, the same way
+    /// every other readout on this row does, never the wire id.
+    func testMustLabelPeersResolvesTheNameThroughPeers() {
+        let id = "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G"
+        let peers = [PeerListDocument.PeerEntry(id: id, name: "studio-mac")]
+        let exit = AccountExit(route: .via(id), strict: true)
+        XCTAssertEqual(exit.mustLabel(peers: peers), "must use studio-mac")
+        // No document: the wire-id variant still carries the raw id, same
+        // caveat as `label`.
+        XCTAssertEqual(exit.mustLabel, "must use \(id)")
+    }
+
     // MARK: Argv
 
     func testTheArgvIsTheStateEachControlMovesTo() {

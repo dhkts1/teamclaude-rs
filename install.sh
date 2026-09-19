@@ -18,6 +18,7 @@
 set -u
 
 DIST_INSTALLER_URL="https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh"
+LATEST_RELEASE_URL="${TCR_LATEST_RELEASE_URL:-https://github.com/dhkts1/teamclaude-rs/releases/latest}"
 LATEST_RELEASE_API_URL="${TCR_LATEST_RELEASE_API_URL:-https://api.github.com/repos/dhkts1/teamclaude-rs/releases/latest}"
 DMG_URL_BASE="${TCR_DMG_URL_BASE:-https://github.com/dhkts1/teamclaude-rs/releases/download}"
 DMG_INSTALL_SCRIPT_URL="${TCR_DMG_INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/dhkts1/teamclaude-rs/main/scripts/install-tcrbar-from-dmg.sh}"
@@ -35,6 +36,10 @@ Env:
   TCR_APPLICATIONS_DIR
                   Where TcrBar.app is installed and looked for (default
                   /Applications). Test-only — a real machine has exactly one.
+  TCR_LATEST_RELEASE_URL, TCR_LATEST_RELEASE_API_URL
+                  Where the latest TcrBar release tag is resolved from: the
+                  redirect target of releases/latest (no API quota), then the
+                  releases/latest API as a fallback. Test-only.
   TCR_DMG_INSTALL_SCRIPT_URL
                   Where to fetch scripts/install-tcrbar-from-dmg.sh from when
                   this script has no local checkout to find it in, which is
@@ -106,15 +111,27 @@ validate_release_tag() {
   esac
 }
 
+# Resolution order: the redirect target of releases/latest first (a plain
+# 302, no API quota: a shared CI runner shares api.github.com's per-IP rate
+# limit with every other job on the host and gets 403'd there, 2026-09-19),
+# then the releases/latest API as a fallback for whoever set only
+# TCR_LATEST_RELEASE_API_URL. curl without -L does not follow the redirect;
+# %{redirect_url} reads the Location header off the 302 response itself,
+# which for GitHub ends in the tag: .../releases/tag/<tag>.
 echo "==> Resolving the latest TcrBar release…"
-release_json="$(curl -fsSL "$LATEST_RELEASE_API_URL")" || {
-  echo "could not reach $LATEST_RELEASE_API_URL — skipping the TcrBar install" >&2
-  exit 0
-}
-tag="$(printf '%s' "$release_json" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+tag=""
+redirect_target="$(curl -fsS -o /dev/null -w '%{redirect_url}' "$LATEST_RELEASE_URL" 2>/dev/null)"
+case "$redirect_target" in
+  */releases/tag/*) tag="${redirect_target##*/releases/tag/}" ;;
+esac
 
 if ! validate_release_tag "$tag"; then
-  echo "the latest-release API returned an unusable tag_name (${tag:-<empty>}) — skipping the TcrBar install" >&2
+  release_json="$(curl -fsSL "$LATEST_RELEASE_API_URL" 2>/dev/null)"
+  tag="$(printf '%s' "$release_json" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+fi
+
+if ! validate_release_tag "$tag"; then
+  echo "could not resolve the latest TcrBar release: tried the redirect at $LATEST_RELEASE_URL and the API at $LATEST_RELEASE_API_URL, skipping the TcrBar install" >&2
   exit 0
 fi
 

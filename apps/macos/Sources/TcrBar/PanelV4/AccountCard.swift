@@ -108,6 +108,19 @@ struct AccountCard<Actions: View>: View {
                 // card one stop and taken every per-account action with it.
                 actions()
             }
+            // An account must-locked to a down exit Mac must not read as
+            // healthy on OK's word alone. Putting a third badge in the
+            // header row beside OK, at the panel's real 372 pt width
+            // (`V4.panelWidth`), crowds the account's own name off the row
+            // entirely (`alice @example.com` clipped to `... M...`). Its own
+            // line, right aligned under the header, keeps the pill the first
+            // thing read after the name without taking the name's place.
+            if let waiting = exitWaitingPillText {
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    V4Pill(text: waiting, role: .warn, help: exitWaitingPillHelp)
+                }
+            }
             // One row per window in BOTH shapes, which is what the comment
             // here has claimed since #248 while the code drew them in one.
             // `if shape == .full` read as if it were the density switch it
@@ -271,6 +284,21 @@ struct AccountCard<Actions: View>: View {
     }
     private var kind: FleetTally.Kind {
         FleetTally.Kind(account: account)
+    }
+
+    /// The header's second pill: `waiting for <peer>`, the same wording
+    /// ``AccountExitRow`` draws under the picker, when this account is
+    /// must-locked to a Mac that is down right now. `nil` on every other
+    /// account, which draws no second pill at all.
+    private var exitWaitingPillText: String? {
+        exit?.waitingPill(peers: exitPeerRows)
+    }
+
+    /// The sentence behind the waiting pill, the same one
+    /// ``AccountExitRow`` attaches to its own waiting line.
+    private var exitWaitingPillHelp: String {
+        "This account is pinned to that Mac and may not use another address, so its "
+            + "requests wait until it is back."
     }
 
     private var statePillText: String {
