@@ -43,8 +43,8 @@
 //! typed refusal, not a panic, is what stops it.
 
 use tcr_peer_wire::{
-    Caps, Hello, Lease, LeaseGrant, LeaseReceipt, LeaseRefusal, LeaseRequest, LeaseUnit, Lendable,
-    NeighborBrief, PeerId, StreamHeader, StreamKind, Window,
+    Caps, Hello, InstanceId, Knock, Lease, LeaseGrant, LeaseReceipt, LeaseRefusal, LeaseRequest,
+    LeaseUnit, Lendable, NeighborBrief, PeerId, StreamHeader, StreamKind, Window,
 };
 use teamclaude_rs::peer::listener::{peer_stream_gate_rows, StreamRefusal};
 
@@ -166,6 +166,60 @@ fn hello_with_an_unknown_field_still_decodes_and_the_field_is_ignored() {
     assert_eq!(
         with_unknown, minimal,
         "an unrecognized key must be silently ignored, not change the decoded value"
+    );
+}
+
+/// The instance id both knock fixtures were written with.
+fn knocker_instance() -> InstanceId {
+    InstanceId::parse("a1b2c3d4e5f60718").expect("fixture instance id decodes")
+}
+
+/// A `Knock` with both of its optional fields populated: a proposed name and
+/// the port the knocker listens on, which is the port an Accept dials back to.
+///
+/// Watch it fail: change `"listenPort":7766` to `7755` in the fixture and this
+/// assertion reports a mismatched `Knock`, which is the same mismatch a
+/// responder would act on by dialling the wrong Mac.
+#[test]
+fn knock_full_decodes_to_the_expected_value() {
+    let knock: Knock =
+        serde_json::from_str(&fixture("knock_full.json")).expect("knock_full.json decodes");
+    assert_eq!(
+        knock,
+        Knock {
+            instance_id: knocker_instance(),
+            proposed_name: Some("laptop-knocker".to_string()),
+            wire_version: 1,
+            listen_port: Some(7766),
+        }
+    );
+}
+
+/// The same message with every optional field absent, which is exactly what a
+/// build from before `listenPort` existed writes: it decodes, and the missing
+/// port arrives as `None` rather than failing the frame or inventing a number.
+///
+/// Watch it fail: give `listen_port` a `#[serde(default = …)]` that answers
+/// `Some(7755)` in `crates/tcr-peer-wire/src/lib.rs`, which is the tempting
+/// wrong fix, and this reports `Some(7755)` where the frame said nothing. That
+/// guess is the defect the field exists to end: it is the port an answer used
+/// to be dialled to whatever the far Mac was really listening on.
+///
+/// Removing the `default` is NOT the mutation, and it was the first one tried
+/// here: serde reads a missing `Option` field as `None` on its own, so the
+/// attribute changes no behaviour and the test stayed green through it.
+#[test]
+fn knock_minimal_decodes_with_no_listen_port() {
+    let knock: Knock =
+        serde_json::from_str(&fixture("knock_minimal.json")).expect("knock_minimal.json decodes");
+    assert_eq!(
+        knock,
+        Knock {
+            instance_id: knocker_instance(),
+            proposed_name: None,
+            wire_version: 1,
+            listen_port: None,
+        }
     );
 }
 

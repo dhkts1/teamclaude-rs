@@ -1873,11 +1873,19 @@ where
             let addr = addr.to_string();
             let instance_id = knock.instance_id;
             let wire_version = knock.wire_version;
+            let listen_port = knock.listen_port;
             move || {
                 let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
                 let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
                 peer_state
-                    .record_knock(&addr, instance_id, proposed_name, wire_version, now_ms)
+                    .record_knock(
+                        &addr,
+                        instance_id,
+                        proposed_name,
+                        wire_version,
+                        listen_port,
+                        now_ms,
+                    )
                     .map_err(anyhow::Error::new)?;
                 crate::peer::state::save(&state_path, &peer_state)?;
                 Ok(peer_state.pending.len())
@@ -1908,8 +1916,17 @@ where
     // queue cap have all said yes.
     noise::write_knock_ack(stream, &mut session).await?;
 
+    // The port it says its own listener is on, which is what an Accept dials
+    // back to, beside the address it arrived from. `not-said` rather than an
+    // empty field: an older build sends no port at all, and a reader of this
+    // line who saw nothing there could not tell that apart from a port this
+    // line forgot to print.
+    let listen_port = knock
+        .listen_port
+        .map_or_else(|| "not-said".to_string(), |port| port.to_string());
     tracing::info!(
         peer_addr = %addr,
+        listen_port = %listen_port,
         instance = %knock.instance_id,
         wire_version = knock.wire_version,
         fresh = reservation_created,

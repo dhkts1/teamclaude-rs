@@ -73,6 +73,42 @@ final class PeerAdmissionTests: XCTestCase {
         XCTAssertEqual(PeerCommand.block(instance: "8f2c1ad6"), ["peer", "block", "8f2c1ad6"])
     }
 
+    /// **A knock whose row carries a port is answered at that port.**
+    ///
+    /// The pair-back is `tcr peer pair <address>` over the row's own address,
+    /// and that address comes from `tcr peer ls --json` unchanged. When the
+    /// knocking Mac said it listens on 7766, the dial has to be 7766: the panel
+    /// used to hand over a bare host, `tcr peer pair` filled in the default
+    /// port, and on a Mac whose listener is elsewhere the dial reached the
+    /// wrong listener and no digits ever appeared.
+    ///
+    /// Watched red: `PeerCommand.pair` built with a hard-coded `":7755"` on the
+    /// end passes the bare-host case below and fails this one; dropping the
+    /// port from the address in the Rust projection fails this one and passes
+    /// that one. Neither can be green at once unless the string is passed
+    /// through.
+    func testAKnockThatNamesItsPortIsPairedBackAtThatPort() {
+        let knock = PeerKnock(
+            addr: "192.0.2.24:7766", instanceId: "8f2c1ad63b0e4471", proposedName: "loft-mini")
+        XCTAssertEqual(
+            PeerCommand.pair(address: knock.addr),
+            ["peer", "pair", "192.0.2.24:7766"],
+            "the port the knock named is the port the answer dials")
+        XCTAssertEqual(
+            PeerCommand.pairJSON(address: knock.addr),
+            ["peer", "pair", "192.0.2.24:7766", "--json"],
+            "and the machine-readable run the panel actually spawns takes the same address")
+    }
+
+    /// A knock from a Mac that named no port pairs back to the bare host, and
+    /// the CLI fills in the default port. Nothing is appended here: a port
+    /// guessed in the panel would be a second place that decision is made.
+    func testAKnockWithNoPortIsPairedBackToTheBareHost() {
+        let knock = PeerKnock(addr: "192.0.2.24", instanceId: "8f2c1ad63b0e4471")
+        XCTAssertEqual(
+            PeerCommand.pair(address: knock.addr), ["peer", "pair", "192.0.2.24"])
+    }
+
     /// And Unblock takes the ADDRESS, a different argument from the other
     /// three, because a block outlives the boot the instance id belonged to.
     /// `src/main.rs:210-217` says so: "the address to unblock, as `tcr peer ls

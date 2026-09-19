@@ -1147,13 +1147,14 @@ fn every_wire_type_serializes_only_allowlisted_keys() {
             "Knock",
             serde_json::to_value(Knock {
                 instance_id: InstanceId([3_u8; INSTANCE_ID_BYTES]),
-                // The optional field is filled, so the expected set is exact
-                // in both directions.
+                // Both optional fields are filled, so the expected set is
+                // exact in both directions.
                 proposed_name: Some("laptop-2".to_string()),
                 wire_version: 1,
+                listen_port: Some(7766),
             })
             .expect("a Knock serializes"),
-            &["instanceId", "proposedName", "wireVersion"],
+            &["instanceId", "proposedName", "wireVersion", "listenPort"],
         ),
         // The lease scope, in this crate and on NO message. Both
         // keyed variants are sampled so the union check below knows `group`

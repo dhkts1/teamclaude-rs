@@ -365,6 +365,7 @@ async fn knock_at(addr: SocketAddr, id: InstanceId, name: Option<&str>) -> anyho
             instance_id: id,
             proposed_name: name.map(str::to_string),
             wire_version: PROTO_VERSION,
+            listen_port: None,
         },
         None,
     )
@@ -1068,6 +1069,7 @@ fn knock_of_serialized_len(id: InstanceId, target: usize) -> Knock {
         instance_id: id,
         proposed_name: Some(String::new()),
         wire_version: PROTO_VERSION,
+        listen_port: None,
     };
     let base = serde_json::to_vec(&probe)
         .expect("a knock serializes")
@@ -1079,6 +1081,7 @@ fn knock_of_serialized_len(id: InstanceId, target: usize) -> Knock {
         instance_id: id,
         proposed_name: Some("a".repeat(name_len)),
         wire_version: PROTO_VERSION,
+        listen_port: None,
     };
     assert_eq!(
         serde_json::to_vec(&knock)
@@ -1761,6 +1764,7 @@ fn a_stalled_connections_release_never_deletes_the_row_that_coalesced_onto_it() 
             real,
             Some("laptop-2".to_string()),
             PROTO_VERSION,
+            None,
             reserved_at + 5
         ),
         Ok(false),
@@ -1824,7 +1828,7 @@ fn an_accepted_window_is_shut_at_the_instant_it_expires_and_before_it_opens() {
     let addr = "192.0.2.77";
 
     value
-        .record_knock(addr, accepted, None, PROTO_VERSION, opened)
+        .record_knock(addr, accepted, None, PROTO_VERSION, None, opened)
         .expect("the knock is queued");
     let window = value
         .accept_knock(addr, opened, plan::PAIRING_WINDOW_SECS)

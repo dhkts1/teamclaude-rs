@@ -571,6 +571,15 @@ pub async fn knock(store: &PeerStore, addr: SocketAddr, proposed_name: &str) -> 
             instance_id: crate::peer::id::boot_instance_id(),
             proposed_name: name,
             wire_version: tcr_peer_wire::PROTO_VERSION,
+            // This Mac's own listening port, so the Accept at the other end
+            // has somewhere to dial back to: the source port of this
+            // connection is ephemeral and answering it reaches nothing.
+            //
+            // From the peers file, which is where the listener took its bind
+            // from at boot, and `None` when this Mac has no listener at all,
+            // which is the honest answer rather than the default port: a Mac
+            // with the feature off is not listening on it.
+            listen_port: file.listen.map(|listen| listen.port()),
         },
         file.network_key.as_ref().map(|key| key.as_bytes()),
     )
