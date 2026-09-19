@@ -187,7 +187,7 @@ struct PeersSnapshot: Equatable {
     // and the Blocked list one pane down are three readings of ONE document,
     // and two reads would see two instants.
 
-    /// Macs asking to pair. Nothing is pinned, carried or served until the
+    /// Macs asking to connect. Nothing is pinned, carried or served until the
     /// operator answers one of these.
     var pending: [PeerKnock] = []
     /// `pendingCount` as the producer counted it, which is not always
@@ -1062,7 +1062,7 @@ struct PeersTabV4: View {
                     onOpenGraph: { openGraph() }
                 )
                 .padding(.top, V4.cardGap)
-                // Decision row 10's own order: a request to pair sits ABOVE
+                // Decision row 10's own order: a request to connect sits ABOVE
                 // the list of Macs, because it is the one thing on this tab
                 // that is waiting on the operator. A found row is passive.
                 ForEach(snapshot.pending) { knock in
@@ -1410,7 +1410,7 @@ struct PeersTabV4: View {
                             // it SENDS a request. The six digits are phase 2
                             // and cannot appear until somebody on that Mac
                             // accepts, so this no longer promises them.
-                            help: "Asks \(row.title) to pair. Six digits appear on both "
+                            help: "Asks \(row.title) to connect. Six digits appear on both "
                                 + "screens once somebody there accepts, and nothing changes "
                                 + "before that.",
                             // One pairing at a time: the sheet IS the pairing,
@@ -1544,7 +1544,7 @@ struct PeersTabV4: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .accessibilityLabel("More for \(row.title)")
-                .help("Block this address, whether or not it is asking to pair.")
+                .help("Block this address, whether or not it is asking to connect.")
             }
         }
     }
@@ -1642,9 +1642,9 @@ struct PeersTabV4: View {
         }
     }
 
-    // MARK: A Mac asking to pair
+    // MARK: A Mac asking to connect
 
-    /// `<name> (<addr>) wants to pair`, with Accept, Ignore and Block.
+    /// `<name> (<addr>) wants to connect`, with Accept and Ignore.
     ///
     /// Decision row 10, and every word of it is load-bearing. **Nothing has
     /// happened yet**: a knock reveals no static key, so there is nothing
@@ -1673,7 +1673,7 @@ struct PeersTabV4: View {
         // Block goes LAST: it is the destructive one, and a row that leads
         // with the destructive verb reads as a warning before an operator has
         // even read who is asking. Ignore and Accept are the two ordinary
-        // answers to "wants to pair" and sit together first.
+        // answers to "wants to connect" and sit together first.
         let verbs: [(title: String, argv: [String], help: String, destructive: Bool)] = [
             (
                 "Ignore", PeerCommand.ignore(instance: knock.instanceId),
@@ -1704,14 +1704,14 @@ struct PeersTabV4: View {
                 // leading label to pay for it: three buttons squeezed the
                 // sentence to about 130 pt and it rendered `loft-mini wants
                 // t…`. The one line on this tab that says a stranger's Mac is
-                // asking to pair was cut mid-word, verb gone, in both
+                // asking to connect was cut mid-word, verb gone, in both
                 // appearances. Nothing about these three controls needs to be
                 // on the title's line.
                 //
                 // The proposed name (or the address, when no name was sent) on
                 // its own line, and the address ALWAYS on a second line rather
                 // than folded into one via `knockTitle`: "loft-mini
-                // (10.0.1.24) wants to pair" truncated to "loft-mini
+                // (10.0.1.24) wants to connect" truncated to "loft-mini
                 // (10.0.1…" mid address, which is exactly the part an operator
                 // is meant to be able to check.
                 NameText(text: PeerAdmission.knockNameLine(knock), lineLimit: 2)
@@ -2256,10 +2256,10 @@ struct PeerTrustSheet: View {
     private var cancelHelp: String {
         switch state {
         case .asking:
-            return "Stops waiting and ends the pairing here. The request stands on that Mac "
+            return "Stops waiting and ends this request here. The request stands on that Mac "
                 + "until somebody answers it or it expires."
         case .comparing:
-            return "Ends the pairing. Nothing is written and \(peerName) stays untrusted."
+            return "Ends this request. Nothing is written and \(peerName) stays untrusted."
         case .done, .refused, .cancelled:
             return "Closes this."
         }

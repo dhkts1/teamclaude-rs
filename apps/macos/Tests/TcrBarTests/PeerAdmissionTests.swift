@@ -14,16 +14,16 @@ final class PeerAdmissionTests: XCTestCase {
     func testTheKnockTitleCarriesBothTheNameAndTheAddress() {
         let knock = PeerKnock(
             addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471", proposedName: "loft-mini")
-        XCTAssertEqual(PeerAdmission.knockTitle(knock), "loft-mini (10.0.1.24) wants to pair")
+        XCTAssertEqual(PeerAdmission.knockTitle(knock), "loft-mini (10.0.1.24) wants to connect")
     }
 
     func testAKnockWithNoNameShowsItsAddressAlone() {
         let knock = PeerKnock(addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471")
-        XCTAssertEqual(PeerAdmission.knockTitle(knock), "10.0.1.24 wants to pair")
+        XCTAssertEqual(PeerAdmission.knockTitle(knock), "10.0.1.24 wants to connect")
         XCTAssertEqual(
             PeerAdmission.knockTitle(
                 PeerKnock(addr: "10.0.1.24", instanceId: "aa", proposedName: "")),
-            "10.0.1.24 wants to pair",
+            "10.0.1.24 wants to connect",
             "an empty name is the same state as no name and must not draw empty brackets")
     }
 
@@ -90,7 +90,7 @@ final class PeerAdmissionTests: XCTestCase {
         let byAddress = PeerBan(addr: "10.0.1.99", sinceMs: 1_699_989_200_000, reason: .blocked)
         XCTAssertEqual(
             PeerAdmission.blockSentence(byAddress, now: now),
-            "blocked 3h ago · you pressed Block on its pairing request")
+            "blocked 3h ago · you pressed Block on its request to connect")
 
         let withKey = PeerBan(
             addr: "10.0.1.99", key: "NNNN", sinceMs: 1_699_989_200_000,

@@ -138,7 +138,7 @@ public enum PeerPairState: Equatable, Sendable {
         case .comparing: return "Compare the digits with \(peerName)"
         case .done: return "\(peerName) is trusted"
         case .refused: return "\(peerName) was not trusted"
-        case .cancelled: return "Stopped pairing with \(peerName)"
+        case .cancelled: return "Stopped before \(peerName) was trusted"
         }
     }
 
@@ -160,8 +160,8 @@ public enum PeerPairState: Equatable, Sendable {
                 + "reading it."
         case .done(let peer):
             return "Its key is pinned here as \(peer). It can carry your encrypted bytes and "
-                + "open none of them; nothing is shared until you turn sharing on. Run the same "
-                + "pairing on that Mac, pointed back here, so both sides hold a pin."
+                + "open none of them; nothing is shared until you turn sharing on. Do the same "
+                + "on that Mac, pointed back here, so both sides hold a pin."
         case .refused(let message):
             return message
         case .cancelled:

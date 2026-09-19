@@ -145,7 +145,7 @@ public enum PeerBanReason: String, Decodable, Equatable, Sendable {
     public var sentence: String {
         switch self {
         case .blocked:
-            return "you pressed Block on its pairing request"
+            return "you pressed Block on its request to connect"
         case .forgottenAndBlocked:
             return "you stopped trusting it and blocked it in one act"
         case .unknown:
@@ -234,32 +234,39 @@ public struct PeerCaps: Decodable, Equatable, Sendable {
 /// The words the admission surfaces use, in one place so the tab and the pane
 /// cannot phrase the same request two ways.
 public enum PeerAdmission {
-    /// `loft-mini (10.0.1.24) wants to pair`, or the address alone when no
+    /// `loft-mini (10.0.1.24) wants to connect`, or the address alone when no
     /// name was proposed.
     ///
-    /// The name is in the sentence and the address is always beside it, which
-    /// is the mockup's own shape for scene 59 and not decoration: a proposed
-    /// name is a string a stranger on this network chose, so the address is
-    /// the part the operator can actually check.
+    /// The name is in the sentence and the address is always beside it: a
+    /// proposed name is a string a stranger on this network chose, so the
+    /// address is the part the operator can actually check.
+    ///
+    /// **`connect`, never `pair`.** Three words were used for one act on one
+    /// screen: the found row's button said Trust, this card said Accept, and
+    /// this headline said `wants to pair`. `pair` is the name of a CLI
+    /// subcommand, it is the first word a stranger's Mac says to somebody who
+    /// has never read the CLI, and the state it leads to is spelled `trusted`
+    /// everywhere else. One act, one vocabulary: a Mac wants to connect,
+    /// Accept opens the six-digit compare, and Trust is the last press.
     public static func knockTitle(_ knock: PeerKnock) -> String {
         guard let name = knock.proposedName, !name.isEmpty else {
-            return "\(knock.addr) wants to pair"
+            return "\(knock.addr) wants to connect"
         }
-        return "\(name) (\(knock.addr)) wants to pair"
+        return "\(name) (\(knock.addr)) wants to connect"
     }
 
     /// ``knockTitle`` without the address folded in: `loft-mini wants to
-    /// pair`, or the address alone when no name was proposed. Every renderer
-    /// of the knock CARD (as opposed to a spoken hint, where one line is
-    /// fine) draws this beside ``knockAddressLine`` rather than
+    /// connect`, or the address alone when no name was proposed. Every
+    /// renderer of the knock CARD (as opposed to a spoken hint, where one line
+    /// is fine) draws this beside ``knockAddressLine`` rather than
     /// ``knockTitle`` directly, because a one-line control truncating
-    /// `"loft-mini (10.0.1.24) wants to pair"` cuts the address mid-digit,
+    /// `"loft-mini (10.0.1.24) wants to connect"` cuts the address mid-digit,
     /// which is the one part of the sentence an operator is meant to check.
     public static func knockNameLine(_ knock: PeerKnock) -> String {
         guard let name = knock.proposedName, !name.isEmpty else {
-            return "\(knock.addr) wants to pair"
+            return "\(knock.addr) wants to connect"
         }
-        return "\(name) wants to pair"
+        return "\(name) wants to connect"
     }
 
     /// The address on its own line beside ``knockNameLine``, or `nil` when
