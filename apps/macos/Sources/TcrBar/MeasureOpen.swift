@@ -193,6 +193,29 @@ enum MeasureOpen {
         })
         line(0, "open 2, the openPanel call", secondCall, "main thread, blocking")
         line(0, "open 2, wait until drawn at size", secondSized, "after the call returned")
+
+        // The step that answers the complaint, and the only one here whose
+        // number a person could have told you without a stopwatch: how long
+        // after the click the figures on screen stop being the last tick's.
+        //
+        // Timed from the middle of the poll interval rather than from wherever
+        // the timer happened to be, so the run is repeatable and the number is
+        // the average case rather than a lucky or unlucky one: wait for a tick
+        // to land, sleep half an interval, then open. Whatever advances
+        // `lastPollAt` first is what the reader waited for.
+        shell.popover.animates = false
+        shell.closePanel()
+        _ = await waitUntil { !shell.popover.isShown }
+        let lastTick = shell.poller.lastPollAt
+        _ = await waitUntil { shell.poller.lastPollAt != lastTick }
+        try? await Task.sleep(
+            nanoseconds: UInt64(StatusPoller.defaultInterval / 2 * 1_000_000_000))
+        let anchor = shell.poller.lastPollAt
+        let fresh = await seconds(of: {
+            shell.openPanel()
+            _ = await waitUntil { shell.poller.lastPollAt != anchor }
+        })
+        line(0, "open 3, until the fleet on screen is fresh", fresh, "opened mid interval")
         // Last, and only after both opens: the two blocking calls `openPanel`
         // makes before it shows anything. Timed here rather than before open 1
         // because activating an app that is already frontmost is not the same

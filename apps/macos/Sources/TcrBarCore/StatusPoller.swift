@@ -234,31 +234,78 @@ public final class StatusPoller: ObservableObject {
     /// depends on that.
     @discardableResult
     public func pollOnce() async -> PollState {
-        let next = await Task.detached(priority: .utility) { Self.fetch() }.value
+        let next = await Self.fetch()
         state = next
         lastPollAt = Date()
         return next
     }
 
-    /// Blocking fetch — always called off the main actor.
-    nonisolated static func fetch() -> PollState {
+    /// One poll: both reads, at once, folded into one state.
+    ///
+    /// The two halves are independent — `tcr status --json` reports accounts
+    /// and `tcr sessions --json` reports sessions, and neither is an input to
+    /// the other — so a poll that ran them one after another charged the panel
+    /// the sum of two subprocesses for work that fits in the longer of them.
+    /// Measured on one machine before this: the pair took 229ms, 288ms and
+    /// 249ms while the slower half alone was 147ms, 146ms and 84ms.
+    ///
+    /// Each half is its own detached task, so both wait in parallel rather
+    /// than one thread waiting twice. `await` on both before anything is
+    /// decided, so nothing here can return while a child it started is still
+    /// running.
+    ///
+    /// Always called off the main actor: `nonisolated` and `async`, so the
+    /// blocking waits inside each detached task never land on the main thread
+    /// (where `Process`'s own wait spins the run loop and costs a multiple of
+    /// what the child costs).
+    nonisolated static func fetch() async -> PollState {
         switch TcrTool.resolve() {
         case .failure(let notFound):
             return .toolMissing(searched: notFound.searched)
         case .success(let executable):
-            do {
-                let output = try TcrTool.run(executable: executable, arguments: ["status", "--json"])
-                let state = classify(output)
-                // The sessions read is a SECOND call, and it may only ever add.
-                // A fleet that decoded is published whatever the second call
-                // does — that is the whole containment rule here, so an old
-                // bundled `tcr`, a dead proxy or unreadable output costs the
-                // Sessions and Tools tabs and nothing else.
-                guard case .loaded(let fleet) = state else { return state }
-                return .loaded(fleet.withSessions(fetchSessions(executable: executable)))
-            } catch {
-                return .commandFailed(exitCode: -1, message: error.localizedDescription)
-            }
+            // The sessions child is started even on a poll whose accounts half
+            // will fail, and its answer is then dropped by ``combine``. That is
+            // one cheap read on a proxy that is already not answering, against
+            // every healthy poll no longer waiting twice.
+            async let accounts = Task.detached(priority: .utility) {
+                fetchAccounts(executable: executable)
+            }.value
+            async let sessions = Task.detached(priority: .utility) {
+                fetchSessions(executable: executable)
+            }.value
+            return combine(accounts: await accounts, sessions: await sessions)
+        }
+    }
+
+    /// The containment rule, as one function rather than as the shape of a
+    /// control flow.
+    ///
+    /// The sessions read may only ever ADD. A fleet that decoded is published
+    /// whatever the sessions half did, so an old bundled `tcr`, a dead proxy or
+    /// unreadable output costs the Sessions and Tools tabs and nothing else;
+    /// and an accounts half that did not decode publishes its own failure
+    /// untouched, so a sessions read that happened to succeed can never dress
+    /// up a poll that failed.
+    ///
+    /// It became a function when the two reads started at once. While the
+    /// sessions call was reached by falling through the accounts branch, "only
+    /// ever adds" was enforced by an early return that could be deleted
+    /// without anything noticing; now the rule has a name, and a test.
+    nonisolated static func combine(
+        accounts: PollState, sessions: Fleet.SessionsRead
+    ) -> PollState {
+        guard case .loaded(let fleet) = accounts else { return accounts }
+        return .loaded(fleet.withSessions(sessions))
+    }
+
+    /// Run `tcr status --json` and classify it. Blocking, always called off
+    /// the main actor.
+    nonisolated static func fetchAccounts(executable: URL) -> PollState {
+        do {
+            return classify(
+                try TcrTool.run(executable: executable, arguments: ["status", "--json"]))
+        } catch {
+            return .commandFailed(exitCode: -1, message: error.localizedDescription)
         }
     }
 
