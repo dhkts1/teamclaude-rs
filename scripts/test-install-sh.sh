@@ -132,6 +132,10 @@ chmod +x "$FAKEBIN/pgrep"
 
 export TCR_SKIP_CLI=1
 export TCR_APPLICATIONS_DIR="$APPLICATIONS_DIR"
+# install.sh tries the redirect of releases/latest before the API; point it
+# at a closed local port so that lookup fails fast and falls through to the
+# local fake API below, keeping this test hermetic (no real github.com call).
+export TCR_LATEST_RELEASE_URL="http://127.0.0.1:9/dead"
 export TCR_LATEST_RELEASE_API_URL="http://127.0.0.1:${PORT}/releases/latest"
 export TCR_DMG_URL_BASE="http://127.0.0.1:${PORT}/releases/download"
 export TCR_DMG_INSTALL_SCRIPT_URL="http://127.0.0.1:${PORT}/install-tcrbar-from-dmg.sh"
