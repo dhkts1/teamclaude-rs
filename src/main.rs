@@ -186,6 +186,10 @@ mod peer_cli {
         NetworkKey(PeerNetworkKeyArgs),
         /// Print one link to share, which brings another Mac onto this mesh.
         Link(PeerLinkArgs),
+        /// Mint, or open, the sealed link one Mac sends one friend after it
+        /// changed networks. It carries an address and nothing else: it joins
+        /// nothing, grants nothing and pairs nothing.
+        Moved(PeerMovedArgs),
         /// Print what this Mac can be reached on from off its own LAN.
         Reach(PeerReachArgs),
         /// Let pinned Macs reach this one from off its own LAN. Off by
@@ -398,6 +402,50 @@ mod peer_cli {
         /// A name for the joining Mac, when `--invite` is given.
         #[arg(long)]
         pub label: Option<String>,
+    }
+
+    /// Which half of `tcr peer moved` is being run.
+    ///
+    /// A typed pair rather than two verbs, because the two are one feature and
+    /// a reader looking for either finds both, and rather than a bare string,
+    /// so a third spelling cannot appear at one call site and not another.
+    #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+    pub enum PeerMovedAction {
+        /// Print one link for one already-trusted Mac, saying where this Mac
+        /// is now.
+        Mint,
+        /// Read a link somebody sent: say which of this Mac's peers it is from
+        /// and where that Mac now is.
+        Open,
+    }
+
+    #[derive(clap::Args)]
+    pub struct PeerMovedArgs {
+        /// `mint` or `open`.
+        #[arg(value_enum)]
+        pub action: PeerMovedAction,
+        /// For `mint`: the peer id to seal for, in its full wire form, the
+        /// `node` field of `tcr peer ls --json`. For `open`: the
+        /// `tcr://peer/moved?…` link.
+        ///
+        /// **A link typed here is visible in `ps` to every process on this Mac
+        /// and in the shell history**, and `open` says so on stderr when it
+        /// finds one here. `--stdin` is the path that does not leak, and it is
+        /// the only one the panel and the `tcr://` handler use.
+        pub target: Option<String>,
+        /// For `open`: read the link from standard input, one line, so it never
+        /// enters this process's argument vector.
+        #[arg(long)]
+        pub stdin: bool,
+        /// For `open`: write the addresses. Without it `open` reads the link,
+        /// says what it would add, and changes nothing. No effect on `mint`.
+        #[arg(long)]
+        pub yes: bool,
+        /// Path to the peers file (default: ~/.config/tcr-peers.json). Also
+        /// selects the runtime-state file beside it and the node-key directory,
+        /// the same one-flag contract every other peer verb gives a test.
+        #[arg(long)]
+        pub peers: Option<PathBuf>,
     }
 
     /// On or off. A typed pair rather than a bare string, so a third spelling
@@ -2936,6 +2984,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        PeerAction::Moved(a) => run_peer_moved(a),
         PeerAction::Reach(a) => run_peer_reach(a),
         PeerAction::Internet(a) => {
             let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
@@ -3258,6 +3307,330 @@ async fn serve_peer_graph(
 /// its own percentage; the three loss bands below are this page's own
 /// addition, since a page has room for colour a text sub-line does not.
 const GRAPH_PAGE_HTML: &str = include_str!("peer_graph_page.html");
+
+/// `tcr peer moved mint|open`: the sealed link one Mac sends one friend after
+/// it changed networks.
+///
+/// Split out of [`run_peer`]'s match for the reason [`run_peer_network_key`]
+/// is: a verb with its own sub-verbs, folded in, makes the arms that matter
+/// harder to find.
+///
+/// # What a link can do to this Mac, and what makes that true
+///
+/// `open --yes` is the only writing path here, and what it writes goes through
+/// [`teamclaude_rs::peer::discovery::admissible_moved_endpoints`] and then
+/// [`teamclaude_rs::peer::config::observe_endpoints`], through nothing else.
+/// That pair is what makes the bound true by construction rather than by
+/// review: the second is the peers file's one endpoint writer and answers
+/// `Ok(false)` for a peer it does not already hold, so a link can never pin a
+/// Mac, un-forget one, or bring back a row an operator revoked; the first caps
+/// how much of a row a link may ever own and leaves every stronger endpoint
+/// alone, neither re-dated nor rewritten as a link's.
+///
+/// Nothing else on a row is reachable from here. No grant, no label, no
+/// network key, no switch: `observe_endpoints` writes `PeerRow::endpoints` and
+/// there is no second call.
+///
+/// # Two prefixes, one sentence each
+///
+/// A line this function wrote itself reads `peer moved: …`, the greppable
+/// shape every other verb uses. A refusal that came out of
+/// [`teamclaude_rs::peer::moved`] is printed in the module's own words, which
+/// start `moved link:`, rather than re-spelled here: one sentence with two
+/// spellings is two sentences that drift, and the prefix says which layer
+/// refused.
+fn run_peer_moved(args: peer_cli::PeerMovedArgs) -> anyhow::Result<()> {
+    let peers_path = args
+        .peers
+        .clone()
+        .unwrap_or_else(peer::config::default_path);
+    match args.action {
+        peer_cli::PeerMovedAction::Mint => run_peer_moved_mint(&args, &peers_path),
+        peer_cli::PeerMovedAction::Open => run_peer_moved_open(&args, &peers_path),
+    }
+}
+
+/// `tcr peer moved mint <peer>`: one link for one pinned Mac.
+///
+/// # Where the addresses come from, and the one that is left out
+///
+/// Two at most: the configured listen socket, which is what a peer on this LAN
+/// acts on, and the router mapping a serving process holds, which is what a
+/// peer off it acts on. The mapping is read off the runtime-state file the way
+/// [`run_peer_reach`] reads it, and for the reason that function states: the
+/// register [`teamclaude_rs::peer::reach::external_socket`] answers from is
+/// filled by a keeper thread, a CLI process has run none, so asking it here
+/// would silently ship the LAN socket alone on a Mac whose mapping is live. A
+/// record past its deadline reads as no mapping.
+///
+/// `PeerRow::sees_us_at`, the address that peer last said it sees this Mac at,
+/// is left out **on purpose**. It is written per completed session, and in the
+/// case this feature exists for no session has completed since the move, so it
+/// holds the address this Mac had BEFORE it moved. A link headed "here is
+/// where I am now" carrying it would ship a known wrong answer.
+fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> anyhow::Result<()> {
+    if args.stdin {
+        anyhow::bail!(
+            "peer moved: `--stdin` is how `open` reads a link; `mint` takes the peer id to \
+             seal for"
+        );
+    }
+    let Some(target) = args.target.as_deref() else {
+        anyhow::bail!(
+            "peer moved: `mint` needs the Mac to seal for, in its full wire form, the `node` \
+             field of `tcr peer ls --json`"
+        );
+    };
+    let peer_id = tcr_peer_wire::PeerId::parse(target)
+        .map_err(|refusal| anyhow::anyhow!("peer moved: {refusal}"))?;
+
+    let file = peer::config::read_or_default(peers_path)?;
+    let Some(row) = file.peers.iter().find(|row| row.node == peer_id) else {
+        anyhow::bail!(
+            "peer moved: that Mac is not pinned here, and a link for one this Mac does not \
+             trust would have no key to be sealed under (`tcr peer ls` lists the pinned ones)"
+        );
+    };
+    // The option is handed over whole. There is no default to reach for: a row
+    // with no secret is the one case this verb cannot serve, and sealing under
+    // thirty-two zero bytes instead would be a key anybody can guess.
+    let keys = peer::moved::MovedKeys::for_row(row.rendezvous_secret.as_ref())
+        .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+
+    let now_ms = peer::pair::now_ms();
+    let held = peer::state::load(&peer_state_path(peers_path), now_ms)
+        .ok()
+        .and_then(|state| state.mapping)
+        .filter(|record| record.expires_at_ms > now_ms);
+
+    let mut addresses: Vec<std::net::SocketAddr> = Vec::new();
+    if let Some(listen) = file.listen {
+        addresses.push(listen);
+    }
+    if let Some(record) = &held {
+        match record.external_address.as_deref() {
+            Some(text) => match text.parse::<std::net::SocketAddr>() {
+                Ok(addr) => addresses.push(addr),
+                // Said out loud rather than skipped: a held mapping this verb
+                // could not read is the difference between a link a friend off
+                // the LAN can act on and one they cannot.
+                Err(why) => println!(
+                    "peer moved: the held mapping's external address did not parse ({why}), \
+                     so this link carries the listen socket alone"
+                ),
+            },
+            None => println!(
+                "peer moved: the router mapped a port and would not name its own external \
+                 address, so this link carries the listen socket alone"
+            ),
+        }
+    }
+    let mut carried: Vec<std::net::SocketAddr> = Vec::new();
+    for addr in addresses {
+        if !carried.contains(&addr) {
+            carried.push(addr);
+        }
+    }
+    carried.truncate(peer::drop::MAX_RECORD_ENDPOINTS);
+    if carried.is_empty() {
+        anyhow::bail!(
+            "peer moved: this Mac has no address to put in a link: no peer listener is \
+             configured and no serving process holds a router mapping. `tcr peer reach` \
+             says what this Mac can be reached on, and `tcr peer internet on` is what asks \
+             the router for the second one"
+        );
+    }
+
+    let config_dir = peers_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(peer::id::default_config_dir);
+    let this = peer::id::NodeKey::load_or_mint(&config_dir)?.id();
+
+    let record = peer::moved::MovedRecord {
+        v: peer::moved::MOVED_VERSION,
+        at: now_unix_secs(),
+        eps: carried,
+    };
+    let link = peer::moved::mint_link(&keys, &this, &record)
+        .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+
+    println!("{link}");
+    println!(
+        "peer moved: sealed for {}; only that Mac can read it, and it goes stale in {} hours",
+        masked_label(&row.label),
+        peer::moved::MAX_MOVED_AGE.as_secs() / 3_600
+    );
+    println!(
+        "peer moved: it carries {} address(es) and nothing else: it joins nothing, grants \
+         nothing and pairs nothing",
+        record.eps.len()
+    );
+    Ok(())
+}
+
+/// `tcr peer moved open [link]`: read a link somebody sent, and write only when
+/// the operator said so.
+///
+/// # Every pinned row is tried, and they all answer alike
+///
+/// The link carries no peer id, so the row whose key opens it IS the answer.
+/// What that costs is a loop, and the loop's one rule is that its refusal must
+/// not depend on the rows it walked: a link forwarded into the wrong group chat
+/// must teach its reader nothing about whose Mac it was for or whether this Mac
+/// came close. Every key that did not open it answers
+/// [`teamclaude_rs::peer::moved::MovedRefusal::NotForThisMac`], which is one
+/// sentence naming nothing, and the only refusals that can outrank it are the
+/// ones decided after a key DID open the bytes.
+fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> anyhow::Result<()> {
+    let raw = match (args.stdin, args.target.as_deref()) {
+        (true, Some(_)) => anyhow::bail!(
+            "peer moved: the link goes on the command line or on standard input, not both"
+        ),
+        (true, None) => {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+                .context("peer moved: could not read the link from standard input")?;
+            if line.trim().is_empty() {
+                anyhow::bail!(
+                    "peer moved: standard input carried no link (`--stdin` expects one line)"
+                );
+            }
+            line
+        }
+        (false, Some(text)) => {
+            // On stderr, so a panel or a script reading stdout sees the same
+            // lines whichever way the link arrived.
+            eprintln!(
+                "peer moved: a link typed on the command line is visible in `ps` to every \
+                 process on this Mac and in this shell's history; `--stdin` is the path that \
+                 does not leak, and it is the one the panel uses"
+            );
+            text.to_string()
+        }
+        (false, None) => anyhow::bail!(
+            "peer moved: `open` needs a link, on the command line or on standard input with \
+             `--stdin`"
+        ),
+    };
+
+    let field = peer::moved::link_field(&raw).map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+    let now_s = now_unix_secs();
+    let now_ms = peer::pair::now_ms();
+    let file = peer::config::read_or_default(peers_path)?;
+
+    let mut opened = None;
+    let mut past_the_seal = None;
+    for row in &file.peers {
+        // A row with no shared secret has no key to try, and that is not an
+        // error: its own doc says absent means no session has completed since
+        // the key existed.
+        let Ok(keys) = peer::moved::MovedKeys::for_row(row.rendezvous_secret.as_ref()) else {
+            continue;
+        };
+        match peer::moved::open_link_field(&keys, &row.node, field, now_s) {
+            Ok(record) => {
+                opened = Some((row, record));
+                break;
+            }
+            // Everything except "this key did not open it" was decided either
+            // before any key was tried, which makes it the same for every row,
+            // or after one opened the bytes, which makes it that row's own
+            // diagnosis. Either way it outranks the quiet refusal and stops the
+            // walk.
+            Err(peer::moved::MovedRefusal::NotForThisMac) => continue,
+            Err(refusal) => {
+                past_the_seal = Some(refusal);
+                break;
+            }
+        }
+    }
+
+    let Some((row, record)) = opened else {
+        let refusal = past_the_seal.unwrap_or(peer::moved::MovedRefusal::NotForThisMac);
+        println!(
+            "peer moved: nothing was written and no row was created; a link only ever adds \
+             an address to a Mac this one already pins"
+        );
+        return Err(anyhow::anyhow!("{refusal}"));
+    };
+
+    let label = masked_label(&row.label);
+    println!(
+        "peer moved: from {label} ({}), sealed {}s ago",
+        row.node.display(),
+        now_s.saturating_sub(record.at)
+    );
+
+    let learned: Vec<peer::config::Endpoint> = record
+        .eps
+        .iter()
+        .map(|addr| {
+            peer::config::Endpoint::direct(*addr, now_ms, peer::config::EndpointSource::Moved)
+        })
+        .collect();
+    let admissible = peer::discovery::admissible_moved_endpoints(row, &learned);
+    // What is already on the row is dropped here rather than refreshed, which
+    // is the whole of a second paste of one link costing nothing: the admission
+    // rules refresh a locator this band already holds, and refreshing rewrites
+    // the operator's file to move one timestamp. A person pasting the same link
+    // twice is telling this Mac what it already knows.
+    let fresh: Vec<peer::config::Endpoint> = admissible
+        .into_iter()
+        .filter(|endpoint| {
+            !row.endpoints
+                .iter()
+                .any(|held| held.locator == endpoint.locator)
+        })
+        .collect();
+
+    if fresh.is_empty() {
+        let all_held = learned.iter().all(|endpoint| {
+            row.endpoints
+                .iter()
+                .any(|held| held.locator == endpoint.locator)
+        });
+        if all_held {
+            println!(
+                "peer moved: already-known; that Mac is already reachable at everything this \
+                 link says, so nothing was written"
+            );
+        } else {
+            println!(
+                "peer moved: nothing written; this row already holds the {} addresses a link \
+                 may ever add to one, and the rest of its slots are for what this Mac proved",
+                peer::discovery::MAX_MOVED_ENDPOINTS_PER_PEER
+            );
+        }
+        return Ok(());
+    }
+
+    if !args.yes {
+        for endpoint in &fresh {
+            match endpoint.direct_addr() {
+                Some(addr) => println!("peer moved: would add {addr}"),
+                None => println!("peer moved: would add a path that is not a socket"),
+            }
+        }
+        println!("peer moved: nothing written; pass --yes to keep these");
+        return Ok(());
+    }
+
+    let node = row.node;
+    let wrote = peer::config::observe_endpoints(peers_path, &node, &fresh)?;
+    if !wrote {
+        println!(
+            "peer moved: that Mac has no row here now, so nothing was written; a link never \
+             creates one"
+        );
+        return Ok(());
+    }
+    println!(
+        "peer moved: added {} address(es) to {label}; nothing else changed",
+        fresh.len()
+    );
+    Ok(())
+}
 
 /// `tcr peer reach`: the three ways a Mac off this LAN could reach this one.
 ///

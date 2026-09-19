@@ -1178,6 +1178,19 @@ impl JoinInput {
         if raw.starts_with(TOKEN_PREFIX) {
             return JoinToken::parse(raw).map(Self::Key);
         }
+        // The third shape names itself and stops there. `tcr peer moved open`
+        // is the OTHER link under this scheme, and the two are easy to confuse
+        // in a chat window where both are one opaque line: a person who pasted
+        // the wrong one is told which verb reads it rather than left to read
+        // "neither of these" about a string that plainly starts `tcr://peer/`.
+        // Nothing about it is parsed here, and no part of the paste is printed.
+        if raw.starts_with(crate::peer::moved::MOVED_LINK_PREFIX) {
+            bail!(
+                "peer join: that is a moved link, which says where a Mac you already trust \
+                 is now. `tcr peer moved open --stdin` is what reads one; it joins nothing \
+                 and pairs nothing, so `tcr peer join` cannot act on it"
+            )
+        }
         bail!(
             "peer join: this is neither a share link ({LINK_PREFIX}…) nor a join key \
              ({TOKEN_PREFIX}…). Nothing is printed back, because a paste that failed to \

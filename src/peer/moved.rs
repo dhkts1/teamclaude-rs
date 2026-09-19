@@ -29,11 +29,13 @@
 //! policy: its own magic, its own versioned domain strings, its own age
 //! ceiling, and refusals written for a person who pasted something.
 //!
-//! # Nothing calls this yet
+//! # What this file owns, and what it leaves to its caller
 //!
-//! This file is the seal and the refusals. There is no verb, no URL parser, no
-//! peers-file access and no clock of its own: `now_s` arrives as a parameter,
-//! the way [`crate::peer::drop::open`] takes one. None of this runs at boot.
+//! The seal, the link's two wire forms, and the refusals. No peers-file access,
+//! no I/O of any kind, and no clock of its own: `now_s` arrives as a parameter,
+//! the way [`crate::peer::drop::open`] takes one. `tcr peer moved` owns the
+//! file, the addresses and the operator's `--yes`, and neither side reaches
+//! into the other. Nothing here runs at boot.
 //!
 //! # Nothing here prints key material or link text
 //!
@@ -76,6 +78,15 @@ const MOVED_CONTEXT: &[u8] = b"tcr peer moved v1";
 /// The link's first four bytes, outside the seal on purpose, so "this is not
 /// one of ours at all" is a different refusal from "this did not open".
 const MOVED_MAGIC: [u8; 4] = *b"TCRM";
+
+/// The scheme and path every moved link starts with.
+///
+/// A second path under `tcr://peer/` rather than a second scheme, which is what
+/// [`crate::peer::pair::LINK_PREFIX`]'s own doc left room for: macOS hands the
+/// whole URL to the app that registered the scheme, so the path is what says
+/// which of the two verbs a person is about to run, in the one place they read
+/// before clicking.
+pub const MOVED_LINK_PREFIX: &str = "tcr://peer/moved?";
 
 /// The only format version, outside the seal and inside it.
 pub const MOVED_VERSION: u8 = 1;
@@ -241,12 +252,12 @@ pub enum MintRefusal {
 
 /// Why a link that arrived was not applied.
 ///
-/// Six variants because four of the six things that go wrong with a link are
-/// the person's own and each has a different fix: a link meant for somebody
-/// else, one that sat too long, one a chat app cut in half, and one from a
-/// build that is not this one. A refusal that answers one word for all of them
-/// is one nobody can act on, which is [`crate::peer::drop::RecordRefusal`]'s
-/// own argument applied to a different reader.
+/// One variant per thing that can go wrong, because most of them are the
+/// person's own and each has a different fix: a link meant for somebody else,
+/// one that sat too long, one a chat app cut in half, and one from a build that
+/// is not this one. A refusal that answers one word for all of them is one
+/// nobody can act on, which is [`crate::peer::drop::RecordRefusal`]'s own
+/// argument applied to a different reader.
 ///
 /// # No variant names anything
 ///
@@ -302,6 +313,18 @@ pub enum MovedRefusal {
         "moved link: that link is {age_s}s old, past the {max_s}s ceiling; ask for a fresh one"
     )]
     Stale { age_s: u64, max_s: u64 },
+    /// The link carries a query field this build does not know.
+    ///
+    /// Refused rather than ignored, and the field is not named back: acting on
+    /// a link is a decision taken in one click, so half of what the sender
+    /// meant is worse than none of it, and the value of a field this build
+    /// cannot read is still somebody's pasted text.
+    #[error(
+        "moved link: that link carries a field this build does not know, and a link is \
+         acted on in one press, so it is refused rather than half read; one of the two \
+         Macs needs updating"
+    )]
+    UnknownField,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +349,9 @@ fn associated_data(publisher: &PeerId) -> Vec<u8> {
 
 /// Seal `record`, from `publisher`, into the framed bytes a link carries.
 ///
-/// `publisher` is the peer this link is FOR, as the sender knows it: the
-/// receiver supplies its own side of the same pair when it opens. It is
+/// `publisher` is the Mac that minted the link, its own peer id. The reader
+/// supplies the same id off the row it is trying, where it already holds the
+/// sender's, so a link only opens against the row it was sealed for. It is
 /// authenticated and not encrypted, and it does not appear in the plaintext.
 pub fn seal_link(
     keys: &MovedKeys,
@@ -486,4 +510,78 @@ pub fn open_link_field(
 ) -> Result<MovedRecord, MovedRefusal> {
     let sealed = decode_bytes(field).map_err(|_| MovedRefusal::CutShort)?;
     open_link(keys, expected_publisher, &sealed, now_s)
+}
+
+// ---------------------------------------------------------------------------
+// The link a person actually pastes
+// ---------------------------------------------------------------------------
+
+/// The whole link: [`MOVED_LINK_PREFIX`], the version, and the sealed field.
+///
+/// Rendered here and read back by [`link_field`] below, so the two halves of
+/// one wire form sit in one file. Percent-encoding is deliberately not applied
+/// and deliberately not needed, the reason
+/// [`crate::peer::pair::ShareLink::to_link`] gives: the field is Crockford
+/// base32 and none of that alphabet is reserved in a query string.
+pub fn mint_link(
+    keys: &MovedKeys,
+    publisher: &PeerId,
+    record: &MovedRecord,
+) -> Result<String, MintRefusal> {
+    let field = seal_link_field(keys, publisher, record)?;
+    Ok(format!("{MOVED_LINK_PREFIX}v={MOVED_VERSION}&r={field}"))
+}
+
+/// The `r=` field of a pasted link, with the version checked first.
+///
+/// Collected first, decided second, the order
+/// [`crate::peer::pair::ShareLink::parse`] settled: reading a field as it goes
+/// past makes the refusal depend on which order the sender's build happened to
+/// write the query in, so a link from a version this build cannot read gets
+/// refused for whichever field came first rather than for its version.
+///
+/// **Nothing here prints a field value.** What a person pasted is not echoed
+/// back at them, for the reason that module gives about its own two fields: the
+/// place a link is pasted is a terminal that keeps scrollback.
+///
+/// A link with no `r=` at all is [`MovedRefusal::CutShort`] rather than a
+/// refusal of its own. The field is last, so losing it is what a chat client's
+/// character limit actually does to one of these, and "paste the whole line
+/// again" is the thing to do about it either way.
+pub fn link_field(link: &str) -> Result<&str, MovedRefusal> {
+    let link = link.trim();
+    let Some(query) = link.strip_prefix(MOVED_LINK_PREFIX) else {
+        return Err(MovedRefusal::NotALink);
+    };
+
+    let mut version = None;
+    let mut sealed = None;
+    for field in query.split('&') {
+        let Some((key, value)) = field.split_once('=') else {
+            return Err(MovedRefusal::CutShort);
+        };
+        match key {
+            "v" => version = Some(value),
+            "r" => sealed = Some(value),
+            _ => return Err(MovedRefusal::UnknownField),
+        }
+    }
+
+    let Some(version) = version else {
+        return Err(MovedRefusal::CutShort);
+    };
+    // A version field that is not a number at all is not a link whose version
+    // this build is behind: it is a string that does not fit the shape, so it
+    // gets the shape's refusal rather than a version number invented to fill
+    // the sentence.
+    let Ok(found) = version.parse::<u8>() else {
+        return Err(MovedRefusal::NotALink);
+    };
+    if found != MOVED_VERSION {
+        return Err(MovedRefusal::Version {
+            found,
+            expected: MOVED_VERSION,
+        });
+    }
+    sealed.ok_or(MovedRefusal::CutShort)
 }

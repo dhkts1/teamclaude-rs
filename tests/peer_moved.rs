@@ -2,12 +2,14 @@
 //! key, the framing, the round trip through base32, and every refusal a reader
 //! can answer with.
 //!
-//! # Nothing here touches a network or a file
+//! # Nothing here touches a network, and every file is a temp one
 //!
-//! There is no listener, no temp file and no store in this file. It is pure
-//! computation over fixed inputs, so it cannot reach the proxy on
-//! `127.0.0.1:3456`, the operator's config directory, or anything else outside
-//! the test process.
+//! The tests about the seal are pure computation over fixed inputs. The ones
+//! about the two verbs spawn the `tcr` this build produced against peers files
+//! under the system temp directory, one per test, and the only addresses in any
+//! of them are documentation ranges nothing can be listening on. Nothing here
+//! binds a socket, dials anything, or reads the operator's own config
+//! directory, so none of it can reach the proxy on `127.0.0.1:3456`.
 //!
 //! # The values are obviously synthetic
 //!
@@ -668,4 +670,449 @@ fn a_moved_endpoint_sorts_behind_a_brief_and_beside_a_drop() {
 /// from a broken one.
 fn crate_min_link_bytes() -> usize {
     4 + 1 + 12 + 16 + 1
+}
+
+// ---------------------------------------------------------------------------
+// The two verbs, against the `tcr` this build produced
+// ---------------------------------------------------------------------------
+
+/// A temp directory of this test's own, named for the test and the thread, so
+/// two of these running at once cannot read each other's peers file.
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "tcr-peer-moved-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clear the scratch dir");
+    }
+    std::fs::create_dir_all(&dir).expect("create the scratch dir");
+    dir
+}
+
+/// The pair secret as a peers file spells it: 64 hex characters, the same
+/// counting pattern the sealed tests above run on.
+fn counting_secret_hex() -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in counting_secret() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// Write a peers file the store will read: JSON text, mode 0600.
+///
+/// Text rather than through `PeerFile`, the reason `tests/peer_reach.rs` gives
+/// for its own: these tests are about what the verb prints, and going through
+/// the config structs would make them fail to COMPILE every time a field lands
+/// elsewhere, which is a different failure from the one they exist to report.
+fn write_peers(path: &std::path::Path, body: &str) {
+    std::fs::write(path, body).expect("write the peers file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 on the peers file");
+    }
+}
+
+/// The address the Mac that moved says it listens on.
+const SENDER_LISTEN: &str = "192.0.2.5:41234";
+
+/// The peers file of the Mac that moved: a listener, and one pinned friend
+/// holding the pair secret.
+///
+/// `sees_us_at` is the address that friend last said it sees this Mac at, for
+/// the one test that is about leaving it out.
+fn sender_peers(dir: &std::path::Path, sees_us_at: Option<&str>) -> std::path::PathBuf {
+    let friend = peer_id(0x22).to_wire();
+    let secret = counting_secret_hex();
+    let seen = match sees_us_at {
+        Some(addr) => format!(",\n      \"seesUsAt\": [\"{addr}\", 1700000000000]"),
+        None => String::new(),
+    };
+    let body = format!(
+        r#"{{
+  "listen": "{SENDER_LISTEN}",
+  "peers": [
+    {{
+      "node": "{friend}",
+      "label": "attic-nuc",
+      "addedAt": 1,
+      "rendezvousSecret": "{secret}"{seen}
+    }}
+  ]
+}}"#
+    );
+    let path = dir.join("tcr-peers.json");
+    write_peers(&path, &body);
+    path
+}
+
+/// The friend's peers file: one pinned row for the Mac that moved, holding the
+/// same pair secret, and no endpoint at all, which is the state this whole
+/// feature exists for.
+fn receiver_peers(dir: &std::path::Path, sender: &PeerId) -> std::path::PathBuf {
+    let node = sender.to_wire();
+    let secret = counting_secret_hex();
+    let body = format!(
+        r#"{{
+  "peers": [
+    {{
+      "node": "{node}",
+      "label": "studio-mac",
+      "addedAt": 1,
+      "rendezvousSecret": "{secret}"
+    }}
+  ]
+}}"#
+    );
+    let path = dir.join("tcr-peers.json");
+    write_peers(&path, &body);
+    path
+}
+
+/// The id `mint` minted for the Mac that moved, read off the public half it
+/// wrote beside the peers file.
+fn sender_id(dir: &std::path::Path) -> PeerId {
+    let raw = std::fs::read(teamclaude_rs::peer::id::public_key_path(dir))
+        .expect("mint wrote this Mac's public key beside the peers file");
+    let bytes: [u8; 32] = raw
+        .try_into()
+        .expect("a static public key is exactly 32 bytes");
+    PeerId(bytes)
+}
+
+/// Run `tcr peer moved …` against one peers file: `(stdout, stderr, ok)`.
+///
+/// `stdin_line` is the link when the run reads one that way, which is the path
+/// that keeps it out of `ps` and out of this test's own argv.
+fn run_moved(
+    peers: &std::path::Path,
+    extra: &[&str],
+    stdin_line: Option<&str>,
+) -> (String, String, bool) {
+    use std::io::Write as _;
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"));
+    command
+        .args(["peer", "moved"])
+        .args(extra)
+        .args(["--peers", peers.to_str().expect("a utf-8 path")])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("spawn tcr peer moved");
+    {
+        let mut stdin = child.stdin.take().expect("the child's stdin is piped");
+        if let Some(line) = stdin_line {
+            writeln!(stdin, "{line}").expect("write the link to the child");
+        }
+    }
+    let output = child.wait_with_output().expect("wait for tcr peer moved");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// The link off a `mint` run's output: the one line that is the link itself.
+fn link_from(out: &str) -> String {
+    out.lines()
+        .find(|line| line.starts_with("tcr://peer/moved?"))
+        .unwrap_or_else(|| panic!("mint printed no link:\n{out}"))
+        .to_string()
+}
+
+/// Mint on the Mac that moved and hand back the link and the friend's peers
+/// file, ready to open it.
+fn minted(tag: &str, sees_us_at: Option<&str>) -> (String, std::path::PathBuf) {
+    let sender_dir = scratch(&format!("{tag}-sender"));
+    let sender = sender_peers(&sender_dir, sees_us_at);
+    let (out, err, ok) = run_moved(&sender, &["mint", &peer_id(0x22).to_wire()], None);
+    assert!(ok, "mint exited non-zero: {err}\n{out}");
+
+    let receiver_dir = scratch(&format!("{tag}-receiver"));
+    let receiver = receiver_peers(&receiver_dir, &sender_id(&sender_dir));
+    (link_from(&out), receiver)
+}
+
+/// What a file is, for a test that has to say it did not change.
+fn file_state(path: &std::path::Path) -> (Vec<u8>, std::time::SystemTime) {
+    let bytes = std::fs::read(path).expect("read the peers file");
+    let mtime = std::fs::metadata(path)
+        .expect("stat the peers file")
+        .modified()
+        .expect("this platform records a modification time");
+    (bytes, mtime)
+}
+
+/// **`open` with no `--yes` says what it would add and writes nothing.**
+///
+/// The split is the feature and not a formality: a link arrives in a chat
+/// window, and a person who clicks one must be able to see which of their Macs
+/// it is about and where it now says that Mac is BEFORE their own file changes.
+/// An implementation that previewed and wrote in one pass would read exactly
+/// the same on a green suite.
+///
+/// Asserted on the bytes AND the modification time, because "wrote the same
+/// content back" is still a write: it moves the file's mtime, and the whole of
+/// the next test is that a second paste does not.
+///
+/// Watched red: dropping the `if !args.yes` early return in
+/// `run_peer_moved_open` leaves the preview lines printing and writes anyway,
+/// and both halves of the file assertion fail.
+#[test]
+fn the_open_verb_writes_nothing_without_yes() {
+    let (link, receiver) = minted("preview", None);
+    let before = file_state(&receiver);
+
+    let (out, err, ok) = run_moved(&receiver, &["open", "--stdin"], Some(&link));
+    assert!(ok, "a preview run exited non-zero: {err}\n{out}");
+
+    assert!(
+        out.contains("from studio-mac"),
+        "the preview names the Mac the link is from, in the operator's own word for it: {out}"
+    );
+    assert!(
+        out.contains(&format!("would add {SENDER_LISTEN}")),
+        "the preview names the address it would add: {out}"
+    );
+    assert!(
+        out.contains("pass --yes"),
+        "the preview says what would make it write: {out}"
+    );
+
+    let after = file_state(&receiver);
+    assert_eq!(
+        before.0, after.0,
+        "a preview run must leave the peers file byte for byte as it was"
+    );
+    assert_eq!(
+        before.1, after.1,
+        "and must not even re-date it: a rewrite with the same bytes is still a write"
+    );
+}
+
+/// **Pasting one link twice writes the peers file once.**
+///
+/// A person who cannot reach their friend pastes the link again; so does a
+/// panel that runs the verb once to preview and once to apply. The admission
+/// rules refresh a locator this band already holds, which is right for a
+/// background source and wrong for a hand-pasted one: refreshing rewrites the
+/// operator's file to move one timestamp, and the operator's file is the thing
+/// every other `tcr peer` mutation contends for.
+///
+/// Watched red: making the `fresh` filter in `run_peer_moved_open` always
+/// true, so that everything admissible is handed to `observe_endpoints`, leaves
+/// the second run writing the same address back with a newer timestamp; it
+/// prints `added 1 address(es)` where it should print `already-known`, and the
+/// bytes assertion below fails with it.
+#[test]
+fn applying_one_link_twice_writes_the_peers_file_once() {
+    let (link, receiver) = minted("twice", None);
+
+    let (out, err, ok) = run_moved(&receiver, &["open", "--stdin", "--yes"], Some(&link));
+    assert!(ok, "the first apply exited non-zero: {err}\n{out}");
+    assert!(
+        out.contains("added 1 address"),
+        "the first apply writes the one address the link carried: {out}"
+    );
+
+    let after_first = file_state(&receiver);
+    assert!(
+        String::from_utf8_lossy(&after_first.0).contains("\"moved\""),
+        "the address landed at the band a link writes and no other: {}",
+        String::from_utf8_lossy(&after_first.0)
+    );
+
+    let (out, err, ok) = run_moved(&receiver, &["open", "--stdin", "--yes"], Some(&link));
+    assert!(ok, "the second apply exited non-zero: {err}\n{out}");
+    assert!(
+        out.contains("already-known"),
+        "the second apply says the Mac is already reachable at everything the link says: {out}"
+    );
+
+    let after_second = file_state(&receiver);
+    assert_eq!(
+        after_first.0, after_second.0,
+        "the second apply must leave the peers file byte for byte as the first left it"
+    );
+    assert_eq!(
+        after_first.1, after_second.1,
+        "and must not re-date it either"
+    );
+}
+
+/// **A link never creates a row, and says so.**
+///
+/// The worst thing this feature could do is re-pin a Mac the operator revoked:
+/// a forgotten peer still holds the pair secret, so it can still seal a link
+/// that opens. This is the test for that, and it drives the whole verb rather
+/// than the writer underneath, because the guarantee is only worth as much as
+/// the path the CLI actually takes.
+///
+/// The friend here holds a row for somebody else entirely, with its own secret,
+/// so the trial-open loop really runs and really fails, which is what a Mac
+/// that forgot the sender looks like from the inside.
+///
+/// Watched red: making the trial-open fall back to the first row in the file
+/// when no key opened the link, which is the shape helpfulness takes here. The
+/// run exits 0, prints `added 1 address(es) to kitchen-mac`, and writes an
+/// address onto a row the link had nothing to do with.
+#[test]
+fn a_moved_link_never_creates_a_row() {
+    let (link, _receiver) = minted("no-row", None);
+
+    // A friend's Mac that does not pin the sender at all: one row, another
+    // pair, another secret.
+    let dir = scratch("no-row-stranger");
+    let stranger = peer_id(0x33).to_wire();
+    let body = format!(
+        r#"{{
+  "peers": [
+    {{
+      "node": "{stranger}",
+      "label": "kitchen-mac",
+      "addedAt": 1,
+      "rendezvousSecret": "{}"
+    }}
+  ]
+}}"#,
+        "ee".repeat(32)
+    );
+    let peers = dir.join("tcr-peers.json");
+    write_peers(&peers, &body);
+    let before = file_state(&peers);
+
+    let (out, err, ok) = run_moved(&peers, &["open", "--stdin", "--yes"], Some(&link));
+    assert!(
+        !ok,
+        "a link this Mac cannot open must exit non-zero: {out}{err}"
+    );
+    assert!(
+        out.contains("no row was created"),
+        "the verb says what it did not do, or a person reads silence as a broken app: {out}"
+    );
+    assert!(
+        err.contains("not meant for this Mac"),
+        "and the refusal is the quiet one: {err}"
+    );
+    assert!(
+        !err.contains("studio-mac") && !err.contains("kitchen-mac"),
+        "a refusal names no row, or a link forwarded into the wrong chat teaches its \
+         reader who this Mac knows: {err}"
+    );
+
+    let after = file_state(&peers);
+    assert_eq!(
+        before.0, after.0,
+        "nothing was written: no row created, and nothing added to the row that was there"
+    );
+}
+
+/// **A minted link never carries the address a peer said it saw us at.**
+///
+/// `sees_us_at` is written per completed session, and in the case this feature
+/// exists for no session has completed since the move, so it holds the address
+/// this Mac had BEFORE it moved. It is the field a reasonable person reaches
+/// for while looking for "every address we know about ourselves", and shipping
+/// it means a link headed "here is where I am now" carrying a known wrong
+/// answer.
+///
+/// The listen socket assertion is the positive control: the link really does
+/// carry an address, so the absence below is a choice and not an empty record.
+///
+/// Watched red: adding the row's `sees_us_at` to the address list in
+/// `run_peer_moved_mint` puts `198.51.100.7:41234` in the preview and fails the
+/// second assertion.
+#[test]
+fn a_minted_link_never_carries_the_address_a_peer_said_it_saw_us_at() {
+    let (link, receiver) = minted("sees-us", Some("198.51.100.7:41234"));
+
+    let (out, err, ok) = run_moved(&receiver, &["open", "--stdin"], Some(&link));
+    assert!(ok, "the preview exited non-zero: {err}\n{out}");
+    assert!(
+        out.contains(&format!("would add {SENDER_LISTEN}")),
+        "the link carries the listen socket, which is what makes the absence below a \
+         choice: {out}"
+    );
+    assert!(
+        !out.contains("198.51.100.7"),
+        "the address a peer said it saw this Mac at is the one this Mac had before it \
+         moved, and a link that carries it teaches a wrong address: {out}"
+    );
+}
+
+/// **`mint` reads the router mapping off the state file, not off a register no
+/// CLI process fills.**
+///
+/// `reach::external_socket` answers from a process-local register a running
+/// keeper fills, and a `tcr` invoked from a terminal has run none, so a mint
+/// that asked it would ship the LAN socket alone on a Mac whose mapping is live
+/// and whose friend is off the LAN. That is the whole case this feature is
+/// for, and it fails silently: the link is well formed, opens, and teaches an
+/// address nobody outside can dial.
+///
+/// The expired record is the control. The same file, the same key, one number
+/// moved past the deadline, and the address must be gone: without it this test
+/// would pass just as happily against a mint that read the file and ignored the
+/// deadline, which would advertise a port the router has already dropped.
+///
+/// Watched red: dropping the held-mapping block from `run_peer_moved_mint`
+/// leaves the first assertion failing with a preview that names the listen
+/// socket alone.
+#[test]
+fn the_mint_verb_reads_the_held_mapping_off_the_state_file() {
+    let mapped = "198.51.100.9:7755";
+
+    let sender_dir = scratch("mapping-sender");
+    let sender = sender_peers(&sender_dir, None);
+    let live = teamclaude_rs::peer::state::MappingRecord {
+        external_address: Some(mapped.to_string()),
+        external_port: 7_755,
+        internal_port: 41_234,
+        expires_at_ms: teamclaude_rs::now_ms() + 120_000,
+    };
+    teamclaude_rs::peer::state::save_mapping(&sender_dir.join("peer-state.json"), Some(live))
+        .expect("the record writes the way a keeper writes one");
+
+    let (out, err, ok) = run_moved(&sender, &["mint", &peer_id(0x22).to_wire()], None);
+    assert!(ok, "mint exited non-zero: {err}\n{out}");
+    let link = link_from(&out);
+
+    let receiver_dir = scratch("mapping-receiver");
+    let receiver = receiver_peers(&receiver_dir, &sender_id(&sender_dir));
+    let (out, err, ok) = run_moved(&receiver, &["open", "--stdin"], Some(&link));
+    assert!(ok, "the preview exited non-zero: {err}\n{out}");
+    assert!(
+        out.contains(&format!("would add {mapped}")),
+        "the link carries the socket a peer off this LAN can dial, which is the whole \
+         point of minting one after a move: {out}"
+    );
+
+    // The control: the same mapping, one number past its deadline.
+    teamclaude_rs::peer::state::save_mapping(
+        &sender_dir.join("peer-state.json"),
+        Some(teamclaude_rs::peer::state::MappingRecord {
+            external_address: Some(mapped.to_string()),
+            external_port: 7_755,
+            internal_port: 41_234,
+            expires_at_ms: teamclaude_rs::now_ms() - 1,
+        }),
+    )
+    .expect("the stale record writes");
+
+    let (out, err, ok) = run_moved(&sender, &["mint", &peer_id(0x22).to_wire()], None);
+    assert!(ok, "mint exited non-zero: {err}\n{out}");
+    let stale_link = link_from(&out);
+    let (out, err, ok) = run_moved(&receiver, &["open", "--stdin"], Some(&stale_link));
+    assert!(ok, "the preview exited non-zero: {err}\n{out}");
+    assert!(
+        !out.contains(mapped),
+        "a mapping whose deadline has passed is not a mapping: nothing renews it and the \
+         router has already dropped it, so a link must not advertise it: {out}"
+    );
 }

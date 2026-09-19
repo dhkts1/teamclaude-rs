@@ -294,6 +294,45 @@ Expect this to fail sometimes: if both Macs are on cellular data with no public 
 shared friend to forward through, there is nothing left to try, because there was never a server
 standing by to fall back on.
 
+### When both Macs moved
+
+Sometimes there is nothing left to try. Both Macs changed networks, neither has a public
+address, and the addresses on each other's rows are where the other one used to be. Nothing on
+this list can fix that by itself: every mechanism above needs one end to be findable.
+
+What fixes it is you, over the chat you already use. On the Mac that moved:
+
+```
+tcr peer moved mint <the other Mac's peer id>
+```
+
+prints one line, `tcr://peer/moved?v=1&r=…`, and you send it to that one friend. It says where
+your Mac is now, sealed so that only their Mac can read it: to anyone else, including whatever
+service carries the message, it is a couple of hundred characters that say nothing. It is not a
+share link. It brings nobody onto your mesh, hands over no key, grants nothing, and pairs
+nothing. Send it to the wrong person and their Mac refuses it, in a sentence that tells them
+nothing about you.
+
+On their side:
+
+```
+tcr peer moved open --stdin < link.txt
+```
+
+reads it and says which of their Macs it is about and where that Mac now is. It writes nothing
+until they pass `--yes`, and even then all it can do is add up to two addresses to a Mac they
+had already paired with, at the lowest confidence there is, dialled after everything their own
+Mac worked out for itself. It cannot create a row, bring back a Mac they told `tcr` to forget,
+or turn anything on. Pasting it twice changes nothing the second time.
+
+One link repairs both directions: once their Mac dials yours, yours learns where theirs is from
+the connection itself. A link goes stale after a day, because by then you have probably moved
+again; if it does, send another one.
+
+The one case where there is nothing to send: a pair that has not completed a single session
+since this build's shared secret existed has no key only the two of them hold, so `mint`
+refuses and says so. Reach that Mac once on any address that works, and then it will seal.
+
 ### Friends of friends: refreshed, never introduced
 
 The rule: "friends through friends are not supported unless you both
