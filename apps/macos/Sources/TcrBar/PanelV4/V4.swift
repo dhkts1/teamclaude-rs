@@ -578,6 +578,32 @@ enum V4 {
         max(own, segMarginBottom) - segMarginBottom
     }
 
+    // MARK: - Peers tab literals
+
+    /// The small circle in an account row's parked-tally breakdown
+    /// (`AccountsTabV4.parkedHeader`): one dot per kind of parked exit,
+    /// beside its count. Not ``dotSize`` (8): that is the freshness dot's own
+    /// size, a different circle in a different card.
+    static let tallyDotSize: CGFloat = 7
+
+    /// The width of the frame around the row's "more" ellipsis glyph
+    /// (`PeersTabV4.rowMenuLabel`); the height is ``PeersTabV4/hitTarget``.
+    static let rowMenuIconWidth: CGFloat = 16
+
+    /// The gap above `PeersTabV4.limitedLine`, the "12 shown, 3 more not
+    /// shown" footer under a capped list.
+    static let limitedLineTopMargin: CGFloat = 2
+
+    /// `PeersTabV4.yesBlock`, the card explaining what pressing yes does:
+    /// its own vertical and horizontal padding, and the margin that sits it
+    /// under the sentence above.
+    static let yesBlockPaddingV: CGFloat = 5
+    static let yesBlockPaddingH: CGFloat = 8
+    static let yesBlockMarginTop: CGFloat = 6
+
+    /// The gap between `PeerSwitch`'s track and its knob circle.
+    static let peerSwitchKnobInset: CGFloat = 2
+
     // MARK: - Derived helpers
 
     /// `font-variant-numeric:tabular-nums` is set on `.panel`, so every number on

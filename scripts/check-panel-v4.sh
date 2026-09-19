@@ -61,7 +61,7 @@ geometry='(padding|frame|offset|spacing|lineWidth|cornerRadius|lineSpacing|inset
 literals=$(
     grep -nE "\.?${geometry}\(([^)]*[^A-Za-z0-9_.])?-?[0-9]+(\.[0-9]+)?([,)]| )" \
         "$views"/*.swift 2>/dev/null |
-        grep -v '^[^:]*V4\.swift:' |
+        grep -vE '(^|/)V4\.swift:' |
         grep -vE ':\s*(///|//)' || true
 )
 if [ -n "$literals" ]; then
