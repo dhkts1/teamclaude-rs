@@ -100,7 +100,15 @@ enum RenderStates {
             // `Menu` contents (the gear's "Use as control account" item, its
             // checkmark) never rasterise regardless of state; see this file's
             // own header and `AccountRow.accountActionsMenu`'s doc-comment.
-            ("13-control-account", .loaded(fleet(healthyJSON)), false, "alice@example.com"),
+            //
+            // `controlAccountJSON`, not `healthyJSON`: this is the one scene
+            // rendered at both `.auto` and `.comfortable` (`densityVariantScenes`
+            // below), and `.auto` only resolves `.compact` above four accounts
+            // (`PanelDensityPreference.comfortableCeiling`). `healthyJSON`'s two
+            // rows sit under that line, so `.auto` and a forced `.comfortable`
+            // drew the identical picture and the density variant proved
+            // nothing.
+            ("13-control-account", .loaded(fleet(controlAccountJSON)), false, "alice@example.com"),
             // Every spend branch at once — see `usageStatsJSON`.
             ("14-usage-stats", .loaded(fleet(usageStatsJSON)), false, nil),
             // A parked group beside a live one — see `parkedGroupJSON`.
@@ -998,8 +1006,13 @@ enum RenderStates {
                         ])),
                 false
             ),
-            // No path at all, beside the asleep pill that used to carry this
-            // fact alone. No RTT anywhere: a stale reading renders as absent.
+            // Trusted and awake, but nothing has ever found a way to reach
+            // it: the case a firewall eating the port produces. A recent
+            // lastSeenMs keeps the freshness read as awake rather than
+            // asleep, and an empty paths array is the honest absence rather
+            // than a stale reading. This used to share `lastSeenMs` and a
+            // spent, ended lease with the asleep row below, which drew the
+            // same picture for two different facts.
             (
                 "w12-path-none",
                 peersSnapshot(
@@ -1009,8 +1022,7 @@ enum RenderStates {
                             .init(
                                 id: "tcr-4b8we1r0zp", name: "studio-mac",
                                 address: "studio-mac.local:7749", trusted: true,
-                                lastSeenMs: peerMsAgo(360), carries: true, serves: true,
-                                leaseSpent: 0, leaseTtlSeconds: 0)
+                                lastSeenMs: peerMsAgo(2), carries: true)
                         ])),
                 false
             ),
@@ -1077,11 +1089,23 @@ enum RenderStates {
                         name: "desk-mac")),
                 false
             ),
-            // 5c: no trusted Macs at all. One sentence, no ring, and no link
-            // to a page with nothing on it.
+            // 5c: no trusted Macs at all, but one found and not yet trusted,
+            // so the empty mesh card is pictured beside a real found row
+            // rather than beside nothing at all. One sentence, no ring, and
+            // no link to a page with nothing on it. A found peer keeps this
+            // scene apart from the plain looking state below, which has no
+            // peers of any kind.
             (
                 "w12-mesh-empty",
-                peersSnapshot(PeerListDocument(finding: true, name: "desk-mac")),
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ],
+                        name: "desk-mac")),
                 false
             ),
             // 5d: seven trusted, five drawn, two collapsed. Chosen because it
@@ -1162,6 +1186,23 @@ enum RenderStates {
             (
                 "44-peers-unsupported",
                 peersSnapshot(PeerListDocument(supported: false)),
+                false
+            ),
+            // A Mac with no network interface at all. There was no fixture
+            // for this state, so a Find card arm written for it would have
+            // shipped with nobody able to look at it first.
+            //
+            // Built behind `PeerListDocument` as it stands today, a
+            // `finding: false` document with no rows, since a network field
+            // has not landed on it yet in this pass. That is the same
+            // document `45-peers-off` builds, so this scene draws the same
+            // picture as that one until the field exists, a known,
+            // deliberate duplicate, not a fixture bug. One line flips it once
+            // the field lands: replace `PeerListDocument()` below with
+            // `PeerListDocument(network: false)`.
+            (
+                "64-peers-no-network",
+                peersSnapshot(PeerListDocument()),
                 false
             ),
         ]
@@ -2061,6 +2102,25 @@ enum RenderStates {
             + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok", groups: ["research"], reservedGroups: ["research"], plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222"))]"
     }
 
+    /// Five plain accounts, `alice@example.com` first: scene 13's own fleet.
+    ///
+    /// Five, not `healthyJSON`'s two: `.auto` only resolves `.compact` above
+    /// ``PanelDensityPreference/comfortableCeiling`` (four) accounts, and
+    /// scene 13 is the one scene rendered at both `.auto` and a forced
+    /// `.comfortable`. A fleet at or under the ceiling draws the identical
+    /// picture either way, which is why the two density variants used to be
+    /// indistinguishable.
+    private static var controlAccountJSON: String {
+        "["
+            + (1...5).map { i in
+                i == 1
+                    ? account(
+                        "alice@example.com", quota: "0.12", state: "ok", plan: "Max 20x",
+                        orgUuid: "11111111-1111-1111-1111-111111111111")
+                    : account("member\(i)@example.com", quota: "0.\(i)0", state: "ok")
+            }.joined(separator: ",") + "]"
+    }
+
     /// Scene 22: a single account, a LIVE read (so
     /// ``NoRequestsBanner/totalRequests(_:)`` sees a measured zero rather than
     /// an offline `nil`), and zero requests served: the colleague's fleet
@@ -2631,19 +2691,26 @@ enum RenderStates {
     /// A PARKED GROUP BESIDE A LIVE ONE — the state a screenshot is the only
     /// honest check on, because every part of it is visual.
     ///
-    /// Four rows, and the last two are the point:
-    ///  - two members of parked `henry-team`, one of which is ALSO disabled by
-    ///    hand. Both draw `PARKED`, but for different reasons, and the fixture
-    ///    exists to show that the panel does not need them to look different:
-    ///    the consequence is identical, and the group tag says which is which.
+    /// Six rows, and the four `henry-team` members are the point:
+    ///  - four members of parked `henry-team`, one of which is ALSO disabled
+    ///    by hand. All draw `PARKED`, but for different reasons, and the
+    ///    fixture exists to show that the panel does not need them to look
+    ///    different: the consequence is identical, and the group tag says
+    ///    which is which.
     ///  - a member of live `dev`, the control: if the dimming is wrong, or
     ///    applied to every tag, this row shows it.
     ///  - an ungrouped row, so the scene also carries a tag-less baseline.
     ///
-    /// The pass condition is that the two parked tags read as held back — dim
+    /// The pass condition is that the parked tags read as held back: dim
     /// wash, pause glyph — while `DEV` beside them stays at full strength and
     /// still identifiable by colour. A tag that dims into illegibility fails
     /// this scene as surely as one that does not dim at all.
+    ///
+    /// Four members, not two: a wholly-parked group shows its first three
+    /// rows and a "Show N more" button, collapsed or expanded, and with only
+    /// two members there is nothing left to hide, so the collapsed and
+    /// expanded renders drew the same picture. The fourth member is the row
+    /// that only the expanded scene shows.
     private static var parkedGroupJSON: String {
         let parkedLive = account(
             "alice@example.com", quota: "0.12", state: "ok",
@@ -2657,13 +2724,26 @@ enum RenderStates {
             groupColors: parkedSceneColors,
             plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222",
             gate: "disabled")
+        let parkedThird = account(
+            "erin@example.com", quota: "0.55", state: "ok",
+            groups: ["henry-team"], parkedGroups: ["henry-team"],
+            groupColors: parkedSceneColors,
+            plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222",
+            gate: "parked")
+        let parkedFourth = account(
+            "frank@example.com", quota: "0.09", state: "ok",
+            groups: ["henry-team"], parkedGroups: ["henry-team"],
+            groupColors: parkedSceneColors,
+            plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222",
+            gate: "parked")
         let live = account(
             "carol@example.com", quota: "0.44", state: "ok",
             groups: ["dev"], groupColors: parkedSceneColors,
             plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222",
             gate: "ok")
         let ungrouped = account("dave@example.com", quota: "0.08", state: "ok", gate: "ok")
-        return "[\(parkedLive),\(parkedAndDisabled),\(live),\(ungrouped)]"
+        return
+            "[\(parkedLive),\(parkedAndDisabled),\(parkedThird),\(parkedFourth),\(live),\(ungrouped)]"
     }
 
     /// Real colours for the parked scene: dimming is invisible against the

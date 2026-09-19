@@ -188,6 +188,37 @@ final class PeerInternetTests: XCTestCase {
         XCTAssertTrue(state.isWarning)
     }
 
+    // MARK: The retry button's own state
+
+    /// The row's retry button only appears on the two states that ended
+    /// without a path.
+    func testCanRetryIsTrueOnlyOnTheTwoStatesThatEndedWithoutAPath() {
+        XCTAssertTrue(PeerInternetReach.routerSilent.canRetry)
+        XCTAssertTrue(PeerInternetReach.unreadable("tcr: command not found").canRetry)
+        XCTAssertFalse(PeerInternetReach.off.canRetry)
+        XCTAssertFalse(PeerInternetReach.asking.canRetry)
+        XCTAssertFalse(PeerInternetReach.retrying.canRetry)
+        XCTAssertFalse(
+            PeerInternetReach.reachable(address: "203.0.113.44", port: 51413, expires: now)
+                .canRetry)
+    }
+
+    /// Pressing the retry button, with the switch already on and no fresh
+    /// reading yet, reads as `retrying`, not `asking`: the caller says which
+    /// press it was.
+    func testRetryingIsAskingsOwnTwinReachedFromTheButton() {
+        let state = PeerInternetReach.state(on: true, reading: nil, retrying: true, now: now)
+        XCTAssertEqual(state, .retrying)
+        XCTAssertEqual(state.line, PeerInternetReach.asking.line)
+        XCTAssertFalse(state.isWarning)
+    }
+
+    /// Leaving `retrying` off, the same call still reads as `asking`: the
+    /// default keeps every existing caller's behaviour.
+    func testStateWithoutRetryingStillReadsAsAsking() {
+        XCTAssertEqual(PeerInternetReach.state(on: true, reading: nil, now: now), .asking)
+    }
+
     // MARK: Words
 
     /// The jargon rule: no protocol name reaches a string an

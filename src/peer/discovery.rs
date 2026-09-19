@@ -815,6 +815,17 @@ pub const MAX_BRIEF_ENDPOINTS_PER_PEER: usize = 2;
 /// to fill a row.
 pub const MAX_DROP_ENDPOINTS_PER_PEER: usize = 2;
 
+/// How many of a row's [`crate::peer::config::MAX_ENDPOINTS_PER_PEER`] slots a
+/// pasted moved link may ever hold.
+///
+/// [`MAX_DROP_ENDPOINTS_PER_PEER`]'s value and its reason: the two bands are
+/// the same strength of evidence, so a row that fills with one of them would
+/// fill with the other. Its own constant rather than that one under a second
+/// name, because the two answer different questions ("how much of a row may a
+/// surface nobody owns hold" and "how much of it may one chat message hold")
+/// and a ruling on either must be able to move one without the other.
+pub const MAX_MOVED_ENDPOINTS_PER_PEER: usize = 2;
+
 /// Record one incoming `Hello.briefs` against the peers file and return how
 /// many rows it moved.
 ///
@@ -948,6 +959,33 @@ pub fn admissible_drop_endpoints(row: &PeerRow, learned: &[Endpoint]) -> Vec<End
         learned,
         EndpointSource::Drop,
         MAX_DROP_ENDPOINTS_PER_PEER,
+    )
+}
+
+/// Which of a moved link's addresses may be written onto the row, read off the
+/// row as it stands.
+///
+/// [`admissible_drop_endpoints`]'s three rules with
+/// [`crate::peer::config::EndpointSource::Moved`] and
+/// [`MAX_MOVED_ENDPOINTS_PER_PEER`] in place of that band's two. The third
+/// sibling over one body, for the reason the second one gives: the rules are a
+/// property of how much a weak source is worth, and a third copy would be a
+/// third thing to correct.
+///
+/// **This is the whole of what a link can do to a row**, and it is why the
+/// write path runs through here and not through
+/// [`crate::peer::config::observe_endpoints`] alone: a locator a handshake
+/// proved is left alone rather than re-dated or rewritten as a link's, at most
+/// [`MAX_MOVED_ENDPOINTS_PER_PEER`] of the row's slots are ever a link's, and a
+/// full row takes nothing. `observed_at_ms` on what comes back is the caller's
+/// own clock and never the record's `at`, the rule
+/// [`crate::peer::config::Endpoint::observed_at_ms`] states.
+pub fn admissible_moved_endpoints(row: &PeerRow, learned: &[Endpoint]) -> Vec<Endpoint> {
+    admissible_weak_endpoints(
+        row,
+        learned,
+        EndpointSource::Moved,
+        MAX_MOVED_ENDPOINTS_PER_PEER,
     )
 }
 

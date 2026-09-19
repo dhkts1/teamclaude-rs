@@ -19,6 +19,24 @@ final class PeerListDocumentTests: XCTestCase {
         try JSONDecoder().decode(PeerListDocument.self, from: Data(json.utf8))
     }
 
+    /// Whether this Mac is on a network at all: a third state beside
+    /// "looking" and "off", and the one the Find card had no words for.
+    ///
+    /// Three values and not two. `false` is a Mac with no Wi-Fi and no cable,
+    /// where "Looking" is a false claim and the card under it explaining that
+    /// only Macs on this network can appear is the wrong sentence entirely.
+    /// ABSENT is every `tcr` shipped so far, which reports nothing of the
+    /// kind, and that reads as "not known" and draws exactly what it drew
+    /// before, never as "no network".
+    func testTheDocumentCarriesWhetherThereIsANetworkAtAll() throws {
+        XCTAssertEqual(try decode(#"{"supported":true,"network":false}"#).network, false)
+        XCTAssertEqual(try decode(#"{"supported":true,"network":true}"#).network, true)
+        XCTAssertNil(
+            try decode(#"{"supported":true,"finding":true}"#).network,
+            "a tcr that says nothing about interfaces is read as having none, so every "
+                + "panel against today's binary draws a no-network card")
+    }
+
     /// **A peer row out of the BUILT binary, pasted verbatim.**
     ///
     /// Every other payload in this file was written from the producer's source.

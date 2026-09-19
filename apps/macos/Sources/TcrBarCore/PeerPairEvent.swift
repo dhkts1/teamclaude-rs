@@ -117,15 +117,32 @@ public enum PeerPairState: Equatable, Sendable {
 
     /// The instruction for the OTHER Mac, while this one waits. `nil` once
     /// there is nothing over there left to do, and `nil` before the command
-    /// has named the instance: a sentence with a blank where an argument
-    /// belongs is worse than no sentence.
+    /// has named the instance: until the knock is away there is nothing over
+    /// there to act on.
     ///
-    /// The instance id and not the name: `tcr peer accept` takes the id, and
-    /// two Macs can propose one name.
+    /// **The panel's own surface, not a terminal's.** It printed two commands
+    /// wrapped in backticks, which draw as the characters they are, plus a
+    /// sixteen-character instance id, to somebody who is looking at a panel
+    /// precisely because they are not in a terminal. The person at the other
+    /// Mac has this same tab, the request is already on it, and Accept is a
+    /// button. The commands and the id are still reachable, in
+    /// ``farSideCommands``, which the sheet's own control carries as help.
     public var farSideInstruction: String? {
         guard case .asking(let instance) = self, !instance.isEmpty else { return nil }
-        return "On that Mac, `tcr peer pending` lists this request and "
-            + "`tcr peer accept \(instance)` approves it. Nothing has been disclosed to it yet."
+        return "On that Mac, the Peers tab shows this request and anybody there can press "
+            + "Accept. Nothing has been disclosed to it yet."
+    }
+
+    /// The same fact for somebody at a terminal, with the argument each verb
+    /// takes. Help text and a bug report, never the sheet's own line.
+    ///
+    /// The instance id and not the name: `tcr peer accept` takes the id, and
+    /// two Macs can propose one name. No backticks: this is read as plain
+    /// text wherever it is drawn.
+    public var farSideCommands: String? {
+        guard case .asking(let instance) = self, !instance.isEmpty else { return nil }
+        return "On that Mac, tcr peer pending lists this request and tcr peer accept "
+            + "\(instance) approves it."
     }
 
     /// The sheet's headline for this state. The words live here rather than in
@@ -138,7 +155,7 @@ public enum PeerPairState: Equatable, Sendable {
         case .comparing: return "Compare the digits with \(peerName)"
         case .done: return "\(peerName) is trusted"
         case .refused: return "\(peerName) was not trusted"
-        case .cancelled: return "Stopped pairing with \(peerName)"
+        case .cancelled: return "Stopped before \(peerName) was trusted"
         }
     }
 
@@ -149,10 +166,16 @@ public enum PeerPairState: Equatable, Sendable {
     /// two numbers match, because only the person looking at both can know
     /// that, and a sheet that asserted it would be teaching them to press past
     /// the one check the six digits exist for.
-    public func sentence(peerName: String) -> String {
+    ///
+    /// `expiresIn` is seconds left on the request this panel sent, counted by
+    /// the sheet from the instant it opened. Only the waiting state has a
+    /// deadline to state, and a caller with nothing to count passes `nil`,
+    /// which is what a rendered fixture does: a pinned state carries no
+    /// clock, so a picture of this sheet is the same picture on every run.
+    public func sentence(peerName: String, expiresIn remaining: TimeInterval? = nil) -> String {
         switch self {
         case .asking:
-            return PeerAdmission.waitingSentence
+            return PeerAdmission.waitingSentence(expiresIn: remaining)
         case .comparing:
             return "\(peerName) is showing six digits of its own. Read them off that screen and "
                 + "type them here: if one digit differs, stop, because something is answering "
@@ -160,8 +183,8 @@ public enum PeerPairState: Equatable, Sendable {
                 + "reading it."
         case .done(let peer):
             return "Its key is pinned here as \(peer). It can carry your encrypted bytes and "
-                + "open none of them; nothing is shared until you turn sharing on. Run the same "
-                + "pairing on that Mac, pointed back here, so both sides hold a pin."
+                + "open none of them; nothing is shared until you turn sharing on. Do the same "
+                + "on that Mac, pointed back here, so both sides hold a pin."
         case .refused(let message):
             return message
         case .cancelled:

@@ -22,7 +22,7 @@ final class PeerMeshLayoutTests: XCTestCase {
             PeerMeshPeer(name: "attic-nuc", rttMs: 16, lossPct: 0.01),
             PeerMeshPeer(name: "loft-mini", rttMs: 72, lossPct: 0.06, viaName: "attic-nuc"),
             PeerMeshPeer(name: "office-mini", rttMs: 210, lossPct: 0.14),
-            PeerMeshPeer(name: "lab-mac", asleep: true),
+            PeerMeshPeer(name: "lab-mac", asleep: true, hasPath: false),
             PeerMeshPeer(name: "gil-laptop", rttMs: 88, viaName: "attic-nuc"),
             PeerMeshPeer(name: "shed-mac", rttMs: 24, lossPct: 0),
             PeerMeshPeer(name: "van-mac", rttMs: 31, lossPct: 0),
@@ -220,6 +220,101 @@ final class PeerMeshLayoutTests: XCTestCase {
             "the forwarder's name is clipped, which is the one word that says WHICH Mac is "
                 + "carrying the bytes")
         XCTAssertEqual(plate.height, PeerMeshLayout.pillTwoLineHeight)
+    }
+
+    // MARK: No path
+
+    /// A row with no path draws a dotted grey edge and a dotted `no path
+    /// now` plate, never a reading, because a round trip or a loss figure
+    /// would both claim something was measured that was not.
+    func testNoPathDrawsADottedGreyEdgeAndPlateNeverAReading() {
+        let layout = PeerMeshLayout.layout(
+            size: small, root: "desk-mac",
+            peers: [PeerMeshPeer(name: "office-mini", rttMs: 210, lossPct: 0.14, hasPath: false)])
+        XCTAssertEqual(layout.edges.first?.noPath, true)
+        XCTAssertEqual(layout.edges.first?.tone, .unmeasured)
+        XCTAssertEqual(layout.pills.first?.reading, "no path now")
+        XCTAssertEqual(layout.pills.first?.via, nil)
+        XCTAssertEqual(layout.pills.first?.dashed, true)
+        XCTAssertEqual(layout.pills.first?.showsToneDot, false)
+    }
+
+    /// A row that does have a path draws neither dotted.
+    func testAPathDrawsNeitherEdgeNorPlateDashed() {
+        let layout = PeerMeshLayout.layout(
+            size: small, root: "desk-mac", peers: [PeerMeshPeer(name: "attic-nuc", rttMs: 16)])
+        XCTAssertEqual(layout.edges.first?.noPath, false)
+        XCTAssertEqual(layout.pills.first?.dashed, false)
+    }
+
+    // MARK: Grey is reserved for nothing measured
+
+    /// A known round trip with unmeasured loss is not "nothing measured": the
+    /// dot drops rather than reusing grey for it.
+    func testAKnownRoundTripWithUnmeasuredLossDropsTheDot() {
+        let layout = PeerMeshLayout.layout(
+            size: small, root: "desk-mac", peers: [PeerMeshPeer(name: "gil-laptop", rttMs: 88)])
+        XCTAssertEqual(layout.pills.first?.showsToneDot, false)
+    }
+
+    /// Nothing measured at all, no round trip, no loss, keeps the grey dot.
+    func testGreyDotStaysWhenNothingAtAllWasMeasured() {
+        let layout = PeerMeshLayout.layout(
+            size: small, root: "desk-mac",
+            peers: [PeerMeshPeer(name: "gil-laptop", viaName: "attic-nuc")])
+        XCTAssertEqual(layout.pills.first?.showsToneDot, true)
+        XCTAssertEqual(layout.pills.first?.tone, .unmeasured)
+    }
+
+    /// A known round trip WITH a known loss keeps the dot too: this is not a
+    /// blanket "carried paths never dot" rule.
+    func testAFullyMeasuredPathKeepsTheDot() {
+        let layout = PeerMeshLayout.layout(
+            size: small, root: "desk-mac",
+            peers: [PeerMeshPeer(name: "attic-nuc", rttMs: 16, lossPct: 0.01)])
+        XCTAssertEqual(layout.pills.first?.showsToneDot, true)
+    }
+
+    // MARK: Above the cap, one reading per Mac
+
+    func testAboveFourTrustedMacsIsTheNamedThreshold() {
+        XCTAssertEqual(PeerMeshLayout.maxMacsForGraph, 4)
+    }
+
+    /// The list states the same facts the graph's pill and edge would, in
+    /// the graph's own words, for every trusted Mac, no cap, no stand-in.
+    func testReadingsListOneLinePerMacInTheGraphsOwnWords() {
+        let readings = PeerMeshLayout.readings(for: sevenMacs)
+        XCTAssertEqual(readings.count, 7, "no collapse tile: every trusted Mac gets a line")
+        XCTAssertEqual(
+            readings.map(\.text),
+            [
+                "direct · 16 ms · 1% lost",
+                "via attic-nuc · 72 ms · 6% lost",
+                "direct · 210 ms · 14% lost",
+                "asleep · no path right now",
+                "via attic-nuc · 88 ms",
+                "direct · 24 ms · no loss",
+                "direct · 31 ms · no loss",
+            ])
+        XCTAssertEqual(readings.map(\.name), sevenMacs.map(\.name))
+    }
+
+    /// Warn is a loss band past `ok`, or a round trip whose loss was never
+    /// read, never set for the asleep, no-path row.
+    func testReadingsFlagWarnForAnythingNotACleanGreen() {
+        let readings = PeerMeshLayout.readings(for: sevenMacs)
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: readings.map { ($0.name, $0.warn) }),
+            [
+                "attic-nuc": false,
+                "loft-mini": true,
+                "office-mini": true,
+                "lab-mac": false,
+                "gil-laptop": true,
+                "shed-mac": false,
+                "van-mac": false,
+            ])
     }
 
     /// The measurement is a real one. A positive control, because a text

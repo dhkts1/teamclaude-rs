@@ -145,7 +145,7 @@ public enum PeerBanReason: String, Decodable, Equatable, Sendable {
     public var sentence: String {
         switch self {
         case .blocked:
-            return "you pressed Block on its pairing request"
+            return "you pressed Block on its request to connect"
         case .forgottenAndBlocked:
             return "you stopped trusting it and blocked it in one act"
         case .unknown:
@@ -234,40 +234,78 @@ public struct PeerCaps: Decodable, Equatable, Sendable {
 /// The words the admission surfaces use, in one place so the tab and the pane
 /// cannot phrase the same request two ways.
 public enum PeerAdmission {
-    /// `loft-mini (10.0.1.24) wants to pair`, or the address alone when no
+    /// `loft-mini (10.0.1.24) wants to connect`, or the address alone when no
     /// name was proposed.
     ///
-    /// The name is in the sentence and the address is always beside it, which
-    /// is the mockup's own shape for scene 59 and not decoration: a proposed
-    /// name is a string a stranger on this network chose, so the address is
-    /// the part the operator can actually check.
+    /// The name is in the sentence and the address is always beside it: a
+    /// proposed name is a string a stranger on this network chose, so the
+    /// address is the part the operator can actually check.
+    ///
+    /// **`connect`, never `pair`.** Three words were used for one act on one
+    /// screen: the found row's button said Trust, this card said Accept, and
+    /// this headline said `wants to pair`. `pair` is the name of a CLI
+    /// subcommand, it is the first word a stranger's Mac says to somebody who
+    /// has never read the CLI, and the state it leads to is spelled `trusted`
+    /// everywhere else. One act, one vocabulary: a Mac wants to connect,
+    /// Accept opens the six-digit compare, and Trust is the last press.
     public static func knockTitle(_ knock: PeerKnock) -> String {
         guard let name = knock.proposedName, !name.isEmpty else {
-            return "\(knock.addr) wants to pair"
+            return "\(knock.addr) wants to connect"
         }
-        return "\(name) (\(knock.addr)) wants to pair"
+        return "\(name) (\(knock.addr)) wants to connect"
     }
 
     /// ``knockTitle`` without the address folded in: `loft-mini wants to
-    /// pair`, or the address alone when no name was proposed. Every renderer
-    /// of the knock CARD (as opposed to a spoken hint, where one line is
-    /// fine) draws this beside ``knockAddressLine`` rather than
+    /// connect`, or the address alone when no name was proposed. Every
+    /// renderer of the knock CARD (as opposed to a spoken hint, where one line
+    /// is fine) draws this beside ``knockAddressLine`` rather than
     /// ``knockTitle`` directly, because a one-line control truncating
-    /// `"loft-mini (10.0.1.24) wants to pair"` cuts the address mid-digit,
+    /// `"loft-mini (10.0.1.24) wants to connect"` cuts the address mid-digit,
     /// which is the one part of the sentence an operator is meant to check.
     public static func knockNameLine(_ knock: PeerKnock) -> String {
         guard let name = knock.proposedName, !name.isEmpty else {
-            return "\(knock.addr) wants to pair"
+            return "\(knock.addr) wants to connect"
         }
-        return "\(name) wants to pair"
+        return "\(name) wants to connect"
     }
 
-    /// The address on its own line beside ``knockNameLine``, or `nil` when
-    /// ``knockNameLine`` already IS the address (no name was proposed, so
-    /// there is nothing left to show on a second line).
-    public static func knockAddressLine(_ knock: PeerKnock) -> String? {
-        guard let name = knock.proposedName, !name.isEmpty else { return nil }
-        return knock.addr
+    /// The address on its own line beside ``knockNameLine``, with the
+    /// deadline counted beside it: `10.0.1.24 · expires in 7m`.
+    ///
+    /// When no name was proposed, ``knockNameLine`` already IS the address and
+    /// this line is the count alone; with neither an expiry nor a name there
+    /// is nothing left to say and the line is `nil`.
+    public static func knockAddressLine(_ knock: PeerKnock, now: Date) -> String? {
+        let named = !(knock.proposedName ?? "").isEmpty
+        let expiry = knockExpiry(firstSeenMs: knock.firstSeenMs, now: now)
+            .map { "expires in \($0)" }
+        guard named else { return expiry }
+        guard let expiry else { return knock.addr }
+        return "\(knock.addr) · \(expiry)"
+    }
+
+    /// How long a knock stands before the Mac holding it drops the row.
+    ///
+    /// The Rust side owns this number: `KNOCK_TTL_MS` in `src/peer/state.rs`
+    /// is what drops an unanswered knock, and `PAIR_WAIT` in
+    /// `src/peer/pair.rs` is the matching wait on the Mac that sent it.
+    /// Nothing on the wire reports either, so this is a copy of a constant
+    /// rather than a reading, and it is the only copy: every surface counts
+    /// against this and none of them describes it in prose.
+    public static let knockExpirySeconds: TimeInterval = 600
+
+    /// `7m` left on a knock, from the timestamp the knock itself carries, or
+    /// `nil` when there is nothing honest to count.
+    ///
+    /// `nil` covers both a knock past its deadline and one whose producer
+    /// sent no timestamp at all, which arrives as `0` and would otherwise
+    /// count from 1970. Neither gets an invented figure.
+    public static func knockExpiry(firstSeenMs: Int64, now: Date) -> String? {
+        guard firstSeenMs > 0 else { return nil }
+        let age = now.timeIntervalSince1970 - Double(firstSeenMs) / 1000
+        let remaining = knockExpirySeconds - age
+        guard remaining > 0 else { return nil }
+        return PeerFormat.span(remaining)
     }
 
     /// What Accept buys, under the title. Decision row 10 in one line:
@@ -324,17 +362,33 @@ public enum PeerAdmission {
     }
 
     /// What the waiting row and the waiting sheet both say happens next.
+    ///
+    /// The deadline is NOT in it. It used to close with "a request nobody
+    /// answers expires in ten minutes", a figure described on a surface that
+    /// knows exactly when this panel sent the request;
+    /// ``waitingSentence(expiresIn:)`` counts it instead.
     public static let waitingSentence =
         "The request is on that Mac now. Nothing is pinned, carried or served until somebody "
-        + "there accepts it; six digits appear on both screens then, and not before. A request "
-        + "nobody answers expires in ten minutes."
+        + "there accepts it; six digits appear on both screens then, and not before."
+
+    /// The same sentence with the deadline counted: `… This request expires
+    /// in 9m.`
+    ///
+    /// `remaining` is seconds left, counted by the caller from when it sent
+    /// the request against ``knockExpirySeconds``. `nil`, or a deadline
+    /// already past, adds nothing at all rather than a zero or a negative
+    /// span: a sheet with nothing to count says nothing.
+    public static func waitingSentence(expiresIn remaining: TimeInterval?) -> String {
+        guard let remaining, remaining > 0 else { return waitingSentence }
+        return waitingSentence + " This request expires in \(PeerFormat.span(remaining))."
+    }
 
     /// Cancel, on a waiting row. It stops this panel waiting and claims
     /// nothing about the other Mac: there is no verb that withdraws a knock,
     /// and saying so is cheaper than a button that pretends to.
     public static let cancelWaitingHelp =
         "Stops waiting here. The request stands on that Mac until somebody answers it or it "
-        + "expires in ten minutes."
+        + "expires."
 
     /// One fragment as a sentence: the first character upper-cased, the rest
     /// untouched. Never `capitalized`, which would also re-case `studio-mac`.

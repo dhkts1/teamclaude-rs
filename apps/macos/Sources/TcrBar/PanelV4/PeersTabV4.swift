@@ -89,6 +89,13 @@ struct PeerRowModel: Identifiable, Equatable {
     /// against a `tcr` whose live half this build could not read, in which
     /// case the row draws exactly what it drew before the paths existed.
     let pathLines: [PeerPathLine]
+    /// Whether the wire named ANY way to reach this Mac.
+    ///
+    /// The bare fact, kept beside the worded lines because a reader of those
+    /// lines cannot recover it: an empty path list draws one of three
+    /// different things (``PeerPathAbsence``) and one of them draws nothing at
+    /// all, so "no line" and "no path" are not the same state.
+    var hasPath: Bool = false
     /// The first path's own figures, kept beside the worded lines for the mini
     /// mesh: the card draws a dot and a number, not a sentence, and re-parsing
     /// them out of `pathLines` would be a second place the wording matters.
@@ -167,6 +174,16 @@ struct PeersSnapshot: Equatable {
     /// mutates a snapshot after it is derived.
     var rows: [PeerRowModel]
     let answeringOn: PeerListDocument.AnsweringOn?
+    /// The instant this snapshot was read AT, carried so that anything the
+    /// tab counts counts from the same clock the rest of the snapshot was
+    /// worded against.
+    ///
+    /// The row ages (`found 2s ago`) are already phrases decided at read time;
+    /// a deadline is not, because it is a count DOWN and the view is what
+    /// draws it. Reading `Date()` inside the view instead would make a
+    /// fixture drawn by `--render-states` count against the real clock, so
+    /// one scene's PNG would differ from the last run's for no design reason.
+    var readAt: Date = Date()
     /// The five Settings-only readouts, straight off the document. `nil` is
     /// "not read yet", which is what the pane draws.
     var name: String? = nil
@@ -179,6 +196,10 @@ struct PeersSnapshot: Equatable {
     /// network. `nil` is "not read yet" and the switch draws the shipped
     /// default, off.
     var internet: Bool? = nil
+    /// Whether this Mac is on a network at all. `nil` is "not read yet",
+    /// which draws exactly what the tab drew before the field existed; only
+    /// a reported `false` draws the no-network arm.
+    var network: Bool? = nil
 
     // MARK: Decision rows 10 to 13
     //
@@ -187,7 +208,7 @@ struct PeersSnapshot: Equatable {
     // and the Blocked list one pane down are three readings of ONE document,
     // and two reads would see two instants.
 
-    /// Macs asking to pair. Nothing is pinned, carried or served until the
+    /// Macs asking to connect. Nothing is pinned, carried or served until the
     /// operator answers one of these.
     var pending: [PeerKnock] = []
     /// `pendingCount` as the producer counted it, which is not always
@@ -233,7 +254,13 @@ struct PeersSnapshot: Equatable {
         rows.filter { $0.trust == .trusted }.map { row in
             PeerMeshPeer(
                 name: row.title, rttMs: row.pathRttMs, lossPct: row.pathLossPct,
-                viaName: row.pathViaName, asleep: !row.awake)
+                viaName: row.pathViaName, asleep: !row.awake,
+                // The bare fact, not `row.pathRttMs != nil`. A path can be
+                // known and never measured, which is a tile with a line and no
+                // number; a Mac with no path at all is a dotted edge and a
+                // plate. Deriving the second from the first draws the plate on
+                // the first Mac an unprobed endpoint belongs to.
+                hasPath: row.hasPath)
         }
     }
 
@@ -270,6 +297,31 @@ struct PeersSnapshot: Equatable {
 /// plaintext names both parties, a direction and a verb, and the word `read`
 /// never appears alone.
 enum PeersSnapshotBuilder {
+    /// The carry pill's word, and it names a CAPABILITY.
+    ///
+    /// It said `carries`, which reads as "is relaying right now", on a row
+    /// whose own path line said that Mac's traffic goes through a third one.
+    /// The grant is permission to relay; whether anything is being relayed at
+    /// this instant is what the path line under the pill answers. Written once
+    /// because the pill and the sentence behind it (``PeersTabV4/pillHelp(_:)``)
+    /// are the same string in two places, and the copy that drifts is the one
+    /// nobody reads.
+    static let carryPillText = "can carry"
+
+    /// What carrying means, said ONCE under the section head.
+    ///
+    /// It was a per-row sentence, repeated word for word on every trusted row:
+    /// seven identical paragraphs in the seven-Mac state, for a fact that is
+    /// true of every trusted Mac and changes for none of them. A row keeps a
+    /// sentence of its own only where it DEVIATES, which is the carrying row
+    /// with its own byte figures.
+    ///
+    /// `path`, not `route`: one noun for a way to reach a Mac, on the whole
+    /// tab.
+    static let carrySentence =
+        "A trusted Mac carries your traffic when this Mac has no path of its own, and reads "
+        + "none of it."
+
     static func snapshot(from document: PeerListDocument, now: Date) -> PeersSnapshot {
         guard document.supported else {
             return PeersSnapshot(
@@ -282,9 +334,12 @@ enum PeersSnapshotBuilder {
             finding: document.finding,
             sharing: document.sharing,
             rows: document.peers.map {
-                row($0, sharing: document.sharing, now: now, names: peerNames(document))
+                row(
+                    $0, sharing: document.sharing, now: now, names: peerNames(document),
+                    liveAnswered: document.liveAnswered)
             },
             answeringOn: document.answeringOn,
+            readAt: now,
             name: document.name,
             announceName: document.announceName,
             nodeId: document.nodeId,
@@ -292,6 +347,7 @@ enum PeersSnapshotBuilder {
             via: document.via,
             maxHops: document.maxHops,
             internet: document.internet,
+            network: document.network,
             pending: document.pending,
             pendingCount: document.pendingCount,
             blocked: document.blocked,
@@ -354,7 +410,7 @@ enum PeersSnapshotBuilder {
 
     private static func row(
         _ entry: PeerListDocument.PeerEntry, sharing: Bool, now: Date,
-        names: [String: String] = [:]
+        names: [String: String] = [:], liveAnswered: Bool? = nil
     ) -> PeerRowModel {
         let address = entry.address ?? entry.name ?? "unknown"
         let named = entry.name != nil
@@ -394,6 +450,20 @@ enum PeersSnapshotBuilder {
         // it about whether the lease is over, and deriving "ended" a second
         // time is how the row ends up with a live pill over a dead meter.
         let meter = meter(entry, title: title, sharing: sharing, awake: seen.awake, now: now)
+        // Which of the three absences this row's empty path list means, and
+        // only this caller can answer it.
+        //
+        // WORK IN FLIGHT, and nothing weaker. Traffic is the proof a path
+        // exists: the row printed `2 requests are on studio-mac's accounts
+        // now` two lines above `no path right now`, which is one card
+        // contradicting itself. A live lease with nothing on it is not that
+        // proof, and reading it as such cost the asleep row the one true line
+        // it had: a standing offer on a Mac that is not answering is exactly
+        // where "no path right now" is worth saying. Measured on the rendered
+        // scene, where the line vanished from a sleeping Mac's row.
+        let working = (entry.inFlight ?? 0) > 0
+        let absence: PeerPathAbsence =
+            working ? .silent : (liveAnswered == false ? .notReported : .measured)
         return PeerRowModel(
             id: identity,
             title: title,
@@ -408,7 +478,8 @@ enum PeersSnapshotBuilder {
             lend: entry.lend,
             // Newest first, as the serving process ordered them: the first
             // line is the path a dial would try first.
-            pathLines: PeerFormat.pathLines(entry.paths, names: names),
+            pathLines: PeerFormat.pathLines(entry.paths, names: names, absence: absence),
+            hasPath: !entry.paths.isEmpty,
             pathRttMs: entry.paths.first?.rttMs,
             pathLossPct: entry.paths.first?.lossPct,
             pathViaName: entry.paths.first.flatMap { path in
@@ -481,7 +552,7 @@ enum PeersSnapshotBuilder {
         } else if entry.serves {
             pills.append((PeerLendDirection.youLend.pillText, .disclosure))
         } else if entry.carries {
-            pills.append(("carries", .info))
+            pills.append((carryPillText, .info))
         }
         return pills
     }
@@ -510,6 +581,10 @@ enum PeersSnapshotBuilder {
             // blocker: on the scene where this Mac has nothing spare and
             // depends entirely on the lender, the work stopped at an hour the
             // screen never named.
+            // The end, said in ONE of two places and never both: the meter's
+            // own slot while it is inside the hour, and otherwise a clause on
+            // whichever of the four sentences below this row draws.
+            let endsIn = entry.endsInLabel(now: now)
             let ends = entry.endsInSentence(now: now).map { " " + $0 } ?? ""
             let inFlight = entry.inFlight ?? 0
             // The same direction the pill above picked, from the same fact
@@ -525,7 +600,7 @@ enum PeersSnapshotBuilder {
                         sentence: "Nothing is being served while it is away, so this reads "
                             + "zero. The offer stands and starts again by itself when "
                             + "\(title) wakes." + ends,
-                        label: direction.meterLabel))
+                        label: direction.meterLabel, endsIn: endsIn))
             }
             if inFlight > 0 {
                 return .lease(
@@ -535,7 +610,7 @@ enum PeersSnapshotBuilder {
                             + "and it has spent \(PeerFormat.share(spent)) of what it offered "
                             + "you. It reads what it serves, and your sign-in stays here."
                             + ends,
-                        label: direction.meterLabel))
+                        label: direction.meterLabel, endsIn: endsIn))
             }
             if spent <= 0 {
                 return .lease(
@@ -543,7 +618,7 @@ enum PeersSnapshotBuilder {
                         spent: 0,
                         sentence: "\(title) has not served a request yet. The same offer "
                             + "stands as for every trusted Mac." + ends,
-                        label: direction.meterLabel))
+                        label: direction.meterLabel, endsIn: endsIn))
             }
             return .lease(
                 LeaseFraction(
@@ -551,7 +626,7 @@ enum PeersSnapshotBuilder {
                     sentence: "\(title) has used \(PeerFormat.share(spent)) of what you offered "
                         + "it this week"
                         + PeerFormat.ttlClause(entry.leaseTtlSeconds) + "." + ends,
-                    label: direction.meterLabel))
+                    label: direction.meterLabel, endsIn: endsIn))
         }
         if entry.carries, let bytes = entry.bytesPerHour, let cap = entry.byteCapPerHour {
             return .gateway(
@@ -562,9 +637,9 @@ enum PeersSnapshotBuilder {
                         + "them, out of \(PeerFormat.megabytes(cap)) MB an hour."))
         }
         if entry.carries {
-            return .none(
-                "Carries your traffic when this Mac has no route of its own, and reads none "
-                    + "of it.")
+            // No sentence: this row says exactly what ``carrySentence`` says
+            // above the list, so it says nothing and the reader reads it once.
+            return .none(nil)
         }
         return .none(nil)
     }
@@ -761,12 +836,15 @@ final class PeerController: ObservableObject {
             guard let self else { return }
             self.pending.remove(key)
             if case .failed(let message) = outcome {
+                // The argv goes with the message: the banner leads with the
+                // act that was refused, and this is the one place that knows
+                // which act it was.
                 // No silent fallback: `tcr`'s own words, on the tab, rather
                 // than a press that looks like it worked. In the refusal
                 // beside the snapshot and not in the snapshot itself, so the
                 // tab keeps every control it had and the next poll cannot wipe
                 // the sentence three seconds later (``PeerRefusal``).
-                self.refusal.refused(message)
+                self.refusal.refused(message, verb: arguments)
                 return
             }
             // The press did what it said. Whatever refusal was on screen is
@@ -984,6 +1062,27 @@ final class PeerController: ObservableObject {
     }
 }
 
+// MARK: - A Block that has been chosen and not yet confirmed
+
+/// What the Block confirm is about: the address the question names, and the
+/// argv the answer runs.
+///
+/// Both halves, built where the row was chosen, because they are not the same
+/// string and neither is derivable from the other. A found row is banned by
+/// ADDRESS; a knock is banned by its INSTANCE ID, the argument every verb on
+/// that card takes, because the name in a knock is only proposed and two
+/// knocks can propose one. The question still names the address either way:
+/// that is the part an operator can check.
+///
+/// One type rather than two confirms, so the sentence an operator reads
+/// before a ban cannot be written twice and drift.
+struct PeerBlockTarget: Identifiable, Equatable {
+    let address: String
+    let arguments: [String]
+
+    var id: String { arguments.joined(separator: " ") }
+}
+
 // MARK: - The tab
 
 /// The Peers tab: two switches, the Macs between them, and one count line.
@@ -1011,6 +1110,15 @@ struct PeersTabV4: View {
     /// ``LoginSheet`` already thread for the same `ImageRenderer` reason.
     var snapshotMode: Bool = false
     var onOpenSettings: () -> Void = {}
+    /// Run the app's own update check, the one the menu bar item runs.
+    ///
+    /// Injected, and `nil` means the control is NOT DRAWN. The panel has no
+    /// reach to the shell's `Updater` of its own (`MenuBarShell` owns it and
+    /// hands it to `FleetView`), and the two wrong answers are a global,
+    /// which would let any view start an update, and a button wired to a
+    /// closure that does nothing, which is a control that lies. So the card
+    /// offers it exactly when a caller has handed it a way to perform it.
+    var onCheckForUpdates: (() -> Void)?
 
     /// The Trust sheet's peer, when one is open. Held here rather than on the
     /// row so two rows cannot open two sheets.
@@ -1019,11 +1127,23 @@ struct PeersTabV4: View {
     /// is up. One value beside ``trusting`` for the same reason: two rows
     /// cannot start two pairings.
     @State private var pairing: PeerPairRun?
-    /// The row whose Block was chosen, while the confirm is up. Same reason:
-    /// one value, so two rows cannot arm two bans.
-    @State private var blocking: PeerRowModel?
+    /// The Block that was chosen, while the confirm is up. One value, so two
+    /// rows cannot arm two bans.
+    @State private var blocking: PeerBlockTarget?
+    /// Whether the refusal banner is showing the raw line tcr printed. Closed
+    /// on every new refusal, because the sentence is what the next one is
+    /// about.
+    @State private var refusalDetails = false
 
     private var snapshot: PeersSnapshot { controller.snapshot }
+
+    /// Whether this Mac has REPORTED having no network at all.
+    ///
+    /// `== false` and never `!= true`: absent is "this tcr does not report
+    /// interfaces", which is every build shipped so far, and reading that as
+    /// no network would announce a failure that is nothing of the sort on
+    /// every panel.
+    private var noNetwork: Bool { snapshot.network == false }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1031,8 +1151,8 @@ struct PeersTabV4: View {
             // tab keeps every control it had, and this stays until it is
             // dismissed or a verb succeeds: the poll behind it cannot touch
             // it, because it is not part of the read (``PeerRefusal``).
-            if let refused = controller.refusal.message {
-                refusalBanner(refused)
+            if controller.refusal.isShowing {
+                refusalBanner(controller.refusal)
             }
             if let failure = snapshot.failure {
                 // The READ failed, which is a different fact: this build has
@@ -1044,25 +1164,35 @@ struct PeersTabV4: View {
                 // (`FleetView.swift:1008`). That banner is for a status read
                 // this build could not decode; an older `tcr` with no peer
                 // subcommand decoded perfectly and answered honestly.
+                // The one card on this tab that tells an operator to go and do
+                // something the app itself can do. It said "update it" and
+                // offered nothing.
                 collapsed(
-                    "This tcr does not support peers yet. Update it and the tab fills in.")
+                    "This tcr does not support peers yet. Update it and the tab fills in.",
+                    checkForUpdates: onCheckForUpdates)
             } else {
                 if let answering = snapshot.answeringOn {
                     egressLine(answering)
                 }
                 findCard
-                // Above "Other Macs": the shape of the mesh
-                // first, then the rows that carry the same two numbers per
-                // Mac. Drawn on every state including the empty one, which
-                // says so in a sentence rather than drawing a ring with
-                // nothing on it.
-                MiniMeshCard(
-                    root: snapshot.thisMac ?? "This Mac",
-                    peers: snapshot.meshPeers,
-                    onOpenGraph: { openGraph() }
-                )
-                .padding(.top, V4.cardGap)
-                // Decision row 10's own order: a request to pair sits ABOVE
+                // Above "Other Macs": the shape of the mesh first, then the
+                // rows that carry the same two numbers per Mac.
+                //
+                // NOT on the empty state. With nothing trusted this card was a
+                // paragraph saying there is nothing to draw, stacked directly
+                // above another card saying there is nothing found: two
+                // absences, one under the other, about two fifths of the
+                // panel. The found card below is the one that owns that
+                // sentence.
+                if snapshot.trustedCount > 0 {
+                    MiniMeshCard(
+                        root: snapshot.thisMac ?? "This Mac",
+                        peers: snapshot.meshPeers,
+                        onOpenGraph: { openGraph() }
+                    )
+                    .padding(.top, V4.cardGap)
+                }
+                // Decision row 10's own order: a request to connect sits ABOVE
                 // the list of Macs, because it is the one thing on this tab
                 // that is waiting on the operator. A found row is passive.
                 ForEach(snapshot.pending) { knock in
@@ -1097,6 +1227,9 @@ struct PeersTabV4: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // A new refusal is a new sentence: the raw line of the last one closes
+        // rather than standing under somebody else's headline.
+        .onChange(of: controller.refusal.message) { _ in refusalDetails = false }
         .onAppear { if !snapshotMode { controller.start() } }
         .onDisappear { controller.stop() }
         .sheet(item: $trusting) { row in
@@ -1125,16 +1258,14 @@ struct PeersTabV4: View {
             isPresented: blockingIsPresented,
             titleVisibility: .visible,
             presenting: blocking
-        ) { row in
-            if let address = row.address {
-                Button("Block \(address)", role: .destructive) {
-                    controller.run(PeerCommand.block(address: address))
-                }
+        ) { target in
+            Button("Block \(target.address)", role: .destructive) {
+                controller.run(target.arguments)
             }
             Button("Cancel", role: .cancel) {}
-        } message: { row in
+        } message: { target in
             Text(
-                "Nothing from \(row.address ?? row.title) is answered again: its address, and "
+                "Nothing from \(target.address) is answered again: its address, and "
                     + "its key too once this Mac has learned one. A block does not lift by "
                     + "itself. Settings > Peers > Advanced is where it is lifted.")
         }
@@ -1198,7 +1329,9 @@ struct PeersTabV4: View {
     /// One honest line, and nothing else on the tab. The collapse
     /// `FleetView.swift:1008` does for an undecodable status, in the shape a
     /// missing subcommand deserves.
-    private func collapsed(_ sentence: String) -> some View {
+    private func collapsed(
+        _ sentence: String, checkForUpdates: (() -> Void)? = nil
+    ) -> some View {
         V4Card {
             V4Row {
                 VStack(alignment: .leading, spacing: 2) {
@@ -1208,6 +1341,15 @@ struct PeersTabV4: View {
                         .foregroundStyle(Tok.mute)
                         .fixedSize(horizontal: false, vertical: true)
                         .lineSpacing(V4.lineSpacing(V4.muteSize))
+                }
+            } trailing: {
+                if let checkForUpdates {
+                    PeerActionButton(
+                        title: "Check for updates…",
+                        systemImage: nil,
+                        help: "Runs the same check as Check for Updates in the menu bar.",
+                        enabled: true,
+                        action: checkForUpdates)
                 }
             }
         }
@@ -1221,16 +1363,19 @@ struct PeersTabV4: View {
     /// `w12-exits-*` rows are the surface this copies. Colour is the second
     /// channel as everywhere here, so the sentence leads and the glyph
     /// follows it.
-    private func refusalBanner(_ message: String) -> some View {
-        V4Card {
+    private func refusalBanner(_ refusal: PeerRefusal) -> some View {
+        let raw = refusal.message ?? ""
+        return V4Card {
             V4Row {
                 HStack(alignment: .top, spacing: V4.rowGap) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(V4.font(V4.dimSize))
                         .foregroundStyle(Tok.near)
                     VStack(alignment: .leading, spacing: 2) {
-                        NameText(text: "That was refused", lineLimit: 2)
-                        Text(message)
+                        // The ACT, named. `That was refused` says nothing
+                        // about which of a dozen controls was pressed.
+                        NameText(text: refusal.headline, lineLimit: 2)
+                        Text(refusal.body ?? raw)
                             .font(V4.font(V4.muteSize))
                             .foregroundStyle(Tok.ink)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1240,18 +1385,39 @@ struct PeersTabV4: View {
                     }
                 }
             } trailing: {
-                PeerActionButton(
-                    title: "Dismiss",
-                    systemImage: nil,
-                    help: "Clears this. It also clears by itself the next time a press does "
-                        + "what it was asked.",
-                    enabled: true
-                ) { controller.dismissRefusal() }
+                HStack(spacing: V4.pillGap) {
+                    // The command line and the exit code, one press away:
+                    // what a bug report needs and a person does not. The
+                    // banner used to LEAD with them.
+                    PeerActionButton(
+                        title: "Details",
+                        systemImage: nil,
+                        help: "Shows the line tcr printed, word for word.",
+                        enabled: true
+                    ) { refusalDetails.toggle() }
+                    PeerActionButton(
+                        title: "Dismiss",
+                        systemImage: nil,
+                        help: "Clears this. It also clears by itself the next time a press does "
+                            + "what it was asked.",
+                        enabled: true
+                    ) { controller.dismissRefusal() }
+                }
+            }
+            if refusalDetails {
+                Text(raw)
+                    .font(.system(size: V4.muteSize, design: .monospaced))
+                    .foregroundStyle(Tok.mute)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(V4.lineSpacing(V4.muteSize))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(.top, V4.yesBlockMarginTop)
             }
         }
         .padding(.top, V4.marginAfterStrip(V4.cardGap))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Refused. \(message)")
+        .accessibilityLabel("\(refusal.headline). \(refusal.body ?? raw)")
     }
 
     // MARK: The egress line
@@ -1291,10 +1457,23 @@ struct PeersTabV4: View {
         let argv = PeerCommand.find(on: !on)
         return switchCard(
             title: "Find Macs on this network",
+            // The subtitle DESCRIBES, in every state. It used to carry
+            // `Looking. 2 Macs found, 2 trusted.` while the footer a few
+            // points below carried the same count: one fact, printed twice in
+            // one scroll, and the cost was the only line on this tab that
+            // could say what finding actually does. The count now lives in the
+            // footer alone.
+            //
+            // The no-network arm replaces the LOOKING one and only it: a Mac
+            // with no interface at all is not looking, whatever the switch
+            // says, and "Looking" there is a claim about a search that cannot
+            // happen. With the switch off, the off state is the operator's
+            // own doing and stays the headline.
             state: on
-                ? (snapshot.rows.isEmpty
-                    ? "Looking. Other Macs running tcr appear below by themselves."
-                    : "Looking. \(snapshot.countLine).")
+                ? (noNetwork
+                    ? "No network. This Mac is not on Wi-Fi or Ethernet, so there is "
+                        + "nothing to find."
+                    : "Looking. Other Macs running tcr appear below by themselves.")
                 : "Off. This Mac is not announcing itself and is not looking.",
             isOn: on,
             enabled: true,
@@ -1405,12 +1584,16 @@ struct PeersTabV4: View {
                     case .found(let dialAddress, _):
                         PeerActionButton(
                             title: "Trust",
-                            systemImage: "checkmark",
+                            // No glyph. A checkmark is the universal "already
+                            // done", and this row's own sub-line two lines
+                            // below reads `not trusted`. The word is the
+                            // control.
+                            systemImage: nil,
                             // What the press really does, per decision row 10:
                             // it SENDS a request. The six digits are phase 2
                             // and cannot appear until somebody on that Mac
                             // accepts, so this no longer promises them.
-                            help: "Asks \(row.title) to pair. Six digits appear on both "
+                            help: "Asks \(row.title) to connect. Six digits appear on both "
                                 + "screens once somebody there accepts, and nothing changes "
                                 + "before that.",
                             // One pairing at a time: the sheet IS the pairing,
@@ -1525,27 +1708,45 @@ struct PeersTabV4: View {
     @ViewBuilder
     private func rowMenu(_ row: PeerRowModel) -> some View {
         if row.trust != .trusted, let address = row.address {
-            if snapshotMode {
-                // `ImageRenderer` rasterises a `Menu` as the macOS
-                // "prohibited" placeholder, measured again here, as
-                // `accountActionsMenu` records for the Accounts tab: the
-                // first render of this row drew a yellow circle-slash where
-                // the glyph goes. The still label is what the live panel
-                // shows, so the PNG pictures the control rather than the
-                // harness's own limit.
-                rowMenuLabel
-            } else {
-                Menu {
-                    Button("Block \(address)…", role: .destructive) { blocking = row }
-                } label: {
-                    rowMenuLabel
+            blockMenu(
+                address: address,
+                arguments: PeerCommand.block(address: address),
+                accessibilityLabel: "More for \(row.title)",
+                help: "Block this address, whether or not it is asking to connect.")
+        }
+    }
+
+    /// One menu, for the two rows that may ban: a found row and a knock.
+    ///
+    /// Its single item is destructive and it asks before it writes. Shared
+    /// rather than written twice, because the two rows differ in exactly one
+    /// thing, the argv, and a second spelling of a ban's own control is how
+    /// one of them ends up without a confirm in front of it.
+    @ViewBuilder
+    private func blockMenu(
+        address: String, arguments: [String], accessibilityLabel: String, help: String
+    ) -> some View {
+        if snapshotMode {
+            // `ImageRenderer` rasterises a `Menu` as the macOS "prohibited"
+            // placeholder, measured again here, as `accountActionsMenu`
+            // records for the Accounts tab: the first render of this row drew
+            // a yellow circle-slash where the glyph goes. The still label is
+            // what the live panel shows, so the PNG pictures the control
+            // rather than the harness's own limit.
+            rowMenuLabel
+        } else {
+            Menu {
+                Button("Block \(address)…", role: .destructive) {
+                    blocking = PeerBlockTarget(address: address, arguments: arguments)
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .accessibilityLabel("More for \(row.title)")
-                .help("Block this address, whether or not it is asking to pair.")
+            } label: {
+                rowMenuLabel
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel(accessibilityLabel)
+            .help(help)
         }
     }
 
@@ -1642,9 +1843,9 @@ struct PeersTabV4: View {
         }
     }
 
-    // MARK: A Mac asking to pair
+    // MARK: A Mac asking to connect
 
-    /// `<name> (<addr>) wants to pair`, with Accept, Ignore and Block.
+    /// `<name> (<addr>) wants to connect`, with Accept and Ignore.
     ///
     /// Decision row 10, and every word of it is load-bearing. **Nothing has
     /// happened yet**: a knock reveals no static key, so there is nothing
@@ -1670,15 +1871,18 @@ struct PeersTabV4: View {
         // in-flight check watching the command it used to run, so a button
         // could be enabled on one argv and press another. Two spellings of
         // one decision, and the one that drifts is the one nobody reads.
-        // Block goes LAST: it is the destructive one, and a row that leads
-        // with the destructive verb reads as a warning before an operator has
-        // even read who is asking. Ignore and Accept are the two ordinary
-        // answers to "wants to pair" and sit together first.
+        // Block is NOT here. It is forever, and it sat as the rightmost equal
+        // of two reversible answers: Ignore is quiet for an hour, Accept opens
+        // a two-minute window, and the third button next to them never lifts
+        // by itself. It is in the row's own menu now, destructive and behind a
+        // confirm, the shape the found row already uses. What is left is the
+        // two ordinary answers to "wants to connect".
         let verbs: [(title: String, argv: [String], help: String, destructive: Bool)] = [
             (
                 "Ignore", PeerCommand.ignore(instance: knock.instanceId),
                 "Turns this request down and stays quiet to that address for an hour. A "
-                    + "request nobody answers expires by itself in ten minutes.",
+                    + "request nobody answers expires by itself; the line above counts "
+                    + "what is left of it.",
                 false
             ),
             (
@@ -1686,12 +1890,6 @@ struct PeersTabV4: View {
                 "Opens a two-minute window for this one Mac. Both screens then show six "
                     + "digits and nothing is shared until you press Trust on both.",
                 false
-            ),
-            (
-                "Block", PeerCommand.block(instance: knock.instanceId),
-                "Never hear from that Mac again: its address, and its key too once this Mac "
-                    + "has learned one. Lift it in Settings > Peers > Advanced.",
-                true
             ),
         ]
         return V4Card {
@@ -1704,18 +1902,32 @@ struct PeersTabV4: View {
                 // leading label to pay for it: three buttons squeezed the
                 // sentence to about 130 pt and it rendered `loft-mini wants
                 // t…`. The one line on this tab that says a stranger's Mac is
-                // asking to pair was cut mid-word, verb gone, in both
+                // asking to connect was cut mid-word, verb gone, in both
                 // appearances. Nothing about these three controls needs to be
                 // on the title's line.
                 //
                 // The proposed name (or the address, when no name was sent) on
                 // its own line, and the address ALWAYS on a second line rather
                 // than folded into one via `knockTitle`: "loft-mini
-                // (10.0.1.24) wants to pair" truncated to "loft-mini
+                // (10.0.1.24) wants to connect" truncated to "loft-mini
                 // (10.0.1…" mid address, which is exactly the part an operator
                 // is meant to be able to check.
-                NameText(text: PeerAdmission.knockNameLine(knock), lineLimit: 2)
-                if let address = PeerAdmission.knockAddressLine(knock) {
+                HStack(alignment: .top, spacing: V4.pillGap) {
+                    NameText(text: PeerAdmission.knockNameLine(knock), lineLimit: 2)
+                    Spacer(minLength: 0)
+                    // The ban, one press away from the row it is about and
+                    // never a button beside the two reversible answers.
+                    blockMenu(
+                        address: knock.addr,
+                        arguments: PeerCommand.block(instance: knock.instanceId),
+                        accessibilityLabel: "More for \(PeerAdmission.knockNameLine(knock))",
+                        help: "Block this address, whether or not it is asking to connect.")
+                }
+                // The address AND the deadline, counted from the knock's own
+                // first-seen time against the clock this snapshot was read
+                // at, rather than a card stating ten minutes in prose and
+                // never counting them.
+                if let address = PeerAdmission.knockAddressLine(knock, now: snapshot.readAt) {
                     MuteText(text: address, lineLimit: 1)
                 }
                 MuteText(text: PeerAdmission.knockDetail, lineLimit: nil)
@@ -1764,13 +1976,23 @@ struct PeersTabV4: View {
     private var emptyCard: some View {
         V4Card {
             VStack(alignment: .leading, spacing: 3) {
-                NameText(text: snapshot.finding ? "Nothing found yet" : "No other Macs")
+                // With no interface at all, neither of the other two
+                // sentences is true: one says only Macs on this network can
+                // appear, to somebody who is on no network, and the other
+                // offers a switch that would change nothing.
+                NameText(
+                    text: noNetwork
+                        ? "No network" : (snapshot.finding ? "Nothing found yet" : "No other Macs")
+                )
                 MuteText(
-                    text: snapshot.finding
-                        ? "Only Macs on this network, running tcr, with finding on, can "
-                            + "appear. A Mac elsewhere is added by hand in Settings."
-                        : "Turn finding on and any Mac running tcr on this network appears "
-                            + "here by itself.",
+                    text: noNetwork
+                        ? "Join a Wi-Fi network or plug in a cable. Macs running tcr on it "
+                            + "appear here by themselves."
+                        : (snapshot.finding
+                            ? "Only Macs on this network, running tcr, with finding on, can "
+                                + "appear. A Mac elsewhere is added by hand in Settings."
+                            : "Turn finding on and any Mac running tcr on this network appears "
+                                + "here by itself."),
                     lineLimit: nil)
             }
         }
@@ -1778,19 +2000,26 @@ struct PeersTabV4: View {
     }
 
     private var sectionHead: some View {
-        HStack(spacing: V4.rowGap) {
-            SectionHead(title: "Other Macs")
-            Spacer(minLength: 0)
-            if snapshot.sharing {
-                PeerPill(
-                    text: "sharing", role: .disclosure,
-                    help: "Trusted Macs may serve your requests on their own accounts, and "
-                        + "read them.")
-            } else if snapshot.finding {
-                PeerPill(
-                    text: "finding", role: .ok,
-                    help: "Discovery is up. A readout, not a control.")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: V4.rowGap) {
+                SectionHead(title: "Other Macs")
+                Spacer(minLength: 0)
+                if snapshot.sharing {
+                    PeerPill(
+                        text: "sharing", role: .disclosure,
+                        help: "Trusted Macs may serve your requests on their own accounts, and "
+                            + "read them.")
+                } else if snapshot.finding {
+                    PeerPill(
+                        text: "finding", role: .ok,
+                        help: "Discovery is up. A readout, not a control.")
+                }
             }
+            // The fact every trusted row used to repeat, said once, where a
+            // reader meets it before the rows rather than seven times inside
+            // them. Drawn whenever the head is, so the height budget's
+            // `carrySentenceLines` is a constant and not a guess.
+            MuteText(text: PeersSnapshotBuilder.carrySentence, lineLimit: nil)
         }
         .padding(.top, V4.sectionHeadMarginTop)
         .padding(.horizontal, V4.sectionHeadMarginSide)
@@ -1863,6 +2092,15 @@ struct PeersTabV4: View {
     /// not have.
     static let hitTarget: CGFloat = 40
 
+    /// How many lines ``PeersSnapshotBuilder/carrySentence`` takes under the
+    /// section head at this panel's width, for the height budget below.
+    ///
+    /// Charged unconditionally, because the sentence is drawn whenever the
+    /// section head is: a conditional line is a line the budget can be wrong
+    /// about, and growth the budget cannot see comes out of the footer
+    /// (``PeerPanelHeight``'s own invariant).
+    static let carrySentenceLines: CGFloat = 2
+
     /// What ``PeerPanelHeight`` charges for this tab, at the density now
     /// resolved. Read off `V4` here (the one place that knows both), and
     /// passed in, so the arithmetic stays testable in `TcrBarCore`.
@@ -1875,18 +2113,21 @@ struct PeersTabV4: View {
             cardGap: V4.cardGap,
             // The two switch cards (each a name line, a state line and a
             // two-line yes block inside its own card chrome), the section
-            // head, and the count line.
+            // head AND the carry sentence under it, and the count line.
             fixedChrome: 2
                 * (V4.lineHeight(V4.nameSize) + V4.lineHeight(V4.muteSize)
                     + 2 * V4.lineHeight(V4.muteSize) + 2 * V4.cardInsetV)
                 + V4.sectionHeadMarginTop + V4.lineHeight(V4.sectionHeadSize)
+                + carrySentenceLines * V4.lineHeight(V4.muteSize)
                 + V4.footerMarginTop + V4.lineHeight(V4.byToolLineSize))
     }
 
     private func pillHelp(_ text: String) -> String {
         switch text {
         case "trusted": return "Pinned on both Macs. It can carry your traffic."
-        case "carries": return "Holds your encrypted bytes and can open none of them."
+        case PeersSnapshotBuilder.carryPillText:
+            return "May hold your encrypted bytes and can open none of them. The path line "
+                + "under the row says whether it is doing so now."
         case PeerLendDirection.youLend.pillText:
             return "May serve your requests on its own accounts, and read them."
         case PeerLendDirection.theyLend.pillText:
@@ -1917,7 +2158,10 @@ struct LeaseMeter: View {
             fill: fraction.spent,
             value: fraction.value,
             sentence: fraction.sentence,
-            tint: Tok.unknown)
+            // Amber while the lease is ending inside the hour: the bar and
+            // the figure move together, so the countdown is not a lone
+            // coloured word, and the words say it too.
+            tint: fraction.isEndingSoon ? Tok.near : Tok.unknown)
     }
 }
 
@@ -2105,6 +2349,11 @@ struct PeerTrustSheetHost: View {
     let peerName: String
     @ObservedObject var run: PeerPairRun
     var snapshotMode: Bool = false
+    /// When this panel sent the request, which is the instant this host was
+    /// first built: the sheet IS the pairing, and it opens on the same press
+    /// that starts the process. `@State` so a redraw does not restart the
+    /// count.
+    @State private var sentAt = Date()
     /// Called once the pairing has settled, with whether a key was pinned. The
     /// tab re-reads on `true`: the peers file changed and the row is a trusted
     /// row now.
@@ -2117,6 +2366,10 @@ struct PeerTrustSheetHost: View {
             state: run.state,
             compare: $run.compare,
             submitting: run.submitting,
+            // What is left of the request this panel sent, counted from the
+            // press that opened this sheet against the deadline the Mac
+            // holding the knock enforces.
+            expiresIn: PeerAdmission.knockExpirySeconds - Date().timeIntervalSince(sentAt),
             snapshotMode: snapshotMode,
             onTrust: { run.submitComparedCode() },
             // Cancel on a live run stops the child and leaves the sheet
@@ -2180,6 +2433,10 @@ struct PeerTrustSheet: View {
     @Binding var compare: PeerPairCompare
     /// Whether the digits are already on their way down the pipe.
     var submitting: Bool = false
+    /// Seconds left on the request this panel sent, or `nil` when there is
+    /// nothing to count. A fixture passes nothing and the sheet states no
+    /// deadline, so a rendered picture of it is the same on every run.
+    var expiresIn: TimeInterval?
     var snapshotMode: Bool = false
     var onTrust: () -> Void = {}
     var onCancel: () -> Void = {}
@@ -2204,7 +2461,7 @@ struct PeerTrustSheet: View {
                 comparedField
             }
 
-            Text(state.sentence(peerName: peerName))
+            Text(state.sentence(peerName: peerName, expiresIn: expiresIn))
                 .font(V4.font(V4.dimSize))
                 .foregroundStyle(Tok.inkDim)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2232,7 +2489,10 @@ struct PeerTrustSheet: View {
                 ) { onCancel() }
                 if state.isLive {
                     PeerActionButton(
-                        title: "Trust", systemImage: "checkmark",
+                        // No glyph here either: this button carries the same
+                        // "already done" checkmark while it is DISABLED,
+                        // which is the state it spends most of its life in.
+                        title: "Trust", systemImage: nil,
                         help: trustHelp,
                         enabled: canTrust
                     ) { onTrust() }
@@ -2256,10 +2516,15 @@ struct PeerTrustSheet: View {
     private var cancelHelp: String {
         switch state {
         case .asking:
-            return "Stops waiting and ends the pairing here. The request stands on that Mac "
-                + "until somebody answers it or it expires."
+            // The two commands and the instance id live HERE, not on the
+            // sheet: the sheet's own line is for the person at the other Mac,
+            // who has this same tab and a button; this is for the one at a
+            // terminal, and for a bug report.
+            let commands = state.farSideCommands.map { " " + $0 } ?? ""
+            return "Stops waiting and ends this request here. The request stands on that Mac "
+                + "until somebody answers it or it expires." + commands
         case .comparing:
-            return "Ends the pairing. Nothing is written and \(peerName) stays untrusted."
+            return "Ends this request. Nothing is written and \(peerName) stays untrusted."
         case .done, .refused, .cancelled:
             return "Closes this."
         }

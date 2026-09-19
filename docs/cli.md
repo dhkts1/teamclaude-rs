@@ -1177,6 +1177,54 @@ invite` as the headless alternative instead.
 | `--invite` | bool | `false` | also mint a one-use join key and carry it in the link, so opening it also completes pairing. **Turns the link into a live bearer secret with ten minutes on it**: without this flag it carries only the network key |
 | `--label <name>` | string | none | a name for the joining Mac, when `--invite` is given |
 
+### `tcr peer moved <mint\|open> [peer\|link]`
+
+The link a Mac sends one friend after it changed networks: it carries this Mac's current
+addresses, sealed so only that one friend's Mac can read them. It joins nothing, grants nothing
+and pairs nothing. See [peers.md](peers.md) § "When both Macs moved".
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<action>` | enum | | `mint` prints one link for one already-trusted Mac; `open` reads a link somebody sent and says which of this Mac's peers it is from and where that Mac now is |
+| `[peer\|link]` | positional | | for `mint`: the peer id to seal for, in its full wire form, the `node` field of `tcr peer ls --json`. For `open`: the `tcr://peer/moved?…` link. **A link typed here is visible in `ps` and in shell history**, and `open` says so on stderr: use `--stdin` |
+| `--stdin` | bool | `false` | for `open`: read the link from standard input, one line, so it never enters argv. The only path the panel and the `tcr://` URL handler use |
+| `--yes` | bool | `false` | for `open`: actually write the addresses. Without it, `open` reads the link, says what it would add, and changes nothing. No effect on `mint` |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use (and the runtime-state file beside it, which is where the router mapping `mint` advertises is read from) |
+
+`mint` seals for one Mac at a time, under a key derived from the secret that pair already
+shares. It refuses a Mac this one has never completed a session with since that secret existed,
+and the refusal carries the fix: the two have to talk once, over any address that works, before
+either can seal for the other. The link carries at most this Mac's listen socket and the router
+mapping a serving process holds; it never carries the address that peer last said it sees this
+Mac at, which is the address this Mac had *before* it moved.
+
+`open` without `--yes` writes nothing, the same split `tcr peer id --regenerate` makes with its
+own `--yes`. What it can add is bounded: at most two addresses, on a row this Mac has already
+pinned, at the lowest confidence band there is. It never creates a row, never un-forgets a Mac,
+never touches a network key and never turns a switch on. Pasting the same link twice writes the
+file once.
+
+```
+$ tcr peer moved mint 0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G
+tcr://peer/moved?v=1&r=6YFN2TQ8ZKW...
+peer moved: sealed for studio-mac; only that Mac can read it, and it goes stale in 24 hours
+peer moved: it carries 2 address(es) and nothing else: it joins nothing, grants nothing and pairs nothing
+
+$ tcr peer moved open --stdin < link.txt
+peer moved: from studio-mac (tcr-0W3GE1R70W), sealed 372s ago
+peer moved: would add 192.0.2.7:41234
+peer moved: would add [2001:db8::1]:41234
+peer moved: nothing written; pass --yes to keep these
+
+$ tcr peer moved open --stdin --yes < link.txt
+peer moved: added 2 address(es) to studio-mac; nothing else changed
+```
+
+Every refusal exits non-zero except `already-known`, which is the ordinary outcome of pasting a
+link twice. A refusal about a link that arrived names nothing: not the peer it might have been
+for, not an address, not any part of what was pasted, because a link forwarded into the wrong
+group chat must teach its reader nothing about who this Mac knows.
+
 ### `tcr peer reach`
 
 Prints what this Mac can be reached on from off the local network. Read-only: nothing here

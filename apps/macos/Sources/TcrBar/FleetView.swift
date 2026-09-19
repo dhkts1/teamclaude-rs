@@ -631,7 +631,11 @@ struct FleetView: View {
                 // `PeersSnapshot`'s own header exists to prevent.
                 PeersView(
                     controller: peers, snapshotMode: snapshotMode,
-                    onOpenSettings: onSettings)
+                    onOpenSettings: onSettings,
+                    // The same act the menu bar item runs, off the same
+                    // `Updater` the header's own "Update…" button uses, so the
+                    // card cannot start a second kind of update check.
+                    onCheckForUpdates: { updater.checkForUpdates() })
             }
         default:
             // Every not-a-fleet state keeps the banner it already had: those
@@ -1174,7 +1178,9 @@ struct FleetView: View {
             case .tools:
                 toolsTab(fleet)
             case .peers:
-                PeersView(snapshotMode: snapshotMode, onOpenSettings: onSettings)
+                PeersView(
+                    snapshotMode: snapshotMode, onOpenSettings: onSettings,
+                    onCheckForUpdates: { updater.checkForUpdates() })
             }
         }
     }
@@ -3560,22 +3566,34 @@ struct PeersView: View {
     @StateObject private var controller: PeerController
     private let snapshotMode: Bool
     private let onOpenSettings: () -> Void
+    /// The app's own update check, for the card an older `tcr` collapses this
+    /// tab to.
+    ///
+    /// Passed down rather than reached for, and `nil` by default, which is the
+    /// state the render harness and every preview are in: the card then draws
+    /// its sentence and no button, instead of a button wired to nothing.
+    /// `MenuBarShell` owns the `Updater`, `FleetView` is handed it, and this is
+    /// the one hop that was missing between the two.
+    private let onCheckForUpdates: (() -> Void)?
 
     init(
         controller: PeerController? = nil,
         snapshotMode: Bool = false,
-        onOpenSettings: @escaping () -> Void = {}
+        onOpenSettings: @escaping () -> Void = {},
+        onCheckForUpdates: (() -> Void)? = nil
     ) {
         _controller = StateObject(wrappedValue: controller ?? PeerController())
         self.snapshotMode = snapshotMode
         self.onOpenSettings = onOpenSettings
+        self.onCheckForUpdates = onCheckForUpdates
     }
 
     var body: some View {
         PeersTabV4(
             controller: controller,
             snapshotMode: snapshotMode,
-            onOpenSettings: onOpenSettings)
+            onOpenSettings: onOpenSettings,
+            onCheckForUpdates: onCheckForUpdates)
     }
 }
 

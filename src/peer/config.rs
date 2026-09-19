@@ -533,14 +533,15 @@ pub enum Locator {
 
 /// What taught this node an endpoint.
 ///
-/// Recorded because the six differ in how much they are worth believing, not
+/// Recorded because the seven differ in how much they are worth believing, not
 /// for display: `Paired` and `Hello` come out of a completed handshake against
 /// a pinned static key, `Beacon` from an unauthenticated LAN announcement,
 /// `Mapping` from this node's own port-mapping request, `Brief` from a
-/// trusted peer's word about a peer we already trust, and `Drop` from a record
-/// left at a surface neither Mac owns. An endpoint is routing advice in every
-/// case, identity is re-proven by the handshake, so a wrong one costs a
-/// connect timeout and never a trust decision.
+/// trusted peer's word about a peer we already trust, `Drop` from a record
+/// left at a surface neither Mac owns, and `Moved` from a sealed link a person
+/// pasted. An endpoint is routing advice in every case, identity is re-proven
+/// by the handshake, so a wrong one costs a connect timeout and never a trust
+/// decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EndpointSource {
@@ -565,6 +566,25 @@ pub enum EndpointSource {
     /// holds the key that seals it. It buys one dial attempt and nothing else:
     /// see [`crate::peer::probe::order_endpoints`] for where that is enforced.
     Drop,
+    /// Off a sealed link one friend sent another after changing networks, read
+    /// by [`crate::peer::moved::open_link`] and written only when the operator
+    /// said `--yes`.
+    ///
+    /// **[`Self::Drop`]'s band and not its member.** It ranks the same, for the
+    /// same reason: both are sealed under a key derived from the pair's
+    /// rendezvous secret, which a Mac this one has since forgotten still holds,
+    /// so neither is evidence this node gathered itself. It is a separate
+    /// member because the rank is not the only question this field answers.
+    /// "How did this address get onto the row" has one honest answer per way in,
+    /// and folding a pasted link into `Drop` would mean that every `Drop` on
+    /// every row is really a link for as long as nothing fetches a dead drop,
+    /// and that the two become indistinguishable the day something does.
+    ///
+    /// That an operator pressed a key does not move it up a band: the press
+    /// authorizes the WRITE, not the address. The person confirming knows their
+    /// friend sent a link; they do not know whether what is inside it is right,
+    /// and a band is about the evidence.
+    Moved,
 }
 
 /// One place a peer was reached, when that was learned, and by what.
