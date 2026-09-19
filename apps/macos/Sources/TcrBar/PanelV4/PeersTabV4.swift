@@ -2222,6 +2222,11 @@ struct PeerTrustSheetHost: View {
     let peerName: String
     @ObservedObject var run: PeerPairRun
     var snapshotMode: Bool = false
+    /// When this panel sent the request, which is the instant this host was
+    /// first built: the sheet IS the pairing, and it opens on the same press
+    /// that starts the process. `@State` so a redraw does not restart the
+    /// count.
+    @State private var sentAt = Date()
     /// Called once the pairing has settled, with whether a key was pinned. The
     /// tab re-reads on `true`: the peers file changed and the row is a trusted
     /// row now.
@@ -2234,6 +2239,10 @@ struct PeerTrustSheetHost: View {
             state: run.state,
             compare: $run.compare,
             submitting: run.submitting,
+            // What is left of the request this panel sent, counted from the
+            // press that opened this sheet against the deadline the Mac
+            // holding the knock enforces.
+            expiresIn: PeerAdmission.knockExpirySeconds - Date().timeIntervalSince(sentAt),
             snapshotMode: snapshotMode,
             onTrust: { run.submitComparedCode() },
             // Cancel on a live run stops the child and leaves the sheet
@@ -2297,6 +2306,10 @@ struct PeerTrustSheet: View {
     @Binding var compare: PeerPairCompare
     /// Whether the digits are already on their way down the pipe.
     var submitting: Bool = false
+    /// Seconds left on the request this panel sent, or `nil` when there is
+    /// nothing to count. A fixture passes nothing and the sheet states no
+    /// deadline, so a rendered picture of it is the same on every run.
+    var expiresIn: TimeInterval?
     var snapshotMode: Bool = false
     var onTrust: () -> Void = {}
     var onCancel: () -> Void = {}
@@ -2321,7 +2334,7 @@ struct PeerTrustSheet: View {
                 comparedField
             }
 
-            Text(state.sentence(peerName: peerName))
+            Text(state.sentence(peerName: peerName, expiresIn: expiresIn))
                 .font(V4.font(V4.dimSize))
                 .foregroundStyle(Tok.inkDim)
                 .fixedSize(horizontal: false, vertical: true)

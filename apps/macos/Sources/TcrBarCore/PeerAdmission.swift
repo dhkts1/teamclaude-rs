@@ -362,17 +362,33 @@ public enum PeerAdmission {
     }
 
     /// What the waiting row and the waiting sheet both say happens next.
+    ///
+    /// The deadline is NOT in it. It used to close with "a request nobody
+    /// answers expires in ten minutes", a figure described on a surface that
+    /// knows exactly when this panel sent the request;
+    /// ``waitingSentence(expiresIn:)`` counts it instead.
     public static let waitingSentence =
         "The request is on that Mac now. Nothing is pinned, carried or served until somebody "
-        + "there accepts it; six digits appear on both screens then, and not before. A request "
-        + "nobody answers expires in ten minutes."
+        + "there accepts it; six digits appear on both screens then, and not before."
+
+    /// The same sentence with the deadline counted: `… This request expires
+    /// in 9m.`
+    ///
+    /// `remaining` is seconds left, counted by the caller from when it sent
+    /// the request against ``knockExpirySeconds``. `nil`, or a deadline
+    /// already past, adds nothing at all rather than a zero or a negative
+    /// span: a sheet with nothing to count says nothing.
+    public static func waitingSentence(expiresIn remaining: TimeInterval?) -> String {
+        guard let remaining, remaining > 0 else { return waitingSentence }
+        return waitingSentence + " This request expires in \(PeerFormat.span(remaining))."
+    }
 
     /// Cancel, on a waiting row. It stops this panel waiting and claims
     /// nothing about the other Mac: there is no verb that withdraws a knock,
     /// and saying so is cheaper than a button that pretends to.
     public static let cancelWaitingHelp =
         "Stops waiting here. The request stands on that Mac until somebody answers it or it "
-        + "expires in ten minutes."
+        + "expires."
 
     /// One fragment as a sentence: the first character upper-cased, the rest
     /// untouched. Never `capitalized`, which would also re-case `studio-mac`.

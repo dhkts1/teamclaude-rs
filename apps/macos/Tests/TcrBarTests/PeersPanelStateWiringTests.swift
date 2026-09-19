@@ -78,6 +78,34 @@ final class PeersPanelStateWiringTests: XCTestCase {
                 + "thing an operator staring at a waiting row wants")
     }
 
+    /// A deadline is counted, not described.
+    ///
+    /// The sheet said "a request nobody answers expires in ten minutes" and
+    /// counted nothing, on a surface that knows exactly when this panel sent
+    /// the request. The prose is gone from both sentences and the figure is
+    /// the counted one.
+    func testTheWaitingCopyCountsTheDeadlineRatherThanDescribingIt() {
+        for sentence in [PeerAdmission.waitingSentence, PeerAdmission.cancelWaitingHelp] {
+            XCTAssertFalse(
+                sentence.contains("ten minutes"),
+                "a deadline is described in prose again: \(sentence)")
+        }
+        XCTAssertEqual(
+            PeerAdmission.waitingSentence(expiresIn: 540),
+            PeerAdmission.waitingSentence + " This request expires in 9m.",
+            "the counted clause is not the same base sentence plus the figure")
+        XCTAssertEqual(
+            PeerAdmission.waitingSentence(expiresIn: nil), PeerAdmission.waitingSentence,
+            "with nothing to count the sheet invents a deadline")
+        XCTAssertEqual(
+            PeerAdmission.waitingSentence(expiresIn: -1), PeerAdmission.waitingSentence,
+            "a request past its deadline counts a negative span")
+        XCTAssertEqual(
+            PeerPairState.asking(instance: "8f").sentence(peerName: "studio-mac", expiresIn: 540),
+            PeerAdmission.waitingSentence(expiresIn: 540),
+            "the sheet's own sentence stopped being the one the row is worded from")
+    }
+
     /// Trust starts the pairing and records that it went, in one call.
     ///
     /// The call used to be `knock(address:arguments:)`, which ran
@@ -135,9 +163,13 @@ final class PeersPanelStateWiringTests: XCTestCase {
     func testTheTrustSheetWithNoCodeClaimsNoDigits() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let sheet = try slice(tab, from: "struct PeerTrustSheet: View {", to: "/// The tab's pill")
+        // The sentence takes the counted deadline as well as the name now, so
+        // the anchor is the call's opening rather than its whole argument
+        // list. The fact being gated is unchanged: the words are the state's,
+        // never the view's.
         XCTAssertTrue(
             sheet.contains("state.title(peerName: peerName)")
-                && sheet.contains("state.sentence(peerName: peerName)"),
+                && sheet.contains("state.sentence(peerName: peerName, expiresIn: expiresIn)"),
             "the sheet no longer draws the gated per-state words, so it can claim something "
                 + "about the other screen again")
         XCTAssertTrue(

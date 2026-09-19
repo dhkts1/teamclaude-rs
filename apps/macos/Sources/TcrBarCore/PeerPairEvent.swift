@@ -166,10 +166,16 @@ public enum PeerPairState: Equatable, Sendable {
     /// two numbers match, because only the person looking at both can know
     /// that, and a sheet that asserted it would be teaching them to press past
     /// the one check the six digits exist for.
-    public func sentence(peerName: String) -> String {
+    ///
+    /// `expiresIn` is seconds left on the request this panel sent, counted by
+    /// the sheet from the instant it opened. Only the waiting state has a
+    /// deadline to state, and a caller with nothing to count passes `nil`,
+    /// which is what a rendered fixture does: a pinned state carries no
+    /// clock, so a picture of this sheet is the same picture on every run.
+    public func sentence(peerName: String, expiresIn remaining: TimeInterval? = nil) -> String {
         switch self {
         case .asking:
-            return PeerAdmission.waitingSentence
+            return PeerAdmission.waitingSentence(expiresIn: remaining)
         case .comparing:
             return "\(peerName) is showing six digits of its own. Read them off that screen and "
                 + "type them here: if one digit differs, stop, because something is answering "
