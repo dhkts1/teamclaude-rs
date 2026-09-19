@@ -1089,11 +1089,23 @@ enum RenderStates {
                         name: "desk-mac")),
                 false
             ),
-            // 5c: no trusted Macs at all. One sentence, no ring, and no link
-            // to a page with nothing on it.
+            // 5c: no trusted Macs at all, but one found and not yet trusted,
+            // so the empty mesh card is pictured beside a real found row
+            // rather than beside nothing at all. One sentence, no ring, and
+            // no link to a page with nothing on it. A found peer keeps this
+            // scene apart from the plain looking state below, which has no
+            // peers of any kind.
             (
                 "w12-mesh-empty",
-                peersSnapshot(PeerListDocument(finding: true, name: "desk-mac")),
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ],
+                        name: "desk-mac")),
                 false
             ),
             // 5d: seven trusted, five drawn, two collapsed. Chosen because it
