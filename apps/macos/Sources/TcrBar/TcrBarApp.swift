@@ -282,6 +282,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The other path under the `tcr://` scheme:
+    /// `tcr://peer/moved?v=1&r=…`, a Mac this one already trusts saying where
+    /// it can be reached now.
+    ///
+    /// **It is not a join and must never be able to become one.** This link
+    /// carries no credential and joins nothing; the most it leads to is a few
+    /// addresses added to a row this Mac already pinned, and `tcr` is what
+    /// holds that bound. The two paths are told apart by
+    /// ``PeerMovedLink/route(_:)`` before either handler sees the URL, because
+    /// the join handler used to sit behind the whole scheme and a new path
+    /// with no decision in front of it would have piped a moved link into the
+    /// verb that sets this Mac's network key.
+    ///
+    /// **A shape refusal never raises an alert.** A link that carries nothing
+    /// sealed is answered in the log and nowhere else, the same split the join
+    /// handler makes: an alert over a link that was never going anywhere
+    /// trains an operator to stop reading alerts.
+    ///
+    /// What reaches the log is ``PeerMovedLink/redacted(_:)``: the path, and
+    /// whether anything sealed rode along. Never the record. Anyone holding
+    /// the string can replay it while it is still good, and the system log is
+    /// readable by other processes on this Mac.
+    private func handleMovedLink(_ url: URL) {
+        let shape = PeerMovedLink.redacted(url)
+        NSLog("TcrBar: %@ received", shape)
+        if case .failure(let refusal) = PeerMovedLink.invocation(for: url) {
+            NSLog("TcrBar: %@: %@", shape, PeerMovedLink.sentence(for: refusal))
+            return
+        }
+        Task.detached(priority: .userInitiated) {
+            let outcome = await PeerMovedConfirmation.readAskKeep(url: url)
+            NSLog("TcrBar: %@: %@", shape, outcome)
+        }
+    }
+
     /// `tcr peer network-key show`, blocking, off the main thread: the one
     /// fact ``PeerJoinConfirmation`` needs and this app never reads any other
     /// way (the peers file's own `network_key` field never crosses `peer ls`
@@ -305,7 +340,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// does nothing is indistinguishable from a broken updater.
     private func handle(_ url: URL) {
         if url.scheme?.lowercased() == PeerJoinLink.scheme {
-            handleJoinLink(url)
+            switch PeerMovedLink.route(url) {
+            case .moved:
+                handleMovedLink(url)
+            case .join, .neither:
+                handleJoinLink(url)
+            }
             return
         }
         guard url.scheme == "tcrbar" else {
