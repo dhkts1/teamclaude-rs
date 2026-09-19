@@ -143,6 +143,39 @@ pub fn decode_key32(field: &str) -> Result<[u8; 32], Key32Refusal> {
     bytes.try_into().map_err(|_| PeerIdError::Length { got })
 }
 
+/// Encode a run of bytes of ANY length in the same Crockford base32, for a
+/// value that is neither an identity nor a 32-byte key.
+///
+/// The caller is a sealed record that has to survive a chat window: a framed
+/// record is magic, a version, a nonce and a sealed body, so its length is
+/// whatever the body came to and is rarely a multiple of five. The spec this
+/// codec is built on never sets `spec.padding`, so the encoding is unpadded and
+/// the last symbol carries the spare bits.
+///
+/// A third entry point rather than a third Crockford implementation, for
+/// [`encode_key32`]'s own stated reason: one alphabet, one translation table,
+/// one length refusal on this wire.
+pub fn encode_bytes(bytes: &[u8]) -> String {
+    crockford_encode(bytes)
+}
+
+/// The inverse of [`encode_bytes`]: whatever bytes the field held, or a
+/// refusal.
+///
+/// [`PeerIdError::Length`] cannot come out of this one: there is no length to
+/// be wrong against. What a caller does see is [`PeerIdError::Alphabet`] for a
+/// character outside the alphabet and [`PeerIdError::Malformed`] for a string
+/// that is not a whole number of symbols, which is what a paste cut off
+/// mid-link looks like.
+///
+/// The refusal's own sentences are written for a peer id, so a caller reading a
+/// different kind of value maps this into its own vocabulary rather than
+/// printing it: telling somebody their cut-off link "is not a whole peer id"
+/// sends them hunting for something that was never there.
+pub fn decode_bytes(field: &str) -> Result<Vec<u8>, Key32Refusal> {
+    crockford_decode(field)
+}
+
 /// Why 32 base32 characters could not be read.
 ///
 /// An alias rather than a second enum: an identity and a join secret differ in
