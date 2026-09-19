@@ -61,6 +61,20 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
     public var via: String?
     /// `maxHops`. 1 in the minimum; a hop above 1 is a setting.
     public var maxHops: Int?
+    /// Whether this Mac is on a network at all: any Wi-Fi or Ethernet
+    /// interface with an address on it.
+    ///
+    /// A THIRD state beside looking and off, and the one the Find card had no
+    /// words for: with no interface the card said "Looking" and the card under
+    /// it explained that only Macs on this network can appear, which is the
+    /// wrong sentence for a Mac that is on no network.
+    ///
+    /// `nil` is "not read yet" and every `tcr` shipped so far, which reports
+    /// nothing of the kind; the tab then draws exactly what it drew before.
+    /// Absent must never read as `false`, or every panel against today's
+    /// binary would announce a network failure that is nothing of the sort.
+    public var network: Bool?
+
     /// Whether this Mac asks its router to let a pinned Mac reach it from off
     /// its own network (`peer.internet`).
     ///
@@ -142,7 +156,7 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case supported, finding, sharing, peers, answeringOn
-        case name, announceName, nodeId, listenAddress, via, maxHops, internet
+        case name, announceName, nodeId, listenAddress, via, maxHops, internet, network
         case pending, pendingCount, blocked, blockedCount, muted, mutedCount, limited, caps
         case lentTo, exits
     }
@@ -152,7 +166,7 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
         peers: [PeerEntry] = [], answeringOn: AnsweringOn? = nil,
         name: String? = nil, announceName: Bool? = nil, nodeId: String? = nil,
         listenAddress: String? = nil, via: String? = nil, maxHops: Int? = nil,
-        internet: Bool? = nil,
+        internet: Bool? = nil, network: Bool? = nil,
         pending: [PeerKnock] = [], pendingCount: Int? = nil,
         blocked: [PeerBan] = [], blockedCount: Int? = nil,
         muted: [PeerMute] = [], mutedCount: Int? = nil,
@@ -172,6 +186,7 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
         self.via = via
         self.maxHops = maxHops
         self.internet = internet
+        self.network = network
         self.pending = pending
         self.pendingCount = pendingCount ?? pending.count
         self.blocked = blocked
@@ -201,6 +216,7 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
         self.via = try c.decodeIfPresent(String.self, forKey: .via)
         self.maxHops = try c.decodeIfPresent(Int.self, forKey: .maxHops)
         self.internet = try c.decodeIfPresent(Bool.self, forKey: .internet)
+        self.network = try c.decodeIfPresent(Bool.self, forKey: .network)
         self.pending = try c.decodeIfPresent([PeerKnock].self, forKey: .pending) ?? []
         self.blocked = try c.decodeIfPresent([PeerBan].self, forKey: .blocked) ?? []
         self.muted = try c.decodeIfPresent([PeerMute].self, forKey: .muted) ?? []

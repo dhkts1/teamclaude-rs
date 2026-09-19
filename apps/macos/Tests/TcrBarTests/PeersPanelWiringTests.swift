@@ -403,6 +403,32 @@ final class PeersPanelWiringTests: XCTestCase {
             "the control is not the one the card's own sentence asks for")
     }
 
+    /// A Mac with no network at all says so, in both cards, and only when the
+    /// running tcr reported it.
+    ///
+    /// It was drawn as "looking", with a card under it explaining that only
+    /// Macs on this network can appear, to somebody who is on no network.
+    func testTheFindCardHasANoNetworkArmThatAbsenceCannotTrigger() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("private var noNetwork: Bool { snapshot.network == false }"),
+            "the no-network arm is not keyed on a REPORTED false, so every tcr that does not "
+                + "report interfaces draws a network failure that is nothing of the sort")
+        let card = try slice(
+            tab, from: "private var findCard: some View {", to: "private var shareCard")
+        XCTAssertTrue(
+            card.contains(
+                "\"No network. This Mac is not on Wi-Fi or Ethernet, so there is \""),
+            "the Find card claims it is looking on a Mac that cannot look")
+        let empty = try slice(
+            tab, from: "private var emptyCard: some View {", to: "private var sectionHead")
+        XCTAssertTrue(
+            empty.contains("\"No network\"")
+                && empty.contains("Join a Wi-Fi network or plug in a cable."),
+            "the card under it still explains that only Macs on this network can appear, to "
+                + "somebody who is on no network")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {

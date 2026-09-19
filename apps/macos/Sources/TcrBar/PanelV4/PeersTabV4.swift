@@ -196,6 +196,10 @@ struct PeersSnapshot: Equatable {
     /// network. `nil` is "not read yet" and the switch draws the shipped
     /// default, off.
     var internet: Bool? = nil
+    /// Whether this Mac is on a network at all. `nil` is "not read yet",
+    /// which draws exactly what the tab drew before the field existed; only
+    /// a reported `false` draws the no-network arm.
+    var network: Bool? = nil
 
     // MARK: Decision rows 10 to 13
     //
@@ -337,6 +341,7 @@ enum PeersSnapshotBuilder {
             via: document.via,
             maxHops: document.maxHops,
             internet: document.internet,
+            network: document.network,
             pending: document.pending,
             pendingCount: document.pendingCount,
             blocked: document.blocked,
@@ -1121,6 +1126,14 @@ struct PeersTabV4: View {
 
     private var snapshot: PeersSnapshot { controller.snapshot }
 
+    /// Whether this Mac has REPORTED having no network at all.
+    ///
+    /// `== false` and never `!= true`: absent is "this tcr does not report
+    /// interfaces", which is every build shipped so far, and reading that as
+    /// no network would announce a failure that is nothing of the sort on
+    /// every panel.
+    private var noNetwork: Bool { snapshot.network == false }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // A refused verb, ABOVE the tab rather than instead of it. The
@@ -1439,8 +1452,17 @@ struct PeersTabV4: View {
             // one scroll, and the cost was the only line on this tab that
             // could say what finding actually does. The count now lives in the
             // footer alone.
+            //
+            // The no-network arm replaces the LOOKING one and only it: a Mac
+            // with no interface at all is not looking, whatever the switch
+            // says, and "Looking" there is a claim about a search that cannot
+            // happen. With the switch off, the off state is the operator's
+            // own doing and stays the headline.
             state: on
-                ? "Looking. Other Macs running tcr appear below by themselves."
+                ? (noNetwork
+                    ? "No network. This Mac is not on Wi-Fi or Ethernet, so there is "
+                        + "nothing to find."
+                    : "Looking. Other Macs running tcr appear below by themselves.")
                 : "Off. This Mac is not announcing itself and is not looking.",
             isOn: on,
             enabled: true,
@@ -1943,13 +1965,23 @@ struct PeersTabV4: View {
     private var emptyCard: some View {
         V4Card {
             VStack(alignment: .leading, spacing: 3) {
-                NameText(text: snapshot.finding ? "Nothing found yet" : "No other Macs")
+                // With no interface at all, neither of the other two
+                // sentences is true: one says only Macs on this network can
+                // appear, to somebody who is on no network, and the other
+                // offers a switch that would change nothing.
+                NameText(
+                    text: noNetwork
+                        ? "No network" : (snapshot.finding ? "Nothing found yet" : "No other Macs")
+                )
                 MuteText(
-                    text: snapshot.finding
-                        ? "Only Macs on this network, running tcr, with finding on, can "
-                            + "appear. A Mac elsewhere is added by hand in Settings."
-                        : "Turn finding on and any Mac running tcr on this network appears "
-                            + "here by itself.",
+                    text: noNetwork
+                        ? "Join a Wi-Fi network or plug in a cable. Macs running tcr on it "
+                            + "appear here by themselves."
+                        : (snapshot.finding
+                            ? "Only Macs on this network, running tcr, with finding on, can "
+                                + "appear. A Mac elsewhere is added by hand in Settings."
+                            : "Turn finding on and any Mac running tcr on this network appears "
+                                + "here by itself."),
                     lineLimit: nil)
             }
         }
