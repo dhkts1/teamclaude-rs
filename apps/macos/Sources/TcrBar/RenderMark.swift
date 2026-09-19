@@ -40,27 +40,41 @@ enum RenderMark {
     /// scene the same way the predecessor mockup repeated one state under the
     /// other appearance rather than a different fleet. `appearance` is `nil`
     /// for the process default (dark) and `.aqua` only for the light scene.
+    /// `knocks` is how many Macs are waiting on an answer. Its own scenes
+    /// rather than a flag on an existing one: the segment is drawn whether or
+    /// not the counts label is on, so it takes a scene with counts OFF (the
+    /// default Mac) and one with them on beside a second asking Mac, and the
+    /// glyph choice at 13 pt cannot be judged in prose.
     private static var scenes:
         [
             (
                 name: String, state: PollState, awake: Bool, showCounts: Bool,
-                showRunningTools: Bool, appearance: NSAppearance.Name?
+                showRunningTools: Bool, appearance: NSAppearance.Name?, knocks: Int
             )
         ]
     {
         [
-            ("01-dark-awake-0pct", .loaded(noneReadyFleet), true, false, false, nil),
-            ("02-dark-awake-40pct", .loaded(partialReadyFleet), true, false, false, nil),
-            ("03-dark-awake-100pct", .loaded(fullReadyFleet), true, false, false, nil),
-            ("04-dark-near", .loaded(nearTheLimitFleet), true, false, false, nil),
+            ("01-dark-awake-0pct", .loaded(noneReadyFleet), true, false, false, nil, 0),
+            ("02-dark-awake-40pct", .loaded(partialReadyFleet), true, false, false, nil, 0),
+            ("03-dark-awake-100pct", .loaded(fullReadyFleet), true, false, false, nil, 0),
+            ("04-dark-near", .loaded(nearTheLimitFleet), true, false, false, nil, 0),
             (
                 "05-dark-failed", .commandFailed(exitCode: 1, message: "connection refused"),
-                true, false, false, nil
+                true, false, false, nil, 0
             ),
-            ("06-dark-off-template", .loaded(partialReadyFleet), false, false, false, nil),
-            ("07-dark-counts-on", .loaded(mixedFleet), true, true, false, nil),
-            ("08-dark-running-tools-count", .loaded(runningToolsFleet), true, true, true, nil),
-            ("09-light-awake-100pct", .loaded(fullReadyFleet), true, false, false, .aqua),
+            ("06-dark-off-template", .loaded(partialReadyFleet), false, false, false, nil, 0),
+            ("07-dark-counts-on", .loaded(mixedFleet), true, true, false, nil, 0),
+            ("08-dark-running-tools-count", .loaded(runningToolsFleet), true, true, true, nil, 0),
+            ("09-light-awake-100pct", .loaded(fullReadyFleet), true, false, false, .aqua, 0),
+            // One Mac asking, counts OFF, which is the default Mac: the glyph
+            // and the cup, nothing else.
+            ("10-dark-knock-one", .loaded(partialReadyFleet), true, false, false, nil, 1),
+            // Two asking, counts and running tools on: the fullest the item
+            // ever gets, and the order it is fixed in — what wants an answer,
+            // then what the fleet is doing.
+            ("11-dark-knock-two-counts-on", .loaded(runningToolsFleet), true, true, true, nil, 2),
+            ("12-light-knock-one", .loaded(partialReadyFleet), true, false, false, .aqua, 1),
+            ("13-light-knock-two-counts-on", .loaded(mixedFleet), true, true, false, .aqua, 2),
         ]
     }
 
@@ -93,12 +107,14 @@ enum RenderMark {
     private static func render(
         _ scene: (
             name: String, state: PollState, awake: Bool, showCounts: Bool,
-            showRunningTools: Bool, appearance: NSAppearance.Name?
+            showRunningTools: Bool, appearance: NSAppearance.Name?, knocks: Int
         ),
         into directory: URL
     ) -> Bool {
         let tint = MenuBarShell.cupTint(for: scene.state, awake: scene.awake)
-        guard let mark = MenuBarMark.image(fraction: scene.state.capacityFraction, tint: tint)
+        guard
+            let mark = MenuBarMark.image(
+                fraction: scene.state.capacityFraction, tint: tint, knocks: scene.knocks)
         else {
             FileHandle.standardError.write(Data("no such SF Symbol: \(MenuBarMark.symbolName)\n".utf8))
             return false
@@ -106,7 +122,15 @@ enum RenderMark {
 
         let label = scene.showCounts ? scene.state.countsLabel : nil
         let running = scene.state.runningToolsCount(showRunningTools: scene.showRunningTools)
-        let amber = scene.state.countIsNearCapacity
+        // The TITLE the live item draws, through the same builder
+        // `updateMark` calls, so the knock segment cannot be drawn one way in
+        // a fixture and another way on the bar. The knock glyph is LEFT of the
+        // cup on the real status item, which composes image then title; this
+        // canvas draws the cup first for the same reason it always has, so
+        // read the two as one item rather than as a pixel-exact placement.
+        let title = MenuBarShell.markTitle(
+            state: scene.state, showCounts: scene.showCounts,
+            showRunningTools: scene.showRunningTools, knocks: scene.knocks)
 
         let draw: (NSRect) -> Bool = { rect in
             NSColor.windowBackgroundColor.setFill()
@@ -115,12 +139,10 @@ enum RenderMark {
                 x: 8, y: (rect.height - mark.size.height) / 2,
                 width: mark.size.width, height: mark.size.height)
             mark.draw(in: markRect, from: .zero, operation: .sourceOver, fraction: 1)
-            if let label {
-                let attributed = MenuBarShell.countsAttributedTitle(
-                    label, amber: amber, runningTools: running)
-                let labelOrigin = NSPoint(
-                    x: markRect.maxX + 4, y: (rect.height - attributed.size().height) / 2)
-                attributed.draw(at: labelOrigin)
+            if title.length > 0 {
+                let titleOrigin = NSPoint(
+                    x: markRect.maxX + 4, y: (rect.height - title.size().height) / 2)
+                title.draw(at: titleOrigin)
             }
             return true
         }
@@ -163,7 +185,8 @@ enum RenderMark {
         do {
             try png.write(to: url)
             let runningNote = running.map { " running=\($0)" } ?? ""
-            print("  \(name)  label=\(label ?? "(hidden)")\(runningNote)")
+            print(
+                "  \(name)  label=\(label ?? "(hidden)")\(runningNote) knocks=\(scene.knocks)")
             return true
         } catch {
             FileHandle.standardError.write(Data("write failed \(name): \(error)\n".utf8))

@@ -353,6 +353,28 @@ public enum PeerAdmission {
         "Accepting shows six digits on both screens. Until you press Trust on both, this Mac "
         + "pins nothing, carries nothing and serves nothing."
 
+    /// What the menu bar says about Macs waiting on an answer, in words:
+    /// `1 Mac is asking to connect. Open the Peers tab to answer it.`
+    ///
+    /// The tooltip AND the mark's accessibility description, which is the
+    /// rule colour is never the only channel: an amber glyph on somebody's
+    /// wallpaper can be promised no contrast ratio against anything, so the
+    /// mark being there at all is the signal and this sentence is what says
+    /// what it means.
+    ///
+    /// It never says WHO. A proposed name is a string a stranger's Mac chose,
+    /// the bar has no room for the address beside it, and a name with no
+    /// address is the half an operator cannot check. `nil` at zero: there is
+    /// no sentence for nobody asking, and a "0 Macs are asking" on every Mac
+    /// that has never met another one is noise.
+    public static func knockBarSentence(count: Int) -> String? {
+        guard count > 0 else { return nil }
+        if count == 1 {
+            return "1 Mac is asking to connect. Open the Peers tab to answer it."
+        }
+        return "\(count) Macs are asking to connect. Open the Peers tab to answer them."
+    }
+
     /// `12 shown, 3 more not shown`, or `nil` when nothing was held back.
     ///
     /// Both numbers, because either alone is a different question: the cap is
@@ -493,9 +515,15 @@ extension PeerCommand {
     /// three take.
     public static func unblock(address: String) -> [String] { ["peer", "unblock", address] }
 
-    /// `tcr peer pending --json`. The tab reads the pending rows out of
+    /// `tcr peer pending --json`. The TAB reads the pending rows out of
     /// `tcr peer ls --json` instead, in ONE read: two calls would see two
     /// different instants and the footer would be able to disagree with the
-    /// rows above it. This is here for a caller that wants only the queue.
+    /// rows above it.
+    ///
+    /// ``KnockReader`` is the caller that wants only the queue, and it is the
+    /// menu bar's whole channel: it runs with the panel closed, where nothing
+    /// asks `peer ls` at all, and this verb reads the peer state file rather
+    /// than the running proxy, so a proxy that is down cannot make it answer
+    /// "nobody is asking".
     public static let pending = ["peer", "pending", "--json"]
 }

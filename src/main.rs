@@ -1718,11 +1718,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 let pending: Vec<peer::state::Knock> = state
                     .visible_pending()
                     .into_iter()
-                    .map(|knock| {
-                        let mut knock = dialable_pending_row(knock);
-                        knock.proposed_name = knock.proposed_name.as_deref().map(masked_label);
-                        knock
-                    })
+                    .map(pending_row_for_readers)
                     .collect();
                 // The account labels every lease is measured against, and
                 // their groups, because a `group:` scope is resolved by name
@@ -2773,13 +2769,15 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // reason `PeerState::visible_pending` gives: a reservation
             // placeholder is a slot held against the cap, not a Mac the
             // operator saw ask.
-            // `dialable_pending_row` for the reason it gives: what a reader of
-            // a pending row does with the address is dial it, so both surfaces
-            // here print the port the knocker said to answer on.
+            // `pending_row_for_readers` for the reason it gives: what a reader
+            // of a pending row does with the address is dial it, so both
+            // surfaces here print the port the knocker said to answer on, and
+            // the name a stranger's Mac proposed is masked on the way out of
+            // both, which this verb used to skip while `ls --json` did it.
             let pending: Vec<peer::state::Knock> = state
                 .visible_pending()
                 .into_iter()
-                .map(dialable_pending_row)
+                .map(pending_row_for_readers)
                 .collect();
 
             if a.json {
@@ -4132,7 +4130,7 @@ fn masked_label(label: &str) -> String {
 }
 
 /// One pending row as a READER of it wants it: `addr` carrying the port the
-/// knocker said to answer on, when it said one.
+/// knocker said to answer on, when it said one, and the proposed name masked.
 ///
 /// The row in the file keeps the bare IP, which is the key the mutes, the bans
 /// and the accepted windows are all matched on
@@ -4142,11 +4140,19 @@ fn masked_label(label: &str) -> String {
 /// panel's own Accept. Printing the key there sent every answer to the default
 /// port.
 ///
-/// One function for both surfaces rather than the same map twice: the panel
-/// and the terminal have to be told the same address, and the copy that drifts
-/// is the one nobody runs.
-fn dialable_pending_row(mut knock: peer::state::Knock) -> peer::state::Knock {
+/// **The name is masked here and not at one call site.** A proposed name is
+/// text a stranger's Mac chose, already sanitized on arrival, and masked again
+/// on the way out for the reason [`masked_label`] gives: this repository is
+/// public and the state file is hand-editable JSON. `ls --json` masked it and
+/// `pending` did not, which is one rule with two answers, and the surface that
+/// skipped it is the one a menu bar and a notification banner now read.
+///
+/// One function for both surfaces rather than the same two maps twice: the
+/// panel and the terminal have to be told the same address and the same name,
+/// and the copy that drifts is the one nobody runs.
+fn pending_row_for_readers(mut knock: peer::state::Knock) -> peer::state::Knock {
     knock.addr = knock.dial_address();
+    knock.proposed_name = knock.proposed_name.as_deref().map(masked_label);
     knock
 }
 

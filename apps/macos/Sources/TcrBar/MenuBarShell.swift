@@ -35,6 +35,14 @@ final class MenuBarShell {
     /// and an assertion that ended when the panel closed would be a keep-awake
     /// control that keeps nothing awake.
     let awake: AwakeController
+    /// Macs waiting on an answer, read with the panel CLOSED.
+    ///
+    /// Owned here for the reason every other controller on this object is: the
+    /// Peers tab's own `PeerController` starts on `onAppear` and stops on
+    /// `onDisappear`, so with the panel shut nothing in this app knows a knock
+    /// exists. The panel is shut almost always, which is the whole case the
+    /// menu-bar mark and the notification are for.
+    let knocks: KnockReader
     let preference: LaunchPreference
     /// "Show counts in the menu bar" — whether ``updateMark`` draws the
     /// `ready/enabled` label. Owned here for the same reason as `preference`:
@@ -111,7 +119,8 @@ final class MenuBarShell {
         whatsNew: WhatsNewController? = nil,
         runningToolsPreference: ShowRunningToolsPreference? = nil,
         defaultTabPreference: DefaultTabPreference? = nil,
-        panelDensityPreference: PanelDensityPreference? = nil
+        panelDensityPreference: PanelDensityPreference? = nil,
+        knocks: KnockReader? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -119,6 +128,9 @@ final class MenuBarShell {
         self.accounts = accounts ?? AccountController()
         self.control = control ?? ControlAccountController()
         self.awake = awake ?? AwakeController()
+        // Never started here: `AppDelegate` starts it beside the poller, and
+        // `--shell-probe` builds this object without ever spawning a `tcr`.
+        self.knocks = knocks ?? KnockReader()
         self.preference = preference ?? LaunchPreference()
         self.countsPreference = countsPreference ?? MenuBarCountsPreference()
         self.updater = updater ?? Updater()
@@ -254,14 +266,20 @@ final class MenuBarShell {
         // follows the identical rule for the same reason: toggling it and
         // reading `countsPreference.showCounts` back inside this sink would
         // race the very publisher this sink exists to trust.
+        // The knock count is combined in here for the same reason the other
+        // three are: the mark is recomposed whenever ANY of them changes, and
+        // a knock arriving between two polls must move the bar without
+        // waiting for an account figure to change.
         self.poller.$state
             .combineLatest(self.awake.$isOn, self.countsPreference.$showCounts)
             .combineLatest(self.runningToolsPreference.$showRunningToolCount)
-            .sink { [weak self] combined, showRunningTools in
+            .combineLatest(self.knocks.$knocks)
+            .sink { [weak self] outer, pending in
+                let (combined, showRunningTools) = outer
                 let (state, isOn, showCounts) = combined
                 self?.updateMark(
                     state: state, awake: isOn, showCounts: showCounts,
-                    showRunningTools: showRunningTools)
+                    showRunningTools: showRunningTools, knocks: pending.count)
             }
             .store(in: &marks)
 
@@ -309,15 +327,62 @@ final class MenuBarShell {
     /// running"), never colour alone: the amber count on the glyph has no
     /// accessible text of its own, but this sentence already says "near their
     /// limit" in words, which is what "never colour alone" asks for.
-    static func toolTip(state: PollState, awake: Bool, showRunningTools: Bool) -> String {
+    /// A Mac waiting on an answer is PREPENDED, in its own sentence, ahead of
+    /// every capacity clause: it is the one thing on this item that is waiting
+    /// on a person, and the pointer route is where the amber glyph beside the
+    /// cup says what it means in words.
+    static func toolTip(
+        state: PollState, awake: Bool, showRunningTools: Bool, knocks: Int = 0
+    ) -> String {
         var sentence = state.tooltipSentence
         if let running = state.runningToolsCount(showRunningTools: showRunningTools) {
             let noun = running == 1 ? "tool" : "tools"
             sentence += " · \(running) \(noun) running"
         }
-        return awake
-            ? "\(sentence) · \(KeepAwakeGlyph.accessibilityDescription)"
-            : sentence
+        if awake {
+            sentence = "\(sentence) · \(KeepAwakeGlyph.accessibilityDescription)"
+        }
+        guard let asking = PeerAdmission.knockBarSentence(count: knocks) else { return sentence }
+        return "\(asking) \(sentence)"
+    }
+
+    /// The knock segment: `person.fill.questionmark` in amber, plus the count
+    /// once more than one Mac is asking.
+    ///
+    /// `nil` at zero, which is what keeps an empty title empty.
+    ///
+    /// The same text-attachment shape the running-tools glyph uses, at the
+    /// same 13 pt and the same baseline nudge, because these are the two
+    /// glyphs that sit in this one label and a second construction is how they
+    /// come to sit at two different heights. The count is NOT drawn at one:
+    /// a `1` beside a glyph that is only there when somebody is asking says
+    /// nothing the glyph did not.
+    static func knockAttributedSegment(count: Int) -> NSAttributedString? {
+        guard count > 0 else { return nil }
+        let font = NSFont.monospacedDigitSystemFont(
+            ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
+        guard
+            let glyph = NSImage(
+                systemSymbolName: "person.fill.questionmark",
+                accessibilityDescription: PeerAdmission.knockBarSentence(count: count))
+        else { return nil }
+        glyph.isTemplate = true
+        let tinted = NSImage(size: glyph.size, flipped: false) { rect in
+            Tok.nearNSColor.set()
+            glyph.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        let attachment = NSTextAttachment()
+        attachment.image = tinted
+        attachment.bounds = NSRect(x: 0, y: -2, width: 13, height: 13)
+        let result = NSMutableAttributedString(attachment: attachment)
+        guard count > 1 else { return result }
+        result.append(
+            NSAttributedString(
+                string: " \(count)",
+                attributes: [.font: font, .foregroundColor: Tok.nearNSColor]))
+        return result
     }
 
     /// `PollState.countsLabel`, rendered with tabular figures so the status
@@ -372,25 +437,50 @@ final class MenuBarShell {
         return result
     }
 
+    /// The status item's title, built in two independent halves.
+    ///
+    /// The knock segment comes FIRST and is drawn whether or not the counts
+    /// preference is on: somebody waiting on an answer is not a preference,
+    /// and the `else` branch used to write `button.title = ""` over it. What
+    /// stays empty is a title with neither half, which is the default Mac with
+    /// counts off and nobody asking.
+    ///
+    /// The order is fixed: what wants an answer, then what the fleet is doing.
+    static func markTitle(
+        state: PollState, showCounts: Bool, showRunningTools: Bool, knocks: Int
+    ) -> NSAttributedString {
+        let title = NSMutableAttributedString()
+        if let asking = Self.knockAttributedSegment(count: knocks) {
+            title.append(asking)
+        }
+        // `state.countsLabel` (`TcrBarCore/StatusPoller.swift`) is `nil` for
+        // the same cases the cup's fill already carries — pending, a failed
+        // read, an all-disabled fleet — so the guard here is purely
+        // `showCounts`; the state check already happened.
+        guard showCounts, let label = state.countsLabel else { return title }
+        if title.length > 0 {
+            title.append(NSAttributedString(string: " "))
+        }
+        title.append(
+            Self.countsAttributedTitle(
+                label, amber: state.countIsNearCapacity,
+                runningTools: state.runningToolsCount(showRunningTools: showRunningTools)))
+        return title
+    }
+
     private func updateMark(
-        state: PollState, awake isOn: Bool, showCounts: Bool, showRunningTools: Bool
+        state: PollState, awake isOn: Bool, showCounts: Bool, showRunningTools: Bool,
+        knocks: Int
     ) {
         guard let button = statusItem.button else { return }
         if let mark = MenuBarMark.image(
-            fraction: state.capacityFraction, tint: Self.cupTint(for: state, awake: isOn))
+            fraction: state.capacityFraction, tint: Self.cupTint(for: state, awake: isOn),
+            knocks: knocks)
         {
             button.image = mark
-            // `state.countsLabel` (`TcrBarCore/StatusPoller.swift`) is `nil`
-            // for the same cases the cup's fill already carries — pending, a
-            // failed read, an all-disabled fleet — so the guard below is
-            // purely `showCounts`; the state check already happened.
-            if showCounts, let label = state.countsLabel {
-                button.attributedTitle = Self.countsAttributedTitle(
-                    label, amber: state.countIsNearCapacity,
-                    runningTools: state.runningToolsCount(showRunningTools: showRunningTools))
-            } else {
-                button.title = ""
-            }
+            button.attributedTitle = Self.markTitle(
+                state: state, showCounts: showCounts, showRunningTools: showRunningTools,
+                knocks: knocks)
         } else if button.image == nil {
             // Only reachable if an SF Symbol this build names has gone missing.
             // A status item with neither image nor title is zero points wide and
@@ -398,7 +488,8 @@ final class MenuBarShell {
             // something rather than disappear.
             button.title = "tcr"
         }
-        button.toolTip = Self.toolTip(state: state, awake: isOn, showRunningTools: showRunningTools)
+        button.toolTip = Self.toolTip(
+            state: state, awake: isOn, showRunningTools: showRunningTools, knocks: knocks)
     }
 
     // MARK: - The panel's size, predicted against what it really is
