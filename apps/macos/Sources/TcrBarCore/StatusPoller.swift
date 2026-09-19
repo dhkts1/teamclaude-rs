@@ -242,9 +242,9 @@ public final class StatusPoller: ObservableObject {
 
     /// One poll: both reads, at once, folded into one state.
     ///
-    /// The two halves are independent — `tcr status --json` reports accounts
+    /// The two halves are independent: `tcr status --json` reports accounts
     /// and `tcr sessions --json` reports sessions, and neither is an input to
-    /// the other — so a poll that ran them one after another charged the panel
+    /// the other, so a poll that ran them one after another charged the panel
     /// the sum of two subprocesses for work that fits in the longer of them.
     /// Measured on one machine before this: the pair took 229ms, 288ms and
     /// 249ms while the slower half alone was 147ms, 146ms and 84ms.
