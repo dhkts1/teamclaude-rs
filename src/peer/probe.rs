@@ -386,17 +386,26 @@ pub fn order_endpoints(row: &PeerRow, table: &PathTable) -> Vec<Endpoint> {
 /// machine's word about where a fourth one answers, a band whose contents an
 /// attacker picks outright.
 ///
-/// [`EndpointSource::Drop`] is last, **below a brief and deliberately so**. A
-/// brief came from a Mac this node pinned, over a session that proved a static
-/// key, about a Mac this node also pinned. A dead-drop record came off a
-/// surface that can withhold and is sealed under a symmetric key a forgotten
-/// peer still holds: the weakest evidence on the list, so it sorts last.
+/// [`EndpointSource::Drop`] and [`EndpointSource::Moved`] share the last band,
+/// **below a brief and deliberately so**. A brief came from a Mac this node
+/// pinned, over a session that proved a static key, about a Mac this node also
+/// pinned. The other two are sealed under a symmetric key derived from the
+/// pair's rendezvous secret, which a peer this node has since forgotten still
+/// holds, and one of them arrived off a surface that can withhold while the
+/// other arrived in somebody's chat window: the weakest evidence on the list,
+/// so the two sort last together.
+///
+/// A moved link does not rank above a drop for having been confirmed by the
+/// operator. The confirmation authorizes writing the address down; it says
+/// nothing about whether the address is right, and this key ranks evidence.
+/// What it costs to be wrong is one connect timeout at the bottom of the dial
+/// order, which is why the honest placement is the one the seal supports.
 fn source_rank(endpoint: &Endpoint) -> u8 {
     match endpoint.source {
         EndpointSource::Paired | EndpointSource::Hello => 0,
         EndpointSource::Mapping | EndpointSource::Beacon => 1,
         EndpointSource::Brief => 2,
-        EndpointSource::Drop => 3,
+        EndpointSource::Drop | EndpointSource::Moved => 3,
     }
 }
 
