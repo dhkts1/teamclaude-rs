@@ -12,6 +12,31 @@ import XCTest
 /// running tab takes, a snapshot's meters to `[PeerPanelHeight.Row]` to the
 /// height it frames its scroll view with, runs here with no view at all.
 ///
+/// The lease meter gives its right-hand slot to the countdown while a lease
+/// is ending inside the hour, and keeps the percentage otherwise.
+///
+/// A lease about to end was pixel for pixel the ordinary borrowing row, with
+/// one clause at the end of a four-line paragraph. The figure an operator
+/// needs is when it stops.
+final class LeaseMeterEndingTests: XCTestCase {
+    func testTheCountdownTakesTheMetersSlotOnlyWhileTheEndIsClose() {
+        let ordinary = LeaseFraction(spent: 0.62, sentence: "…")
+        XCTAssertEqual(ordinary.value, "62%")
+        XCTAssertFalse(ordinary.isEndingSoon)
+
+        let ending = LeaseFraction(spent: 0.62, sentence: "…", endsIn: "ends in 1h")
+        XCTAssertEqual(
+            ending.value, "ends in 1h",
+            "the percentage kept the slot on a row whose lease stops within the hour")
+        XCTAssertTrue(
+            ending.isEndingSoon,
+            "nothing marks the row, so the bar and the figure stay the ordinary colour")
+        XCTAssertEqual(
+            ending.spent, 0.62,
+            "the bar stopped drawing the spend it is a meter of")
+    }
+}
+
 /// The metrics are the Comfortable figures `PeersTabV4.heightMetrics` passes
 /// in, transcribed as literals for the reason `PeerSectionHeightTests` gives
 /// in full: `V4` is in the executable target.

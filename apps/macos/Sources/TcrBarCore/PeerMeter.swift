@@ -50,18 +50,36 @@ public struct LeaseFraction: Equatable {
     /// `you lent` or `they lent`, the meter label. Defaulted so the tests
     /// that only exercise `spent`/`value` need not name a direction.
     public let label: String
+    /// `ends in 1h`, while this lease stops inside the hour
+    /// (``PeerLease/endsSoonSeconds``); `nil` at every other distance.
+    ///
+    /// It takes the meter's right-hand slot FROM the percentage rather than
+    /// sitting beside it, because the two answer the same reader at different
+    /// moments: how much has been spent, until the answer that matters is how
+    /// long is left.
+    public let endsIn: String?
 
-    public init(spent: Double, sentence: String, label: String = PeerLendDirection.youLend.meterLabel) {
+    public init(
+        spent: Double, sentence: String,
+        label: String = PeerLendDirection.youLend.meterLabel, endsIn: String? = nil
+    ) {
         self.spent = min(1, max(0, spent))
         self.sentence = sentence
         self.label = label
+        self.endsIn = endsIn
     }
 
-    /// `34%` / `nothing yet`. A Mac that has stopped serving reads zero, never
-    /// its last value (rule 5 again).
+    /// `34%` / `nothing yet`, or the countdown while there is one. A Mac that
+    /// has stopped serving reads zero, never its last value (rule 5 again).
     public var value: String {
-        spent <= 0 ? "nothing yet" : "\(Int((spent * 100).rounded()))%"
+        if let endsIn { return endsIn }
+        return spent <= 0 ? "nothing yet" : "\(Int((spent * 100).rounded()))%"
     }
+
+    /// Whether this meter is drawing a countdown, for the one surface that
+    /// tints it: the figure and the bar go amber together, and neither
+    /// carries the meaning alone.
+    public var isEndingSoon: Bool { endsIn != nil }
 }
 
 /// A GATEWAY meter: bytes per hour against the hourly ceiling.
@@ -104,8 +122,12 @@ public struct GatewayBytes: Equatable {
 ///
 /// Three strings and an argv, all decided by the builder: the view renders.
 public struct LeaseEnded: Equatable {
-    /// `17:30`, or `nil` when the producer said a lease ended without saying
-    /// when. Never a guessed clock.
+    /// `22m ago`, or `nil` when the producer said a lease ended without saying
+    /// when. Never a guessed time.
+    ///
+    /// A span and not a wall clock: `ended 09:36` was the only wall clock on
+    /// this tab, and with no date on it a lease that ended yesterday read as
+    /// one that ended this morning.
     public let when: String?
     public let sentence: String
     /// `tcr peer lend <peer> --relend <id>`, when this Mac is the LENDER and
@@ -121,7 +143,7 @@ public struct LeaseEnded: Equatable {
         self.relendArguments = relendArguments
     }
 
-    /// `ended 17:30`, or `ended` when no clock was reported.
+    /// `ended 22m ago`, or `ended` when no time was reported.
     public var label: String { when.map { "ended \($0)" } ?? "ended" }
 }
 

@@ -78,6 +78,34 @@ final class PeersPanelStateWiringTests: XCTestCase {
                 + "thing an operator staring at a waiting row wants")
     }
 
+    /// A deadline is counted, not described.
+    ///
+    /// The sheet said "a request nobody answers expires in ten minutes" and
+    /// counted nothing, on a surface that knows exactly when this panel sent
+    /// the request. The prose is gone from both sentences and the figure is
+    /// the counted one.
+    func testTheWaitingCopyCountsTheDeadlineRatherThanDescribingIt() {
+        for sentence in [PeerAdmission.waitingSentence, PeerAdmission.cancelWaitingHelp] {
+            XCTAssertFalse(
+                sentence.contains("ten minutes"),
+                "a deadline is described in prose again: \(sentence)")
+        }
+        XCTAssertEqual(
+            PeerAdmission.waitingSentence(expiresIn: 540),
+            PeerAdmission.waitingSentence + " This request expires in 9m.",
+            "the counted clause is not the same base sentence plus the figure")
+        XCTAssertEqual(
+            PeerAdmission.waitingSentence(expiresIn: nil), PeerAdmission.waitingSentence,
+            "with nothing to count the sheet invents a deadline")
+        XCTAssertEqual(
+            PeerAdmission.waitingSentence(expiresIn: -1), PeerAdmission.waitingSentence,
+            "a request past its deadline counts a negative span")
+        XCTAssertEqual(
+            PeerPairState.asking(instance: "8f").sentence(peerName: "studio-mac", expiresIn: 540),
+            PeerAdmission.waitingSentence(expiresIn: 540),
+            "the sheet's own sentence stopped being the one the row is worded from")
+    }
+
     /// Trust starts the pairing and records that it went, in one call.
     ///
     /// The call used to be `knock(address:arguments:)`, which ran
@@ -135,9 +163,13 @@ final class PeersPanelStateWiringTests: XCTestCase {
     func testTheTrustSheetWithNoCodeClaimsNoDigits() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let sheet = try slice(tab, from: "struct PeerTrustSheet: View {", to: "/// The tab's pill")
+        // The sentence takes the counted deadline as well as the name now, so
+        // the anchor is the call's opening rather than its whole argument
+        // list. The fact being gated is unchanged: the words are the state's,
+        // never the view's.
         XCTAssertTrue(
             sheet.contains("state.title(peerName: peerName)")
-                && sheet.contains("state.sentence(peerName: peerName)"),
+                && sheet.contains("state.sentence(peerName: peerName, expiresIn: expiresIn)"),
             "the sheet no longer draws the gated per-state words, so it can claim something "
                 + "about the other screen again")
         XCTAssertTrue(
@@ -232,12 +264,22 @@ final class PeersPanelStateWiringTests: XCTestCase {
         XCTAssertTrue(
             name < buttons,
             "the controls are drawn above the sentence they are an answer to")
-        let block = try XCTUnwrap(card.range(of: "\"Block\", PeerCommand.block")).lowerBound
-        let accept = try XCTUnwrap(card.range(of: "\"Accept\", PeerCommand.accept")).lowerBound
+        // Block is no longer a button on this row at all. It is forever, and
+        // it sat as the rightmost equal of two reversible answers; it is now
+        // in the row's own menu, destructive, asking before it writes, the
+        // shape the found row already uses. What is left in the button row is
+        // Ignore and Accept, the two ordinary answers.
+        XCTAssertFalse(
+            card.contains("\"Block\", PeerCommand.block"),
+            "Block is a same-weight button beside Ignore and Accept again, and it is the one "
+                + "answer on this card that cannot be taken back")
         XCTAssertTrue(
-            accept < block,
-            "the destructive control leads the row again: a card that opens with Block reads "
-                + "as a warning before anyone has read who is asking")
+            card.contains("blockMenu("),
+            "the knock row has no menu, so Block is reachable nowhere on the card")
+        XCTAssertTrue(
+            card.contains("arguments: PeerCommand.block(instance: knock.instanceId)"),
+            "the knock's Block no longer runs the instance-shaped verb, and the proposed "
+                + "name two knocks can share is not an identity")
     }
 
     /// A sheet that goes away takes its subprocess with it.
@@ -315,6 +357,7 @@ final class PeersPanelStateWiringTests: XCTestCase {
     /// sent are refused, with the reason on screen.
     func testADraftRefusesAZeroShareAndAnEndAlreadyPassed() {
         let noon = Date(timeIntervalSince1970: 1_786_000_000)
+        let calendar = Calendar(identifier: .gregorian)
         var draft = LeaseDraft.new(peer: "studio-mac")
         XCTAssertNil(draft.refusal(now: noon), "the shipped default is refused")
 
@@ -322,7 +365,6 @@ final class PeersPanelStateWiringTests: XCTestCase {
         XCTAssertNotNil(draft.refusal(now: noon), "a share of zero is written as a lease")
 
         draft = LeaseDraft.new(peer: "studio-mac")
-        let calendar = Calendar(identifier: .gregorian)
         let hour = calendar.component(.hour, from: noon)
         draft.end = .until(String(format: "%02d:00", max(0, hour - 1)))
         XCTAssertNotNil(
@@ -386,24 +428,33 @@ final class PeersPanelStateWiringTests: XCTestCase {
     func testAFoundRowCanBeBlocked() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let menu = try slice(
-            tab, from: "private func rowMenu(", to: "/// The glyph the live `Menu`")
+            tab, from: "private func rowMenu(", to: "/// One menu, for the two rows")
         XCTAssertTrue(
-            menu.contains("Button(\"Block \\(address)…\", role: .destructive) { blocking = row }"),
+            menu.contains("arguments: PeerCommand.block(address: address)"),
             "a found row cannot be blocked again, so an address can only be banned while it "
                 + "is knocking")
         XCTAssertTrue(
             menu.contains("row.trust != .trusted, let address = row.address"),
             "the menu is offered without an address to aim at, or on a trusted row whose "
                 + "trailing column has no width for it")
+        let shared = try slice(
+            tab, from: "private func blockMenu(", to: "/// The glyph the live `Menu`")
         XCTAssertTrue(
-            menu.contains("if snapshotMode {"),
+            shared.contains("Button(\"Block \\(address)…\", role: .destructive)"),
+            "the menu's one item is not the destructive Block any more")
+        XCTAssertTrue(
+            shared.contains("if snapshotMode {"),
             "the render harness draws a live Menu again, which ImageRenderer rasterises as "
                 + "the prohibited placeholder")
         let confirm = try slice(
             tab, from: "\"Block this Mac?\"", to: "private var blockingIsPresented")
         XCTAssertTrue(
-            confirm.contains("controller.run(PeerCommand.block(address: address))"),
-            "the tab's Block confirm no longer runs the address-shaped verb")
+            confirm.contains("controller.run(target.arguments)"),
+            "the tab's Block confirm no longer runs the argv the chosen row handed it")
+        XCTAssertTrue(
+            confirm.contains("Block \\(target.address)"),
+            "the question no longer names the address, which is the part an operator can "
+                + "check: a proposed name is a string the other Mac chose")
     }
 
     /// A trusted Mac can be blocked from its own sheet, which is where every
@@ -467,10 +518,25 @@ final class PeersPanelStateWiringTests: XCTestCase {
     /// nothing to say.
     func testTheBorrowerRowNamesTheHourTheWorkStops() {
         let now = Date(timeIntervalSince1970: 1_786_000_000)
+        // Inside the hour the END is the headline: it takes the meter's own
+        // right-hand slot, where the percentage was, and comes OUT of the
+        // four-line paragraph, where it was the last clause of the last
+        // sentence on a row that is pixel for pixel the ordinary one.
         let inAnHour = PeerListDocument.PeerEntry(
             name: "studio-mac", trusted: true, serves: true, until: 1_786_003_600)
-        XCTAssertEqual(inAnHour.endsInSentence(now: now), "This lease ends in 1h.")
+        XCTAssertEqual(inAnHour.endsInLabel(now: now), "ends in 1h")
+        XCTAssertNil(
+            inAnHour.endsInSentence(now: now),
+            "the end is stated twice: once in the meter's slot and once at the end of the "
+                + "paragraph")
         XCTAssertFalse(inAnHour.leaseHasEnded(now: now))
+
+        // Further out, the percentage keeps its slot and the sentence keeps
+        // the clause: a lease ending tomorrow is not an amber row.
+        let inFiveHours = PeerListDocument.PeerEntry(
+            name: "studio-mac", trusted: true, serves: true, until: 1_786_018_000)
+        XCTAssertNil(inFiveHours.endsInLabel(now: now))
+        XCTAssertEqual(inFiveHours.endsInSentence(now: now), "This lease ends in 5h.")
 
         let noEnd = PeerListDocument.PeerEntry(name: "attic-nuc", trusted: true, serves: true)
         XCTAssertNil(noEnd.endsInSentence(now: now), "a lease with no end is given one")
@@ -532,16 +598,15 @@ final class PeersPanelStateWiringTests: XCTestCase {
                 + "right now rather than nothing will happen again")
         XCTAssertEqual(ended.rowShape.subLines, 2)
         XCTAssertEqual(
-            LeaseEnded(when: "17:30", sentence: "It ended.").label, "ended 17:30")
+            LeaseEnded(when: "22m ago", sentence: "It ended.").label, "ended 22m ago")
         XCTAssertEqual(
             LeaseEnded(when: nil, sentence: "It ended.").label, "ended",
-            "a lease that ended at an hour nobody reported gets a guessed clock")
+            "a lease that ended at a time nobody reported gets a guessed one")
     }
 
     /// Which direction ended, and who may re-lend it.
     func testAnEndedLeaseKnowsWhichDirectionItWas() {
         let now = Date(timeIntervalSince1970: 1_786_000_000)
-        let calendar = Calendar(identifier: .gregorian)
         let running = PeerListDocument.PeerEntry(
             id: "tcr-4b8we1r0zp", name: "studio-mac", trusted: true, serves: true,
             until: 1_786_003_600)
@@ -553,7 +618,7 @@ final class PeersPanelStateWiringTests: XCTestCase {
             id: "tcr-4b8we1r0zp", name: "studio-mac", trusted: true, serves: true,
             until: 1_785_998_200, ended: true)
         let borrowedEnded = LeaseEnded.forEntry(
-            borrowed, title: "studio-mac", now: now, calendar: calendar)
+            borrowed, title: "studio-mac", now: now)
         XCTAssertNotNil(borrowedEnded, "a borrowed lease that ended is drawn as running")
         XCTAssertNil(
             borrowedEnded?.relendArguments,
@@ -582,12 +647,19 @@ final class PeersPanelStateWiringTests: XCTestCase {
                     until: 1_785_998_200, ended: true)
             ])
         let lent = LeaseEnded.forEntry(
-            allEnded, title: "attic-nuc", now: now, calendar: calendar)
+            allEnded, title: "attic-nuc", now: now)
         XCTAssertEqual(
             lent?.relendArguments,
             ["peer", "lend", "tcr-92hbq5t7yv", "--relend", "ls-4b1f"],
             "the lender's ended row lost the one control that puts the lease back")
-        XCTAssertNotNil(lent?.when, "an ended lease with a clock reports none")
+        // Relative, never a wall clock. `ended 09:36` was the only clock on
+        // a tab where everything else is counted, and with no date on it a
+        // lease that ended yesterday read as one that ended this morning.
+        XCTAssertEqual(
+            lent?.when, "30m ago",
+            "the ended lease is back to a wall clock, which with no date makes yesterday look "
+                + "like this morning")
+        XCTAssertEqual(lent?.label, "ended 30m ago")
     }
 
     /// A row with no wire id yet (an untrusted or freshly-trusted Mac, see
@@ -595,7 +667,6 @@ final class PeersPanelStateWiringTests: XCTestCase {
     /// `PeerId::parse` refuses a name, so that argv used to fail silently.
     func testAnEndedLendWithNoWireIdRefusesRatherThanFallingBackToTheTitle() {
         let now = Date(timeIntervalSince1970: 1_786_000_000)
-        let calendar = Calendar(identifier: .gregorian)
         let noWireId = PeerListDocument.PeerEntry(
             id: nil, name: "attic-nuc", trusted: true,
             lend: [
@@ -604,7 +675,7 @@ final class PeersPanelStateWiringTests: XCTestCase {
                     until: 1_785_998_200, ended: true)
             ])
         let lent = LeaseEnded.forEntry(
-            noWireId, title: "attic-nuc", now: now, calendar: calendar)
+            noWireId, title: "attic-nuc", now: now)
         XCTAssertNil(
             lent?.relendArguments,
             "no wire id means no Re-lend argv, never one built on the title")
@@ -714,11 +785,14 @@ final class PeersPanelStateWiringTests: XCTestCase {
     func testARefusedVerbNoLongerReplacesTheTab() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let body = try slice(tab, from: "var body: some View {", to: "/// Close the Trust sheet")
+        // The banner takes the whole refusal now, not its raw string: it
+        // leads with the act that was refused and holds the command line and
+        // the exit code behind Details.
         XCTAssertTrue(
-            body.contains("if let refused = controller.refusal.message {")
-                && body.contains("refusalBanner(refused)"),
+            body.contains("if controller.refusal.isShowing {")
+                && body.contains("refusalBanner(controller.refusal)"),
             "a refused verb is no longer drawn as a banner above the tab")
-        let banner = try XCTUnwrap(body.range(of: "refusalBanner(refused)")).lowerBound
+        let banner = try XCTUnwrap(body.range(of: "refusalBanner(controller.refusal)")).lowerBound
         let find = try XCTUnwrap(body.range(of: "findCard")).lowerBound
         XCTAssertTrue(banner < find, "the banner is below the controls it is an answer to")
         XCTAssertTrue(
@@ -735,8 +809,9 @@ final class PeersPanelStateWiringTests: XCTestCase {
             tab, from: "private func run(arguments: [String], stdin: String?) {",
             to: "/// Runs one verb and hands back what it PRINTED")
         XCTAssertTrue(
-            run.contains("self.refusal.refused(message)"),
-            "a refused verb no longer lands in the refusal beside the snapshot")
+            run.contains("self.refusal.refused(message, verb: arguments)"),
+            "a refused verb no longer lands in the refusal beside the snapshot, or lands "
+                + "without the argv the banner names the act from")
         XCTAssertFalse(
             run.contains("PeersSnapshotBuilder.failed(message)"),
             "a refused verb is written into the snapshot again, so the tab is replaced by one "

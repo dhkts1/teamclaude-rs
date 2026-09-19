@@ -294,11 +294,30 @@ final class PeersStatusBlockTests: XCTestCase {
 
     /// A `tcr` with no live-peers verb: the tab keeps every row it read from
     /// the file and draws no paths. Forward compatibility, not a failure.
-    func testAnUnsupportedLiveReadLeavesTheDocumentAlone() {
+    ///
+    /// Every ROW is left alone. One thing is recorded: whether the live half
+    /// answered at all, which used to be dropped here and is the one fact
+    /// that tells "this Mac looked and found no way there" from "nothing
+    /// looked". The whole-document equality this test used to assert could
+    /// not distinguish the two, which is what let the tab word both the same.
+    func testAnUnsupportedLiveReadLeavesEveryRowAloneAndRecordsThatItDidNotAnswer() {
         let file = PeerListDocument(
             peers: [.init(id: "tcr-0W3GE1R70W", name: "studio-mac", trusted: true)])
-        XCTAssertEqual(file.mergingLive(.unsupported), file)
-        XCTAssertEqual(file.mergingLive(.init(supported: true, peers: [])), file)
+
+        let unread = file.mergingLive(.unsupported)
+        XCTAssertEqual(unread.peers, file.peers, "a row changed on a read that answered nothing")
+        XCTAssertEqual(
+            unread.liveAnswered, false,
+            "the tab cannot tell an unread live half from a measured absence again")
+
+        let answeredWithNoRows = file.mergingLive(.init(supported: true, peers: []))
+        XCTAssertEqual(answeredWithNoRows.peers, file.peers)
+        XCTAssertEqual(
+            answeredWithNoRows.liveAnswered, true,
+            "a live half that answered and reported no peers is a measurement, not silence")
+        XCTAssertNil(
+            file.liveAnswered,
+            "a document nobody merged a live read into claims one either way")
     }
 
     /// A pinned Mac the file half never listed is the one Mac an operator is

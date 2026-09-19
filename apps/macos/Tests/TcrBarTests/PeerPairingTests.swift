@@ -65,11 +65,22 @@ final class PeerPairingTests: XCTestCase {
         state = state.applying(
             .asking(addr: "10.0.1.24:7749", instance: "8f2c1ad63b0e4471", waitSeconds: 600))
         XCTAssertEqual(state, .asking(instance: "8f2c1ad63b0e4471"))
+        // The sentence on the sheet is what somebody at the other Mac can act
+        // on from the panel they are already looking at. The two commands and
+        // the instance id are still available, in the button's help, where a
+        // bug report can find them and a person reading the sheet does not
+        // have to.
         XCTAssertEqual(
             state.farSideInstruction,
-            "On that Mac, `tcr peer pending` lists this request and "
-                + "`tcr peer accept 8f2c1ad63b0e4471` approves it. Nothing has been disclosed "
-                + "to it yet.")
+            "On that Mac, the Peers tab shows this request and anybody there can press "
+                + "Accept. Nothing has been disclosed to it yet.")
+        XCTAssertFalse(
+            state.farSideInstruction?.contains("`") ?? true,
+            "the sheet prints backticks again, and they draw as the characters they are")
+        XCTAssertEqual(
+            state.farSideCommands,
+            "On that Mac, tcr peer pending lists this request and tcr peer accept "
+                + "8f2c1ad63b0e4471 approves it.")
         state = state.applying(.comparing(code: "418902"))
         XCTAssertEqual(state, .comparing(code: "418902"))
         XCTAssertTrue(state.isLive)

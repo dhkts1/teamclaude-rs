@@ -239,6 +239,200 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "is stored, accepted, and then opens the Accounts tab")
     }
 
+    // MARK: - One fact, in the one place that owns it
+
+    /// The Mac count belongs to the footer, and the Find card's subtitle is
+    /// the only line on the tab that could say what finding DOES.
+    ///
+    /// The count was printed twice in one scroll, about fifteen points apart:
+    /// `Looking. 2 Macs found, 2 trusted.` in this subtitle and `2 Macs
+    /// found, 2 trusted` in the footer under the list. Spending the one
+    /// describing line on a number that is already below is what this closes.
+    func testTheFindCardSubtitleDescribesFindingRatherThanCountingMacs() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let card = try slice(
+            tab, from: "private var findCard: some View {", to: "private var shareCard")
+        XCTAssertFalse(
+            card.contains("snapshot.countLine"),
+            "the Find card prints the Mac count again, a few points above the footer that "
+                + "owns it")
+        XCTAssertTrue(
+            card.contains("Looking. Other Macs running tcr appear below by themselves."),
+            "the Looking arm no longer says what finding does, which is the one thing this "
+                + "line is for")
+    }
+
+    /// A capability and an act get different words.
+    ///
+    /// The pill means "is willing to relay" and it read as "is relaying now",
+    /// on a row whose own path line said its traffic went through somebody
+    /// else. The pill states the capability; the path line under it states the
+    /// act. And the word is written ONCE, because the pill and the sentence
+    /// behind it are the same string in two places.
+    func testTheCarryPillNamesTheCapabilityAndIsWrittenOnce() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("static let carryPillText = \"can carry\""),
+            "the carry pill's word is not the capability, or is no longer written in one "
+                + "place for the pill and its help to share")
+        XCTAssertFalse(
+            tab.contains("(\"carries\", .info)"),
+            "the pill says carries again, which reads as an act on a row whose path line "
+                + "says the bytes go through a third Mac")
+        XCTAssertFalse(
+            tab.contains("case \"carries\": return"),
+            "the pill help is keyed on the old word, so the pill an operator hovers has no "
+                + "sentence behind it at all")
+    }
+
+    /// Neither Trust control wears a checkmark.
+    ///
+    /// A checkmark is the universal "already done". It was drawn on the found
+    /// row's button, whose own subtitle two lines below reads `not trusted`,
+    /// and on the sheet's Trust button while that button was disabled. The
+    /// word is the control.
+    func testNoTrustControlDrawsACheckmark() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertFalse(
+            tab.contains("systemImage: \"checkmark\""),
+            "a Trust control carries a checkmark again, which reads as done on a row that "
+                + "says not trusted and on a button that cannot be pressed yet")
+    }
+
+    /// No drawing of the mesh until there is a mesh.
+    ///
+    /// With nothing trusted the card was a paragraph saying there is nothing
+    /// to draw, stacked directly above another card saying there is nothing
+    /// found: about two fifths of the panel spent on two absences, and the
+    /// found card below already says it.
+    func testTheMeshCardIsDrawnOnlyWhenAMacIsTrusted() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let body = try slice(tab, from: "                findCard", to: "ForEach(snapshot.pending)")
+        XCTAssertTrue(
+            body.contains("if snapshot.trustedCount > 0 {"),
+            "the mini mesh is drawn unconditionally again, so an empty drawing sits above "
+                + "an empty found card")
+        XCTAssertTrue(
+            body.contains("MiniMeshCard("),
+            "the mesh card is gone from the tab altogether, not just from the empty state")
+    }
+
+    /// The carry sentence is said once, above the list, and the rows that do
+    /// not deviate from it say nothing.
+    ///
+    /// It was repeated word for word on every trusted row, seven times in the
+    /// seven-Mac state, for a fact that is true of every trusted Mac. A row
+    /// keeps a sentence of its own only where it deviates, which is the
+    /// gateway row with its own byte figures.
+    func testTheCarrySentenceIsSaidOnceAboveTheList() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("static let carrySentence ="),
+            "the shared carry sentence is not one string any more")
+        let head = try slice(
+            tab, from: "private var sectionHead: some View {", to: "private var countLine")
+        XCTAssertTrue(
+            head.contains("PeersSnapshotBuilder.carrySentence"),
+            "the section head no longer carries the sentence, so the fact is said nowhere")
+        XCTAssertFalse(
+            tab.contains("\"Carries your traffic when this Mac has no route of its own"),
+            "the per-row copy of the carry sentence is back, once per trusted row, and it "
+                + "still says route where the tab says path")
+        let metrics = try slice(
+            tab, from: "static var heightMetrics: PeerPanelHeight.Metrics {", to: "private func pillHelp")
+        XCTAssertTrue(
+            metrics.contains("carrySentenceLines"),
+            "the height budget does not charge for the sentence under the section head, and "
+                + "growth the budget cannot see comes out of the footer")
+    }
+
+    /// The row decides which absence its empty path list means, and a row
+    /// with traffic on it prints none.
+    ///
+    /// `PeerFormat` cannot answer this: only the caller knows whether the
+    /// live half answered and whether work is in flight. The row printed
+    /// `2 requests are on studio-mac's accounts now` two lines above `no path
+    /// right now`, which is one card saying traffic is flowing over a route
+    /// it also says does not exist.
+    func testTheRowPicksWhichAbsenceItsPathListMeans() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let builder = try slice(
+            tab, from: "private static func row(", to: "private static func pills(")
+        XCTAssertTrue(
+            builder.contains("let working = (entry.inFlight ?? 0) > 0"),
+            "traffic no longer silences the absent path line, so a row can contradict "
+                + "itself two lines apart")
+        XCTAssertFalse(
+            builder.contains("meter.isLiveLease"),
+            "a standing lease with nothing on it silences the line again, and that is not "
+                + "traffic: it cost a sleeping Mac's row the one true line it had")
+        XCTAssertTrue(
+            builder.contains("working ? .silent"),
+            "a row with work in flight prints an absence again")
+        XCTAssertTrue(
+            builder.contains("liveAnswered == false ? .notReported : .measured"),
+            "a live half that never answered is reported as a measured absence, which is a "
+                + "claim this panel did not measure")
+        XCTAssertTrue(
+            builder.contains("absence: absence"),
+            "the decision is made and then not handed to the lines it decides")
+    }
+
+    /// The unsupported card offers the update it asks for, and offers it only
+    /// when it can really run one.
+    ///
+    /// It told an operator to update `tcr` and gave them nothing to press,
+    /// while the app ships an update flow the menu bar item runs. The panel
+    /// cannot reach the shell's updater by itself, so the act is injected: a
+    /// caller that has one hands it over, and with none the control is not
+    /// drawn at all rather than wired to a closure that does nothing.
+    func testTheUnsupportedCardOffersTheUpdateItAsksFor() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("var onCheckForUpdates: (() -> Void)?"),
+            "the update act is not injected any more, so the panel either reaches a global "
+                + "or the card is back to naming an act it cannot perform")
+        XCTAssertTrue(
+            tab.contains("checkForUpdates: onCheckForUpdates"),
+            "the unsupported card does not hand its control the act, so pressing it does "
+                + "nothing")
+        let card = try slice(
+            tab, from: "private func collapsed(", to: "/// The refused verb, in `tcr`'s own")
+        XCTAssertTrue(
+            card.contains("if let checkForUpdates {"),
+            "the button is drawn whether or not there is an update check behind it, which is "
+                + "a control that lies")
+        XCTAssertTrue(
+            card.contains("title: \"Check for updates…\""),
+            "the control is not the one the card's own sentence asks for")
+    }
+
+    /// A Mac with no network at all says so, in both cards, and only when the
+    /// running tcr reported it.
+    ///
+    /// It was drawn as "looking", with a card under it explaining that only
+    /// Macs on this network can appear, to somebody who is on no network.
+    func testTheFindCardHasANoNetworkArmThatAbsenceCannotTrigger() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("private var noNetwork: Bool { snapshot.network == false }"),
+            "the no-network arm is not keyed on a REPORTED false, so every tcr that does not "
+                + "report interfaces draws a network failure that is nothing of the sort")
+        let card = try slice(
+            tab, from: "private var findCard: some View {", to: "private var shareCard")
+        XCTAssertTrue(
+            card.contains(
+                "\"No network. This Mac is not on Wi-Fi or Ethernet, so there is \""),
+            "the Find card claims it is looking on a Mac that cannot look")
+        let empty = try slice(
+            tab, from: "private var emptyCard: some View {", to: "private var sectionHead")
+        XCTAssertTrue(
+            empty.contains("\"No network\"")
+                && empty.contains("Join a Wi-Fi network or plug in a cable."),
+            "the card under it still explains that only Macs on this network can appear, to "
+                + "somebody who is on no network")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
