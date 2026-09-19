@@ -21,12 +21,18 @@ import SwiftUI
 /// `.name` — an account or session name. 15 pt / 600 / -0.005em, `ink`.
 struct NameText: View {
     let text: String
+    /// One line, as every other role here defaults to. Opt-in to two for a
+    /// name line that is a SENTENCE rather than an identifier: the request to
+    /// pair reads `<name> wants to pair`, and a Mac with a long name lost the
+    /// verb to the ellipsis, which left the one line that says a stranger is
+    /// asking for something saying only that a stranger exists.
+    var lineLimit: Int? = 1
     var body: some View {
         Text(text)
             .font(V4.font(V4.nameSize, .semibold))
             .tracking(V4.nameTracking)
             .foregroundStyle(Tok.ink)
-            .lineLimit(1)
+            .lineLimit(lineLimit)
             .truncationMode(.tail)
             .frame(minHeight: V4.lineHeight(V4.nameSize), alignment: .leading)
             .help(text)

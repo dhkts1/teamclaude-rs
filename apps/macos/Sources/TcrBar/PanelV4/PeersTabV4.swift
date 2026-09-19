@@ -1606,33 +1606,39 @@ struct PeersTabV4: View {
             ),
         ]
         return V4Card {
-            VStack(alignment: .leading, spacing: 3) {
-                V4Row {
-                    VStack(alignment: .leading, spacing: 2) {
-                        // The proposed name (or the address, when no name was
-                        // sent) on its own line, and the address ALWAYS on a
-                        // second line rather than folded into one via
-                        // `knockTitle`: a `NameText` is one line by design
-                        // (`V4Text.swift`), and "loft-mini (10.0.1.24) wants
-                        // to pair" truncated to "loft-mini (10.0.1…" mid
-                        // address, which is exactly the part an operator is
-                        // meant to be able to check.
-                        NameText(text: PeerAdmission.knockNameLine(knock))
-                        if let address = PeerAdmission.knockAddressLine(knock) {
-                            MuteText(text: address, lineLimit: 1)
-                        }
-                        MuteText(text: PeerAdmission.knockDetail, lineLimit: nil)
-                    }
-                } trailing: {
-                    HStack(spacing: V4.pillGap) {
-                        ForEach(verbs, id: \.title) { verb in
-                            PeerActionButton(
-                                title: verb.title,
-                                systemImage: nil,
-                                help: verb.help,
-                                enabled: !controller.isPending(verb.argv),
-                                action: { controller.run(verb.argv) })
-                        }
+            VStack(alignment: .leading, spacing: V4.knockLineGap) {
+                // The whole card width for the sentence, and the buttons on
+                // their own row underneath.
+                //
+                // They used to sit in a `V4Row`'s trailing slot, which gives
+                // the trailing column `layoutPriority(1)` and clips the
+                // leading label to pay for it: three buttons squeezed the
+                // sentence to about 130 pt and it rendered `loft-mini wants
+                // t…`. The one line on this tab that says a stranger's Mac is
+                // asking to pair was cut mid-word, verb gone, in both
+                // appearances. Nothing about these three controls needs to be
+                // on the title's line.
+                //
+                // The proposed name (or the address, when no name was sent) on
+                // its own line, and the address ALWAYS on a second line rather
+                // than folded into one via `knockTitle`: "loft-mini
+                // (10.0.1.24) wants to pair" truncated to "loft-mini
+                // (10.0.1…" mid address, which is exactly the part an operator
+                // is meant to be able to check.
+                NameText(text: PeerAdmission.knockNameLine(knock), lineLimit: 2)
+                if let address = PeerAdmission.knockAddressLine(knock) {
+                    MuteText(text: address, lineLimit: 1)
+                }
+                MuteText(text: PeerAdmission.knockDetail, lineLimit: nil)
+                HStack(spacing: V4.pillGap) {
+                    Spacer(minLength: 0)
+                    ForEach(verbs, id: \.title) { verb in
+                        PeerActionButton(
+                            title: verb.title,
+                            systemImage: nil,
+                            help: verb.help,
+                            enabled: !controller.isPending(verb.argv),
+                            action: { controller.run(verb.argv) })
                     }
                 }
                 yesBlock(

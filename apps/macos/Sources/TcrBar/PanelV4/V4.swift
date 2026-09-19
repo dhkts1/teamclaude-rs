@@ -412,6 +412,10 @@ enum V4 {
     /// the pill's own rounded border.
     static let meshPillLabelInset: CGFloat = 20
 
+    /// The gap between the lines of a pairing request's card: the sentence,
+    /// the address, what Accept does, and the row of controls under them.
+    static let knockLineGap: CGFloat = 3
+
     // MARK: - The six digits (`.code`, `.code span`)
     //
     // The pairing sheet's own block, transcribed from the onboarding mockup's

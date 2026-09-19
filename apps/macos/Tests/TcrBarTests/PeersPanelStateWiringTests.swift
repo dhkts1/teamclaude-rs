@@ -207,6 +207,39 @@ final class PeersPanelStateWiringTests: XCTestCase {
                 + "default disposition terminates the menu-bar app, not the subprocess")
     }
 
+    // MARK: - The request to pair, readable
+
+    /// The sentence that says a stranger is asking gets the whole card width.
+    ///
+    /// It used to sit in a `V4Row`'s leading slot with three buttons in the
+    /// trailing one. `V4Row` gives the trailing column `layoutPriority(1)` and
+    /// clips the leading label to pay for it, so the sentence rendered as
+    /// `loft-mini wants t…`: the verb, the only word that says what is being
+    /// asked, was the part that went.
+    func testTheRequestToPairIsNotSqueezedByItsOwnButtons() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let card = try slice(
+            tab, from: "private func knockCard(", to: "/// `12 shown, 3 more not shown`")
+        XCTAssertFalse(
+            card.contains("} trailing: {"),
+            "the controls are back in the trailing slot beside the sentence, which clips the "
+                + "sentence to pay for them")
+        XCTAssertTrue(
+            card.contains("NameText(text: PeerAdmission.knockNameLine(knock), lineLimit: 2)"),
+            "the sentence is one line again, so a Mac with a long name still loses its verb")
+        let buttons = try XCTUnwrap(card.range(of: "PeerActionButton(")).lowerBound
+        let name = try XCTUnwrap(card.range(of: "NameText(text:")).lowerBound
+        XCTAssertTrue(
+            name < buttons,
+            "the controls are drawn above the sentence they are an answer to")
+        let block = try XCTUnwrap(card.range(of: "\"Block\", PeerCommand.block")).lowerBound
+        let accept = try XCTUnwrap(card.range(of: "\"Accept\", PeerCommand.accept")).lowerBound
+        XCTAssertTrue(
+            accept < block,
+            "the destructive control leads the row again: a card that opens with Block reads "
+                + "as a warning before anyone has read who is asking")
+    }
+
     /// A sheet that goes away takes its subprocess with it.
     func testClosingTheSheetStopsThePairing() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
