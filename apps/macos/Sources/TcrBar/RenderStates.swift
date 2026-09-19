@@ -2691,19 +2691,26 @@ enum RenderStates {
     /// A PARKED GROUP BESIDE A LIVE ONE — the state a screenshot is the only
     /// honest check on, because every part of it is visual.
     ///
-    /// Four rows, and the last two are the point:
-    ///  - two members of parked `henry-team`, one of which is ALSO disabled by
-    ///    hand. Both draw `PARKED`, but for different reasons, and the fixture
-    ///    exists to show that the panel does not need them to look different:
-    ///    the consequence is identical, and the group tag says which is which.
+    /// Six rows, and the four `henry-team` members are the point:
+    ///  - four members of parked `henry-team`, one of which is ALSO disabled
+    ///    by hand. All draw `PARKED`, but for different reasons, and the
+    ///    fixture exists to show that the panel does not need them to look
+    ///    different: the consequence is identical, and the group tag says
+    ///    which is which.
     ///  - a member of live `dev`, the control: if the dimming is wrong, or
     ///    applied to every tag, this row shows it.
     ///  - an ungrouped row, so the scene also carries a tag-less baseline.
     ///
-    /// The pass condition is that the two parked tags read as held back — dim
+    /// The pass condition is that the parked tags read as held back — dim
     /// wash, pause glyph — while `DEV` beside them stays at full strength and
     /// still identifiable by colour. A tag that dims into illegibility fails
     /// this scene as surely as one that does not dim at all.
+    ///
+    /// Four members, not two: a wholly-parked group shows its first three
+    /// rows and a "Show N more" button, collapsed or expanded, and with only
+    /// two members there is nothing left to hide, so the collapsed and
+    /// expanded renders drew the same picture. The fourth member is the row
+    /// that only the expanded scene shows.
     private static var parkedGroupJSON: String {
         let parkedLive = account(
             "alice@example.com", quota: "0.12", state: "ok",
@@ -2717,13 +2724,26 @@ enum RenderStates {
             groupColors: parkedSceneColors,
             plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222",
             gate: "disabled")
+        let parkedThird = account(
+            "erin@example.com", quota: "0.55", state: "ok",
+            groups: ["henry-team"], parkedGroups: ["henry-team"],
+            groupColors: parkedSceneColors,
+            plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222",
+            gate: "parked")
+        let parkedFourth = account(
+            "frank@example.com", quota: "0.09", state: "ok",
+            groups: ["henry-team"], parkedGroups: ["henry-team"],
+            groupColors: parkedSceneColors,
+            plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222",
+            gate: "parked")
         let live = account(
             "carol@example.com", quota: "0.44", state: "ok",
             groups: ["dev"], groupColors: parkedSceneColors,
             plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222",
             gate: "ok")
         let ungrouped = account("dave@example.com", quota: "0.08", state: "ok", gate: "ok")
-        return "[\(parkedLive),\(parkedAndDisabled),\(live),\(ungrouped)]"
+        return
+            "[\(parkedLive),\(parkedAndDisabled),\(parkedThird),\(parkedFourth),\(live),\(ungrouped)]"
     }
 
     /// Real colours for the parked scene: dimming is invisible against the
