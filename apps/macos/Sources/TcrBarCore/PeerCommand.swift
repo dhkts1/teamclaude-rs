@@ -104,6 +104,30 @@ public enum PeerCommand {
         PeerSecretInvocation(arguments: ["peer", "join", "--stdin"], stdin: key)
     }
 
+    /// `tcr peer moved mint <peer>`, one link for one Mac this one already
+    /// trusts, to be handed over in whatever chat the two people already use.
+    ///
+    /// The peer id is NOT a secret: it is what `tcr peer ls` prints in the
+    /// first column and what the panel already draws, so it rides argv like
+    /// every other verb's subject. ``moved(open:apply:)`` is the other half,
+    /// and it is a different kind of value, which is why the two are separate
+    /// factories rather than one with a flag.
+    public static func moved(mint peer: String) -> [String] { ["peer", "moved", "mint", peer] }
+
+    /// `tcr peer moved open --stdin [--yes]`, with the whole link on stdin.
+    ///
+    /// Returns the refusal rather than an invocation when the URL is not a
+    /// moved link, so no caller can pipe an arbitrary URL into `tcr`.
+    ///
+    /// `apply` is the operator's answer, carried straight through: `false`
+    /// reads the link and writes nothing, `true` keeps what the first run
+    /// showed them.
+    public static func moved(
+        open link: URL, apply: Bool = false
+    ) -> Result<PeerSecretInvocation, PeerMovedLink.Refusal> {
+        PeerMovedLink.invocation(for: link, apply: apply)
+    }
+
     /// `tcr peer id --regenerate --yes`, the pane asked first, so the CLI
     /// must not ask again. `--yes` is what makes the `confirmationDialog` the
     /// one and only confirmation; without it this button opens a prompt on a
