@@ -58,7 +58,7 @@ struct AccountExitRow: View {
                 }
                 Spacer(minLength: 0)
                 if exit.showsMust {
-                    Text("must")
+                    Text(exit.mustLabel(peers: peerRows))
                         .font(V4.font(V4.muteSize))
                         .foregroundStyle(Tok.mute)
                     MustSwitch(on: exit.strict) { onToggleMust(!exit.strict) }
