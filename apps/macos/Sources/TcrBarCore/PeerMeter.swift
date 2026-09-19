@@ -11,7 +11,8 @@ import CoreGraphics
 
 /// Which Mac is the lender, said once, so the pill and the meter label that
 /// name the same fact cannot drift apart the way `serves`/`serving you` and a
-/// meter fixed at `shared` once did (rule 2 of the mockup's settled words).
+/// meter fixed at `shared` once did: a direction-less word reads the same
+/// whether this Mac lends or borrows, so the reader has to guess which.
 public enum PeerLendDirection: Equatable {
     /// This Mac answers requests on its own accounts, for the peer.
     case youLend

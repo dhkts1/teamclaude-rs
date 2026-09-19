@@ -113,10 +113,10 @@ final class PeerMeterTests: XCTestCase {
         XCTAssertEqual(LeaseFraction(spent: -1, sentence: "").spent, 0)
     }
 
-    /// The mockup's rule 2, as the two words a Mac lends and a Mac borrows: a
-    /// direction is always named, never the bare word `shared`. One place
-    /// decides the words, so the pill and the meter label cannot phrase the
-    /// same fact two ways.
+    /// The two words a Mac lends and a Mac borrows: a direction is always
+    /// named, never the bare word `shared`, which reads the same whichever
+    /// way the lease runs. One place decides the words, so the pill and the
+    /// meter label cannot phrase the same fact two ways.
     func testPeerLendDirectionNamesTheWordsOnce() {
         XCTAssertEqual(PeerLendDirection.youLend.pillText, "you lend")
         XCTAssertEqual(PeerLendDirection.theyLend.pillText, "they lend")

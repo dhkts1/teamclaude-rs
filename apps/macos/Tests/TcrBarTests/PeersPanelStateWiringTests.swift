@@ -822,7 +822,8 @@ final class PeersPanelStateWiringTests: XCTestCase {
     // MARK: - Item 9: lending and borrowing say which Mac is the lender
 
     /// The pill says `you lend` or `they lend`, never the bare literal
-    /// `serves`/`serving you` this tab drew before the mockup's rule 2: a
+    /// `serves`/`serving you` this tab drew before: a word with no direction
+    /// in it reads the same whether this Mac is lending or borrowing, so a
     /// direction is always named.
     func testThePillNamesADirectionNotTheBareVerb() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
