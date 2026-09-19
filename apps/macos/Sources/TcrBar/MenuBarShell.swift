@@ -573,21 +573,6 @@ final class MenuBarShell {
 
     func openPanel() {
         guard let button = statusItem.button else { return }
-        // macOS owns the login-item bit and the operator can revoke it in System
-        // Settings, so a cached value is a lie (`LoginItem.swift:5-12`). Under
-        // `MenuBarExtra` this rode on `FleetView`'s own `.onAppear`, which fired
-        // on every open because the panel was rebuilt every time. One popover
-        // keeps one hosting controller for the life of the app, so that
-        // `onAppear` now fires once and never again — losing this line is a
-        // silent regression, not a visible one.
-        loginItem.refresh()
-        // Same reasoning as `loginItem.refresh()` above: another `tcr control`
-        // call — from this app's own menu on a previous open, from the CLI
-        // directly, or from a second TcrBar instance — can have changed it
-        // since this panel last drew, and there is no push channel that would
-        // tell this view. `control` is `@Published`, so a stale in-flight open
-        // still redraws once this completes.
-        Task { await control.refresh() }
         // Without activation the panel opens without key focus, and
         // `.textSelection(.enabled)` on the account name (`FleetView.swift:537`)
         // stops working.
@@ -616,6 +601,42 @@ final class MenuBarShell {
         // replacement has no way to express "the user asked for this window".
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // Every re-read the panel needs, started AFTER it is on screen.
+        //
+        // The panel draws the last snapshot immediately and each of these
+        // updates it when it lands. They used to run in front of the show,
+        // which put a system call and a subprocess between the click and the
+        // first frame for facts the first frame does not need: measured on one
+        // machine, the login-item read alone is 19ms to 24ms of blocking main
+        // thread, and the open was the only thing waiting for it.
+        //
+        // macOS owns the login-item bit and the operator can revoke it in
+        // System Settings, so a cached value is a lie (`LoginItem.swift:5-12`).
+        // Under `MenuBarExtra` this rode on `FleetView`'s own `.onAppear`,
+        // which fired on every open because the panel was rebuilt every time.
+        // One popover keeps one hosting controller for the life of the app, so
+        // that `onAppear` now fires once and never again: losing this line is a
+        // silent regression, not a visible one.
+        loginItem.refresh()
+        // Same reasoning as `loginItem.refresh()` above: another `tcr control`
+        // call, from this app's own menu on a previous open, from the CLI
+        // directly, or from a second TcrBar instance, can have changed it since
+        // this panel last drew, and there is no push channel that would tell
+        // this view. `control` is `@Published`, so a stale in-flight open still
+        // redraws once this completes.
+        Task { await control.refresh() }
+        // The fleet, on the same terms, and this one is what the panel is
+        // mostly made of.
+        //
+        // The poll runs on a 3s timer and an open used to take whatever the
+        // last tick left, so the figures a person reads after clicking were up
+        // to one whole interval old and the fresh ones arrived up to 3000ms
+        // later, with nothing on screen saying so. One poll costs a fraction of
+        // that: measured on one machine, 229ms, 288ms and 249ms before the two
+        // halves were made to run at once. So the open asks for a read of its
+        // own rather than waiting for the timer, and the panel it is drawing
+        // meanwhile is the same panel it always drew.
+        Task { await poller.pollOnce() }
     }
 
     func closePanel() {
