@@ -224,6 +224,52 @@ final class PeersSettingsPaneRenderWiringTests: XCTestCase {
                 + "places, and they are formatted differently")
     }
 
+    // MARK: - Item 4: the internet row's retry button fires something
+
+    /// The button existed with no `onRetry:` argument reaching it, so it drew
+    /// and did nothing: the exact "check the surface a user reads" defect
+    /// this repo's own rules warn about, since every gate below the render
+    /// stays green whether the button is wired or not.
+    func testTheInternetRowIsPassedAnOnRetryClosure() throws {
+        let pane = try source("apps/macos/Sources/TcrBar/PeersSettingsView.swift")
+        XCTAssertTrue(
+            pane.contains("onRetry: retryReach"),
+            "PeerInternetRow is built with no onRetry: argument, so its button fires "
+                + "nothing")
+    }
+
+    /// The retry button never re-runs `PeerCommand.internet`: the switch
+    /// itself has not moved, only the probe under it.
+    func testRetryReachRunsTheProbeAloneNeverTheSwitch() throws {
+        let pane = try source("apps/macos/Sources/TcrBar/PeersSettingsView.swift")
+        let retry = try slice(
+            pane, from: "    private func retryReach() {", to: "    private var announceNameBinding:")
+        XCTAssertTrue(
+            retry.contains("controller.capture(PeerCommand.reach)"),
+            "retryReach no longer runs the reach probe")
+        XCTAssertFalse(
+            retry.contains("controller.run(PeerCommand.internet"),
+            "retryReach writes the switch again; a retry must never move it")
+    }
+
+    /// The in-flight flag is threaded into the one place that decides the
+    /// row's state, so the button reads Asking… and goes unavailable while a
+    /// retry is outstanding.
+    func testTheRetryFlagReachesTheStateDecision() throws {
+        let pane = try source("apps/macos/Sources/TcrBar/PeersSettingsView.swift")
+        XCTAssertTrue(
+            pane.contains("@State private var isRetryingReach = false"),
+            "the in-flight retry flag is gone, so the row can no longer tell asking from "
+                + "retrying")
+        let state = try slice(
+            pane, from: "    private var internetState: PeerInternetReach {",
+            to: "    /// The press: write the setting")
+        XCTAssertTrue(
+            state.contains("retrying: isRetryingReach"),
+            "internetState no longer passes retrying: into PeerInternetReach.state, so a "
+                + "retry press reads as an ordinary asking instead of its own case")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
