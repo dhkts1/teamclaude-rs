@@ -281,19 +281,38 @@ public enum PeerAdmission {
         return "\(name) wants to connect"
     }
 
-    /// The address on its own line beside ``knockNameLine``, with the
-    /// deadline counted beside it: `10.0.1.24 · expires in 7m`.
+    /// The address on its own line beside ``knockNameLine``: `10.0.1.24`, or
+    /// `no name sent` when the knock proposed none.
     ///
-    /// When no name was proposed, ``knockNameLine`` already IS the address and
-    /// this line is the count alone; with neither an expiry nor a name there
-    /// is nothing left to say and the line is `nil`.
-    public static func knockAddressLine(_ knock: PeerKnock, now: Date) -> String? {
+    /// **The deadline is no longer folded in here.** It is counted by
+    /// ``knockExpiryPill(_:now:)`` and drawn as a pill on this same row, and a
+    /// countdown printed in both places is one fact said twice, which is the
+    /// one that drifts. Nothing in this line counts any more, so it takes no
+    /// clock.
+    ///
+    /// Never `nil`. When no name was proposed ``knockNameLine`` already IS the
+    /// address, so this line says what is MISSING rather than repeating the
+    /// address or collapsing to nothing: a card whose second line vanished
+    /// looked like a card whose second line failed to load.
+    public static func knockAddressLine(_ knock: PeerKnock) -> String {
         let named = !(knock.proposedName ?? "").isEmpty
-        let expiry = knockExpiry(firstSeenMs: knock.firstSeenMs, now: now)
-            .map { "expires in \($0)" }
-        guard named else { return expiry }
-        guard let expiry else { return knock.addr }
-        return "\(knock.addr) · \(expiry)"
+        return named ? knock.addr : "no name sent"
+    }
+
+    /// `Expires in 9m` for the pill on the knock card's address row, or `nil`
+    /// when there is nothing honest to count.
+    ///
+    /// Over ``knockExpiry(firstSeenMs:now:)`` rather than beside it: that
+    /// function already decides both absences, a knock past its deadline and
+    /// one whose sender stamped no time, and `nil` here is the honest answer
+    /// for each. No pill at all, never a zero and never an invented ten
+    /// minutes. The card keeps its accent either way: it still expires, this
+    /// Mac just cannot say when.
+    public static func knockExpiryPill(_ knock: PeerKnock, now: Date) -> String? {
+        guard let remaining = knockExpiry(firstSeenMs: knock.firstSeenMs, now: now) else {
+            return nil
+        }
+        return "Expires in \(remaining)"
     }
 
     /// How long a knock stands before the Mac holding it drops the row.
@@ -320,10 +339,19 @@ public enum PeerAdmission {
         return PeerFormat.span(remaining)
     }
 
-    /// What Accept buys, under the title. Decision row 10 in one line:
+    /// What Accept buys, under the address. Decision row 10 in one sentence:
     /// approval comes first and nothing is shared until Trust.
+    ///
+    /// **One sentence, because the card used to carry two.** This line and the
+    /// block under the buttons both said "six digits" and both said "nothing
+    /// is shared until Trust", which is one promise written twice on one card;
+    /// the block is gone and what it added, that this Mac pins, carries and
+    /// serves nothing meanwhile, is the second half of this sentence. The card
+    /// ends up shorter than it was, which is what pays for a line that wraps
+    /// whole instead of being cut mid-word.
     public static let knockDetail =
-        "Accepting shows six digits on both screens; nothing is shared until you press Trust."
+        "Accepting shows six digits on both screens. Until you press Trust on both, this Mac "
+        + "pins nothing, carries nothing and serves nothing."
 
     /// `12 shown, 3 more not shown`, or `nil` when nothing was held back.
     ///

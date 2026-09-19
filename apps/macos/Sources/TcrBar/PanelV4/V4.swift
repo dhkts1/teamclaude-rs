@@ -610,6 +610,16 @@ enum V4 {
     static let yesBlockPaddingH: CGFloat = 8
     static let yesBlockMarginTop: CGFloat = 6
 
+    /// A tinted surface: its wash over the fill under it, and its border.
+    ///
+    /// The pair `PeersTabV4.yesBlock` has always drawn at, written here rather
+    /// than at each site so a card that wears a colour and a block that wears
+    /// one cannot drift into two strengths of the same idea. Nothing new
+    /// entered the panel with ``V4Card``'s accent: these are that block's own
+    /// two numbers, lifted.
+    static let accentWashAlpha: Double = 0.07
+    static let accentLineAlpha: Double = 0.35
+
     /// The gap between `PeerSwitch`'s track and its knob circle.
     static let peerSwitchKnobInset: CGFloat = 2
 

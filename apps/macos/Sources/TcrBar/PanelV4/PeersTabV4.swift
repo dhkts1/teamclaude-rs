@@ -2047,7 +2047,13 @@ struct PeersTabV4: View {
                 false
             ),
         ]
-        return V4Card {
+        // The one card on this tab that wears a colour, and amber because
+        // amber is what this tab already spends on "waiting on you". A knock
+        // is the only card here with a clock running against it: ten minutes,
+        // and then the person on the other Mac gets nothing. The reserved hue
+        // stays reserved — `Tok.unknown` means plaintext crossing a machine
+        // boundary, and a knock discloses nothing at all.
+        return V4Card(accent: Tok.near) {
             VStack(alignment: .leading, spacing: V4.knockLineGap) {
                 // The whole card width for the sentence, and the buttons on
                 // their own row underneath.
@@ -2078,12 +2084,29 @@ struct PeersTabV4: View {
                         accessibilityLabel: "More for \(PeerAdmission.knockNameLine(knock))",
                         help: "Block this address, whether or not it is asking to connect.")
                 }
-                // The address AND the deadline, counted from the knock's own
-                // first-seen time against the clock this snapshot was read
-                // at, rather than a card stating ten minutes in prose and
-                // never counting them.
-                if let address = PeerAdmission.knockAddressLine(knock, now: snapshot.readAt) {
-                    MuteText(text: address, lineLimit: 1)
+                // The address, and the deadline beside it as a pill rather
+                // than as a fragment at the end of the line in the least
+                // visible text on the card. Counted from the knock's own
+                // first-seen time against the clock this snapshot was read at,
+                // never `Date()`: a view reading its own clock would make a
+                // rendered scene draw a different PNG every run.
+                //
+                // The pill sits on THIS row and not on the title row, where
+                // the headline and the menu already spend the width: content
+                // is 326 pt, the headline takes about 192 of it, and an
+                // `EXPIRES IN 9M` pill plus the menu takes about 140.
+                //
+                // No pill is the honest state for a knock with nothing to
+                // count, which is what `knockExpiryPill` returns `nil` for.
+                HStack(spacing: V4.pillGap) {
+                    MuteText(text: PeerAdmission.knockAddressLine(knock), lineLimit: 1)
+                    Spacer(minLength: 0)
+                    if let expiry = PeerAdmission.knockExpiryPill(knock, now: snapshot.readAt) {
+                        V4Pill(
+                            text: expiry, role: .warn,
+                            help: "A request nobody answers expires by itself, and this Mac "
+                                + "drops the card when it does.")
+                    }
                 }
                 MuteText(text: PeerAdmission.knockDetail, lineLimit: nil)
                 HStack(spacing: V4.pillGap) {
@@ -2097,10 +2120,13 @@ struct PeersTabV4: View {
                             action: { controller.run(verb.argv) })
                     }
                 }
-                yesBlock(
-                    "Accept shows six digits here and on that Mac. Until you press Trust on "
-                        + "both it is pinned nowhere, carries nothing and serves nothing.",
-                    role: .warn)
+                // No "what yes does" block here, and it is the one card on
+                // the tab without one. It said what the line above the buttons
+                // says: six digits twice, "nothing is shared until Trust"
+                // twice, on one card. Once the card itself is amber the block
+                // reads as a second thing inside a thing rather than as a
+                // warning, and the sentences are merged in
+                // `PeerAdmission.knockDetail`. Every other caller keeps it.
             }
         }
         .padding(.top, V4.cardGap)
@@ -2228,11 +2254,12 @@ struct PeersTabV4: View {
             .padding(.horizontal, V4.yesBlockPaddingH)
             .background(
                 RoundedRectangle(cornerRadius: V4.buttonRadius)
-                    .fill(role.tint.opacity(0.07))
+                    .fill(role.tint.opacity(V4.accentWashAlpha))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: V4.buttonRadius)
-                    .strokeBorder(role.tint.opacity(0.35), lineWidth: V4.panelBorderWidth)
+                    .strokeBorder(
+                        role.tint.opacity(V4.accentLineAlpha), lineWidth: V4.panelBorderWidth)
             )
             .padding(.top, V4.yesBlockMarginTop)
     }
@@ -2256,6 +2283,15 @@ struct PeersTabV4: View {
     /// (``PeerPanelHeight``'s own invariant).
     static let carrySentenceLines: CGFloat = 2
 
+    /// How many lines the knock card's own sentence wraps to.
+    ///
+    /// ``PeerAdmission/knockDetail`` is 133 characters and about sixty fit on
+    /// one line at this card's 326 pt of content, so three. Charged as a
+    /// constant for the same reason ``carrySentenceLines`` is: a line the
+    /// budget guesses at is a line the budget can be wrong about, and growth
+    /// the budget cannot see comes out of the footer.
+    static let knockDetailLines: CGFloat = 3
+
     /// What ``PeerPanelHeight`` charges for this tab, at the density now
     /// resolved. Read off `V4` here (the one place that knows both), and
     /// passed in, so the arithmetic stays testable in `TcrBarCore`.
@@ -2274,7 +2310,20 @@ struct PeersTabV4: View {
                     + 2 * V4.lineHeight(V4.muteSize) + 2 * V4.cardInsetV)
                 + V4.sectionHeadMarginTop + V4.lineHeight(V4.sectionHeadSize)
                 + carrySentenceLines * V4.lineHeight(V4.muteSize)
-                + V4.footerMarginTop + V4.lineHeight(V4.byToolLineSize))
+                + V4.footerMarginTop + V4.lineHeight(V4.byToolLineSize),
+            // One knock card as it is actually drawn: the name line, the
+            // address row it shares with its pill, the three lines its
+            // sentence wraps to, the gaps between those four children, the
+            // button row at the tab's own hit target, and the card's edges.
+            //
+            // Derived, then MEASURED: 160 pt here against 158 pt read off the
+            // rendered panel, whose wrapped lines stack a little tighter than
+            // a line box each. The two points are reserved and unused, which
+            // is the safe direction — under-charging is what takes points out
+            // of the footer, and over-charging by a line's rounding does not.
+            knockCardHeight: V4.lineHeight(V4.nameSize)
+                + (1 + knockDetailLines) * V4.lineHeight(V4.muteSize)
+                + 3 * V4.knockLineGap + hitTarget + 2 * V4.cardInsetV)
     }
 
     private func pillHelp(_ text: String) -> String {

@@ -48,7 +48,8 @@ final class PeerMeterTests: XCTestCase {
         meterHeight: 27,
         cardChrome: 22,
         cardGap: 14,
-        fixedChrome: 216
+        fixedChrome: 216,
+        knockCardHeight: 158
     )
 
     private func lease(_ spent: Double) -> PeerMeter {

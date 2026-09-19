@@ -20,13 +20,20 @@ final class PeerSectionHeightTests: XCTestCase {
     /// `fixedChrome` is the two switch cards, the section head and the count
     /// line: two cards of a name line, a sub line and a two-line "what yes
     /// does" block, plus a 15 pt section head and a 17 pt count line.
+    ///
+    /// `knockCardHeight` is one knock card as `PeersTabV4.heightMetrics`
+    /// derives it at this density: a 21 pt name line, four 17 pt mute lines
+    /// (the address row and the three the sentence wraps to), three 3 pt gaps
+    /// between the card's four children, a 40 pt button row and the card's
+    /// own 22 pt of chrome.
     private let comfortable = PeerPanelHeight.Metrics(
         nameLineHeight: 21,
         subLineHeight: 17,
         meterHeight: 27,
         cardChrome: 22,
         cardGap: 14,
-        fixedChrome: 216
+        fixedChrome: 216,
+        knockCardHeight: 160
     )
 
     /// The same tab at Compact, which is what `.auto` resolves to above four
@@ -39,7 +46,8 @@ final class PeerSectionHeightTests: XCTestCase {
         meterHeight: 23,
         cardChrome: 16,
         cardGap: 8,
-        fixedChrome: 180
+        fixedChrome: 180,
+        knockCardHeight: 133
     )
 
     private func geometry(panelWidth: CGFloat = 372) -> PanelSize.Geometry {
@@ -222,5 +230,66 @@ final class PeerSectionHeightTests: XCTestCase {
         XCTAssertEqual(
             PeerPanelHeight.peerSectionHeight(rows: [], metrics: comfortable),
             comfortable.fixedChrome)
+    }
+
+    // MARK: - A Mac asking to connect
+
+    /// **The charge this file was missing.** A section holding one pending
+    /// knock is taller than the same section holding none by exactly that
+    /// card and the gap above it.
+    ///
+    /// It was charged nowhere: `fixedChrome` is the two switches, the section
+    /// head and the count line, and the list is the trusted rows, so a panel
+    /// with a request to connect in it was sized for a panel without one.
+    /// That is vertical pressure nothing in the budget can see, and what gave
+    /// way under it was the card's own help line, cut mid-word.
+    ///
+    /// Watched red: with `peerSectionHeight` ignoring its `pendingKnocks`
+    /// argument the two sides are equal and this fails at the first assertion.
+    func testOnePendingKnockCostsItsCardAndTheGapAboveIt() {
+        let rows = trusted(3)
+        let none = PeerPanelHeight.peerSectionHeight(rows: rows, metrics: comfortable)
+        let one = PeerPanelHeight.peerSectionHeight(
+            rows: rows, pendingKnocks: 1, metrics: comfortable)
+        XCTAssertEqual(
+            one - none, comfortable.knockCardHeight + comfortable.cardGap,
+            "a knock card is drawn and paid for nowhere")
+        XCTAssertEqual(
+            PeerPanelHeight.peerSectionHeight(rows: rows, pendingKnocks: 2, metrics: comfortable)
+                - one,
+            comfortable.knockCardHeight + comfortable.cardGap,
+            "the second Mac asking at once costs the same as the first")
+    }
+
+    /// The knock cards are charged OUTSIDE the capped list. Forty peers clamp
+    /// the list; a knock on top of them still adds its own card, because it is
+    /// drawn above "Other Macs" and outside the scroll view.
+    func testAKnockIsChargedOutsideTheCappedList() {
+        let rows = trusted(40)
+        XCTAssertEqual(
+            PeerPanelHeight.peerSectionHeight(rows: rows, pendingKnocks: 1, metrics: comfortable),
+            comfortable.fixedChrome + comfortable.knockCardHeight + comfortable.cardGap
+                + PanelHeight.panelMaxHeight,
+            "a knock arriving under forty peers was absorbed by the clamp, so the card "
+                + "would be drawn in points nothing reserved")
+    }
+
+    /// And the plan carries it through to the drawn region, so the panel the
+    /// shell sizes is the panel the tab draws.
+    func testThePlanCarriesThePendingKnocksThrough() {
+        func plan(_ knocks: Int) -> PanelSize.Plan {
+            PeerPanelHeight.plan(
+                rows: trusted(2), pendingKnocks: knocks,
+                header: [PanelSize.Line("13 accounts, 6 with headroom", fontSize: 15)],
+                footer: [PanelSize.Line("2 Macs found, 1 trusted", fontSize: 12.5)],
+                geometry: geometry(), metrics: comfortable,
+                textMetrics: FixedMetrics(perLine: 18))
+        }
+        XCTAssertEqual(
+            plan(1).listHeight - plan(0).listHeight,
+            comfortable.knockCardHeight + comfortable.cardGap)
+        XCTAssertEqual(
+            plan(1).footerHeight, plan(0).footerHeight,
+            "the knock came out of the footer, which is the bug this file exists for")
     }
 }

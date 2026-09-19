@@ -845,6 +845,13 @@ final class PeersPanelStateWiringTests: XCTestCase {
             // A refused verb, which had none: the banner is the surface every
             // refusal on this tab lands on.
             "63-peers-refused",
+            // The knock card's other states, each of which the amber card
+            // has to be judged on rather than only the happy one: the same
+            // tab with nobody asking (the twin that makes the card's cost
+            // measurable), two asking at once, one that proposed no name, and
+            // one with nothing to count and therefore no pill.
+            "67-peers-knock-none", "68-peers-knock-two", "69-peers-knock-no-name",
+            "70-peers-knock-no-expiry",
         ] {
             XCTAssertTrue(
                 scenes.contains("\"\(scene)\""),
