@@ -102,6 +102,12 @@ enum TcrBarEntry {
         if ShellProbe.requested() {
             ShellProbe.run()  // exits
         }
+        // The other flag that builds a status item, and for the same reason:
+        // what one panel open costs cannot be measured without opening one.
+        // It reads `tcr` with read verbs only and never starts a server.
+        if MeasureOpen.requested() {
+            MeasureOpen.run()  // exits
+        }
 
         let app = NSApplication.shared
         // The bundle already sets `LSUIElement`, so this matches what the app
