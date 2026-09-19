@@ -9,6 +9,32 @@ import CoreGraphics
 
 // MARK: - The two meters, typed apart
 
+/// Which Mac is the lender, said once, so the pill and the meter label that
+/// name the same fact cannot drift apart the way `serves`/`serving you` and a
+/// meter fixed at `shared` once did (rule 2 of the mockup's settled words).
+public enum PeerLendDirection: Equatable {
+    /// This Mac answers requests on its own accounts, for the peer.
+    case youLend
+    /// The peer answers requests on its own accounts, for this Mac.
+    case theyLend
+
+    /// The pill's word: present tense, a capability or an act.
+    public var pillText: String {
+        switch self {
+        case .youLend: return "you lend"
+        case .theyLend: return "they lend"
+        }
+    }
+
+    /// The lease meter's word: past tense, what has been spent so far.
+    public var meterLabel: String {
+        switch self {
+        case .youLend: return "you lent"
+        case .theyLend: return "they lent"
+        }
+    }
+}
+
 /// A LEASE meter: a fraction of an allowance window, with the sentence that
 /// states its scale.
 ///
@@ -20,10 +46,14 @@ public struct LeaseFraction: Equatable {
     /// full bar, never a bar wider than its track.
     public let spent: Double
     public let sentence: String
+    /// `you lent` or `they lent`, the meter label. Defaulted so the tests
+    /// that only exercise `spent`/`value` need not name a direction.
+    public let label: String
 
-    public init(spent: Double, sentence: String) {
+    public init(spent: Double, sentence: String, label: String = PeerLendDirection.youLend.meterLabel) {
         self.spent = min(1, max(0, spent))
         self.sentence = sentence
+        self.label = label
     }
 
     /// `34%` / `nothing yet`. A Mac that has stopped serving reads zero, never
