@@ -412,6 +412,40 @@ enum V4 {
     /// the pill's own rounded border.
     static let meshPillLabelInset: CGFloat = 20
 
+    // MARK: - The six digits (`.code`, `.code span`)
+    //
+    // The pairing sheet's own block, transcribed from the onboarding mockup's
+    // style sheet the same way every token above was:
+    //
+    //   .code{display:flex;gap:10px;justify-content:center;margin:10px 0 2px}
+    //   .code span{font:700 30px/1 "SF Mono",Menlo,monospace;letter-spacing:.06em;
+    //    border:1px solid var(--line-strong);border-radius:10px;padding:10px 12px}
+
+    static let pairCodeSize: CGFloat = 30
+    static let pairCodeTracking: CGFloat = 0.06 * 30
+    static let pairCodeGap: CGFloat = 10
+    static let pairCodeRadius: CGFloat = 10
+    static let pairCodePaddingV: CGFloat = 10
+    static let pairCodePaddingH: CGFloat = 12
+    static let pairCodeMarginTop: CGFloat = 10
+    /// How many digits sit in one plate: the mockup draws `418` `902`, two
+    /// groups of three, because a person reading six digits off another screen
+    /// reads them in groups.
+    static let pairCodeGroup: Int = 3
+    /// The field the OTHER Mac's digits are typed into. One plate rather than
+    /// two: typing across two boxes is a worse job than reading across them,
+    /// and the grouping is what the eye needs, not the keyboard.
+    static let pairFieldSize: CGFloat = 22
+    static let pairFieldTracking: CGFloat = 0.14 * 22
+    static let pairFieldWidth: CGFloat = 150
+    static let pairFieldPaddingV: CGFloat = 8
+    /// The plate's own height. Derived rather than written: a
+    /// `RoundedRectangle` in a `ZStack` has no intrinsic size and takes every
+    /// point it is offered, which drew a 900 pt box in the first render of
+    /// this sheet.
+    static var pairFieldHeight: CGFloat { pairFieldSize + 2 * pairFieldPaddingV }
+    static let pairFieldCaptionGap: CGFloat = 4
+
     // MARK: - Must switch (`.sw2.small`)
 
     static let switchWidth: CGFloat = 30

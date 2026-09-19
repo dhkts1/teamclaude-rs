@@ -696,6 +696,16 @@ mod peer_cli {
         /// The six digits the other screen is showing. Omit to start the
         /// pairing and print this side's digits.
         pub code: Option<String>,
+        /// Print one JSON object per line on stdout instead of prose, for a
+        /// caller that is not a terminal.
+        ///
+        /// The pairing holds ONE live handshake across both phases and cannot
+        /// be split into two invocations, so a panel has to stay attached to
+        /// this process, read these lines and answer on its stdin. The lines
+        /// are `crate::peer::pair::PairEvent` and `tests/peer_pairing.rs`
+        /// pins them.
+        #[arg(long)]
+        pub json: bool,
     }
 
     #[derive(clap::Args)]
@@ -1989,6 +1999,21 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             Ok(())
         }
         PeerAction::Pair(a) => {
+            use teamclaude_rs::peer::pair::PairEvent;
+
+            /// Print one `--json` line, or nothing at all in prose mode.
+            ///
+            /// A function rather than a bare `println!` at four call sites:
+            /// every arm below has to be either prose or JSON and never both,
+            /// and the one that forgets is the one that puts an English
+            /// sentence into a stream a parser is reading.
+            fn announce(json: bool, event: &PairEvent) -> anyhow::Result<()> {
+                if json {
+                    println!("{}", event.line()?);
+                }
+                Ok(())
+            }
+
             let path = a
                 .peers
                 .clone()
@@ -2007,30 +2032,76 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // pressed Accept.
             let file = teamclaude_rs::peer::config::read_or_default(&path)?;
             let proposed_name = file.display_name();
-            teamclaude_rs::peer::pair::knock(&store, addr, &proposed_name).await?;
-            println!(
-                "peer pair: asked {addr} to pair and waiting for them, as instance {}",
-                teamclaude_rs::peer::id::boot_instance_id()
-            );
-            println!(
-                "peer pair: on that Mac, `tcr peer pending` shows the request and \
-                 `tcr peer accept {}` approves it; nothing has been disclosed to it yet",
-                teamclaude_rs::peer::id::boot_instance_id()
-            );
+            let instance = teamclaude_rs::peer::id::boot_instance_id();
+            if let Err(err) = teamclaude_rs::peer::pair::knock(&store, addr, &proposed_name).await {
+                announce(
+                    a.json,
+                    &PairEvent::Refused {
+                        message: format!("{err:#}"),
+                    },
+                )?;
+                return Err(err);
+            }
+            announce(
+                a.json,
+                &PairEvent::Asking {
+                    addr: addr.to_string(),
+                    instance: instance.to_string(),
+                    wait_seconds: teamclaude_rs::peer::pair::PAIR_WAIT.as_secs(),
+                },
+            )?;
+            if !a.json {
+                println!(
+                    "peer pair: asked {addr} to pair and waiting for them, as instance {instance}"
+                );
+                println!(
+                    "peer pair: on that Mac, `tcr peer pending` shows the request and \
+                     `tcr peer accept {instance}` approves it; nothing has been disclosed to it \
+                     yet"
+                );
+            }
 
             // **Phase two: `XX`, once their Accept opens a window for this
             // instance id.** Retried, because approval can come minutes later.
             // See `pair::PAIR_WAIT`.
-            let pending = teamclaude_rs::peer::pair::pair(&store, addr).await?;
-            println!("peer pair: this Mac shows {}", pending.code);
-            println!(
-                "peer pair: the other Mac shows six digits for the same pairing; they must be \
-                 identical, and a mismatch means a machine in the middle relayed it"
-            );
+            let pending = match teamclaude_rs::peer::pair::pair(&store, addr).await {
+                Ok(pending) => pending,
+                Err(err) => {
+                    // The ten-minute deadline lands here, and it is the one
+                    // failure a panel MUST be able to draw: it is what "nobody
+                    // was at the other Mac" looks like.
+                    announce(
+                        a.json,
+                        &PairEvent::Refused {
+                            message: format!("{err:#}"),
+                        },
+                    )?;
+                    return Err(err);
+                }
+            };
+            announce(
+                a.json,
+                &PairEvent::Comparing {
+                    code: pending.code.clone(),
+                },
+            )?;
+            if !a.json {
+                println!("peer pair: this Mac shows {}", pending.code);
+                println!(
+                    "peer pair: the other Mac shows six digits for the same pairing; they must \
+                     be identical, and a mismatch means a machine in the middle relayed it"
+                );
+            }
             let offered = match a.code.clone() {
                 Some(code) => code,
                 None => {
-                    println!("peer pair: type the digits the other Mac is showing:");
+                    // The prompt is prose only. In `--json` the `comparing`
+                    // line above IS the prompt, and a reader that got an
+                    // English sentence on the same stream would have to
+                    // decide which of the two to believe.
+                    if !a.json {
+                        println!("peer pair: type the digits the other Mac is showing:");
+                    }
                     let mut line = String::new();
                     std::io::stdin()
                         .read_line(&mut line)
@@ -2039,22 +2110,37 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 }
             };
             if !pending.matches(&offered) {
-                anyhow::bail!(
+                let message = format!(
                     "peer pair: refused, {} here, {} there. A mismatch is the one signal \
                      this path exists to produce, so it is not a retry prompt",
                     pending.code,
                     offered.trim()
                 );
+                announce(
+                    a.json,
+                    &PairEvent::Refused {
+                        message: message.clone(),
+                    },
+                )?;
+                anyhow::bail!(message);
             }
             teamclaude_rs::peer::pair::confirm(&store, &pending.peer, &pending.code, Some(addr))?;
-            println!(
-                "peer pair: trusted, and a bare pin can say hello and nothing else \
-                 (`tcr peer allow` grants one thing at a time, with no restart)"
-            );
-            println!(
-                "peer pair: run the same command on the other Mac, pointed back here, so both \
-                 sides hold a pin"
-            );
+            announce(
+                a.json,
+                &PairEvent::Trusted {
+                    peer: pending.peer.display(),
+                },
+            )?;
+            if !a.json {
+                println!(
+                    "peer pair: trusted, and a bare pin can say hello and nothing else \
+                     (`tcr peer allow` grants one thing at a time, with no restart)"
+                );
+                println!(
+                    "peer pair: run the same command on the other Mac, pointed back here, so \
+                     both sides hold a pin"
+                );
+            }
             Ok(())
         }
         PeerAction::Invite(a) => {

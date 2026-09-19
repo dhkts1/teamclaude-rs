@@ -593,6 +593,81 @@ pub const PAIR_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 /// one Mac the same operator is standing at costs nothing.
 pub const PAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// One line of `tcr peer pair --json`, the machine half of a pairing that
+/// takes minutes and needs a person in the middle of it.
+///
+/// # Why the flag exists at all
+///
+/// `tcr peer pair` holds ONE live handshake across both phases: the far side's
+/// Accept opens a window for this instance id, the `XX` that follows produces
+/// the six digits, and [`confirm`] writes the pin from the same process,
+/// because a `snow::HandshakeState` cannot be persisted and a second
+/// invocation has nothing to recompute the code from. So a caller that is not
+/// a terminal, the menu-bar panel, cannot split it into two runs: it has to
+/// hold this process open, read what it says, and answer on its stdin.
+///
+/// What it could not do before is read it. The prose this command prints is
+/// written for a person ("peer pair: this Mac shows 418902"), and a panel that
+/// scraped those sentences would break on the next wording change with nothing
+/// to catch it. These lines are the contract instead: one JSON object per
+/// line on stdout, each naming its own `event`, pinned by
+/// `tests/peer_pairing.rs` so a rename is a failing test rather than a blank
+/// sheet.
+///
+/// The ORDER is the pairing's own: `asking` once the knock is away, then
+/// `comparing` when the handshake has produced digits, then exactly one of
+/// `trusted` or `refused`. Nothing is emitted between `asking` and
+/// `comparing`, which can be ten minutes apart (`PAIR_WAIT`), so a reader
+/// takes `waitSeconds` off the first line rather than inventing a timeout of
+/// its own.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum PairEvent {
+    /// The knock is away and this process is waiting for somebody at `addr`
+    /// to press Accept.
+    Asking {
+        /// Where the knock went, as it was dialled.
+        addr: String,
+        /// The boot instance id the far side's `tcr peer accept` takes.
+        instance: String,
+        /// How long this process will keep offering, in seconds: [`PAIR_WAIT`]
+        /// itself, so a reader's deadline is the CLI's own and not a second
+        /// number that can drift from it.
+        #[serde(rename = "waitSeconds")]
+        wait_seconds: u64,
+    },
+    /// The handshake produced six digits. They are on this screen; the other
+    /// Mac is showing its own, and the operator types THOSE.
+    Comparing {
+        /// The six digits this Mac shows.
+        code: String,
+    },
+    /// The compared digits matched and the key is pinned.
+    Trusted {
+        /// Who was pinned, as the handshake proved it rather than as a beacon
+        /// claimed it.
+        peer: String,
+    },
+    /// The pairing ended without a pin, with the reason as this command would
+    /// have said it on stderr.
+    Refused {
+        /// The refusal in the CLI's own words. Never paraphrased by a reader.
+        message: String,
+    },
+}
+
+impl PairEvent {
+    /// The event as the one line `--json` prints for it, with no trailing
+    /// newline.
+    ///
+    /// Fallible rather than infallible-by-`expect`: serialisation of this type
+    /// cannot fail today, and a caller that has to handle it is cheaper than a
+    /// panic in a command an operator is standing in front of.
+    pub fn line(&self) -> Result<String> {
+        serde_json::to_string(self).context("peer pair: could not render a --json line")
+    }
+}
+
 /// Run phase two: `XX` under the window the other Mac's Accept opened, then
 /// hand back the six digits for the operator to compare.
 ///

@@ -78,16 +78,30 @@ final class PeersPanelStateWiringTests: XCTestCase {
                 + "thing an operator staring at a waiting row wants")
     }
 
-    /// Trust sends the knock and records that it went, in one call.
-    func testTheTrustControlKnocksAndRemembers() throws {
+    /// Trust starts the pairing and records that it went, in one call.
+    ///
+    /// The call used to be `knock(address:arguments:)`, which ran
+    /// `tcr peer pair <addr>` through `TcrTool.run` and threw the process
+    /// away. That is the spelling that cannot finish: the command blocks
+    /// reading the other Mac's digits off a stdin it was never given. The one
+    /// call is now `startPairing(rowId:dialAddress:)`, which records the knock
+    /// AND hands back the live run the sheet draws. The invariant this test
+    /// has always guarded is unchanged: a press that forgot to record itself
+    /// draws a row that has not changed.
+    func testTheTrustControlStartsThePairingAndRemembers() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let card = try slice(
             tab, from: "private func peerCard(", to: "/// The freshness readout AND")
         XCTAssertTrue(
-            card.contains("controller.knock(address: row.id, arguments: arguments)"),
-            "the Trust control no longer goes through the one call that both sends the knock "
-                + "and records it, so the row can go back to being byte-identical after a "
-                + "press")
+            card.contains("controller.startPairing(")
+                && card.contains("rowId: row.id, dialAddress: dialAddress"),
+            "the Trust control no longer goes through the one call that both starts the "
+                + "pairing and records it, so the row can go back to being byte-identical "
+                + "after a press")
+        XCTAssertFalse(
+            card.contains("controller.run(arguments)"),
+            "Trust runs the fire-and-forget verb again: that process blocks on a stdin it has "
+                + "not been given and the sheet can never finish the pairing")
         XCTAssertTrue(
             card.contains("controller.stopWaiting(address: address)"),
             "the waiting row lost its Cancel")
@@ -112,16 +126,22 @@ final class PeersPanelStateWiringTests: XCTestCase {
     // MARK: - Item 2: the sheet with no digits
 
     /// The waiting sheet says what is true and draws no digit block.
+    ///
+    /// The words are now on ``PeerPairState`` (driven directly in
+    /// `PeerPairingTests`) and the sheet switches on that state instead of on
+    /// a `code: String?`. What is still asserted here is the same pair of
+    /// facts: the digit block is conditional, and the compare sentence cannot
+    /// be drawn while the request is unanswered.
     func testTheTrustSheetWithNoCodeClaimsNoDigits() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let sheet = try slice(tab, from: "struct PeerTrustSheet: View {", to: "/// The tab's pill")
         XCTAssertTrue(
-            sheet.contains("PeerAdmission.waitingTitle(name: peerName)")
-                && sheet.contains("PeerAdmission.waitingSentence"),
-            "the waiting sheet no longer uses the gated waiting words, so it can claim "
-                + "something about the other screen again")
+            sheet.contains("state.title(peerName: peerName)")
+                && sheet.contains("state.sentence(peerName: peerName)"),
+            "the sheet no longer draws the gated per-state words, so it can claim something "
+                + "about the other screen again")
         XCTAssertTrue(
-            sheet.contains("if let code {"),
+            sheet.contains("if case .comparing(let code) = state {"),
             "the digit block is drawn unconditionally again, so a sheet with no digits draws "
                 + "a placeholder where a number belongs")
         XCTAssertFalse(
@@ -133,8 +153,70 @@ final class PeersPanelStateWiringTests: XCTestCase {
             "the compare sentence is unconditional again, which is the blocker: it asserts "
                 + "the other Mac is showing digits while the request sits unanswered")
         XCTAssertTrue(
-            sheet.contains("enabled: code != nil"),
-            "Trust is no longer gated on there being a code to compare")
+            sheet.contains("guard case .comparing = state else { return false }"),
+            "Trust is no longer gated on there being digits to compare")
+    }
+
+    // MARK: - The pairing the sheet can actually finish
+
+    /// The Trust sheet is never built with a literal code again.
+    ///
+    /// This is the blocker itself, as an assertion. The sheet took a
+    /// `code: String?`, its only call site passed `code: nil`, and its Trust
+    /// button read `enabled: code != nil`: pressing Trust could not pin a key
+    /// at any click depth, while every gate in the tree stayed green because
+    /// nothing rendered or read that call site.
+    func testTheTrustSheetIsNeverBuiltWithALiteralCode() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertFalse(
+            tab.contains("code: nil"),
+            "the Trust sheet is constructed with a literal nil code again, which is the "
+                + "blocker: its control is then disabled for the whole life of the sheet and "
+                + "no key can ever be pinned from the panel")
+        let sheet = try slice(tab, from: "struct PeerTrustSheet: View {", to: "/// The tab's pill")
+        XCTAssertFalse(
+            sheet.contains("let code: String?"),
+            "the sheet takes an optional code again rather than the typed state a running "
+                + "pairing produces, so a call site can hand it a value no command ever sent")
+        XCTAssertTrue(
+            sheet.contains("let state: PeerPairState"),
+            "the sheet no longer draws a typed pairing state")
+    }
+
+    /// The digits the operator types go back down the SAME process's stdin.
+    ///
+    /// The whole reason this cannot be two invocations: the handshake lives in
+    /// the first one. A second `tcr peer …` spelled as a confirm would have
+    /// nothing to compare against, which is why `PeerCommand` has no confirm
+    /// verb at all.
+    func testTheComparedDigitsGoBackToTheRunningProcess() throws {
+        let host = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let wrapper = try slice(
+            host, from: "struct PeerTrustSheetHost: View {", to: "/// The six-digit compare")
+        XCTAssertTrue(
+            wrapper.contains("onTrust: { run.submitComparedCode() }"),
+            "Trust no longer sends the typed digits to the process holding the handshake")
+        let run = try source("apps/macos/Sources/TcrBarCore/PeerPairRun.swift")
+        XCTAssertTrue(
+            run.contains("input.write(contentsOf: Data(submission.utf8))"),
+            "the digits are no longer written to the child's stdin, which is the one channel "
+                + "the compare can arrive on")
+        XCTAssertTrue(
+            run.contains("TcrTool.ignoreSIGPIPE()"),
+            "the write to a child that may already have exited is unguarded again: SIGPIPE's "
+                + "default disposition terminates the menu-bar app, not the subprocess")
+    }
+
+    /// A sheet that goes away takes its subprocess with it.
+    func testClosingTheSheetStopsThePairing() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let close = try slice(
+            tab, from: "private func closePairing(row: PeerRowModel) {", to: "private var blockingIsPresented"
+        )
+        XCTAssertTrue(
+            close.contains("pairing.stop()"),
+            "closing the Trust sheet no longer stops the pairing, so a handshake is left open "
+                + "for ten minutes with nothing on screen showing it")
     }
 
     // MARK: - Item 3: a knock raises a badge on the tab
