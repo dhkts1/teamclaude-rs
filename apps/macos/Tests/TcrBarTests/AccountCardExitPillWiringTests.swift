@@ -10,27 +10,28 @@ import XCTest
 /// `TcrBarCore` alone, `AccountCard` is a view in the executable, and
 /// ViewInspector is not a dependency.
 ///
-/// C15 (`docs/plans/lan-p2p/ux-read-2026-09-19.md`): a must-locked account
-/// whose exit Mac is down drew a lone green `OK` pill, with the refusal
-/// buried in the note two lines below. The row read as healthy at a glance.
+/// A must-locked account whose exit Mac is down used to draw a lone green
+/// `OK` pill, with the refusal buried in the note two lines below. The row
+/// read as healthy at a glance.
 ///
-/// The mockup's own answer (`wave12-ui-mockup.html` scene 3d) draws the
-/// waiting pill INSIDE the header row, beside OK. Rendered at the real panel
-/// width (`V4.panelWidth`, 372 pt, `PeerPaneLayoutTests`'s own figure) that
-/// crowds `alice @example.com` off the row entirely, which is why the pill
-/// is its own row directly under the header rather than sharing it.
+/// Drawing the waiting pill inside the header row, beside OK, crowds
+/// `alice @example.com` off the row entirely at the panel's real width
+/// (`V4.panelWidth`, 372 pt, `PeerPaneLayoutTests`'s own figure), which is
+/// why the pill is its own row directly under the header rather than
+/// sharing it.
 final class AccountCardExitPillWiringTests: XCTestCase {
 
     /// The card must reach `AccountExit`'s own waiting state, not stop at the
-    /// quota classifier. A card that never asks `exit` anything is the exact
-    /// regression C15 named.
+    /// quota classifier. A card that never asks `exit` anything cannot draw
+    /// the one fact that keeps a must-locked, peer-down account from reading
+    /// as healthy.
     func testTheCardReachesTheExitsWaitingState() throws {
         let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
         XCTAssertTrue(
             card.contains("exit?.waitingPill(peers:") || card.contains(".waitingPill(peers:"),
             "nothing in the file reads AccountExit.waitingPill(peers:) any more, so the card "
                 + "cannot draw the state that makes a must-locked, peer-down account NOT read "
-                + "as healthy (C15)")
+                + "as healthy")
         XCTAssertTrue(
             card.contains("V4Pill(text: waiting, role: .warn"),
             "the waiting readout is no longer drawn as a pill, so the row loses the visual "
@@ -38,7 +39,7 @@ final class AccountCardExitPillWiringTests: XCTestCase {
     }
 
     /// The pill must NOT be crammed into the header's trailing `HStack`
-    /// alongside the name — that is the exact layout this test exists to
+    /// alongside the name. That is the exact layout this test exists to
     /// catch regressing back to: three badges plus the account's own name
     /// do not fit in 372 pt, and the name is what gives way.
     func testTheWaitingPillIsNotInsideTheNamesTrailingRow() throws {
@@ -49,10 +50,10 @@ final class AccountCardExitPillWiringTests: XCTestCase {
             header.contains("exitWaitingPillText") || header.contains("role: .warn"),
             "the waiting pill is back inside the header's trailing HStack, which crowds "
                 + "the account name (\"alice @example.com\") off the row at the real 372 pt "
-                + "panel width — confirmed by rendering w12-exits-peer-must-waiting")
+                + "panel width, confirmed by rendering the exits-must-waiting card")
     }
 
-    /// The pill sits directly under the header, before the quota rows — the
+    /// The pill sits directly under the header, before the quota rows: the
     /// first thing read after the name, which is what "at a glance" means.
     func testTheWaitingPillSitsDirectlyUnderTheHeader() throws {
         let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")

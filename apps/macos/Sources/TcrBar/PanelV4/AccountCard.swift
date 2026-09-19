@@ -108,16 +108,13 @@ struct AccountCard<Actions: View>: View {
                 // card one stop and taken every per-account action with it.
                 actions()
             }
-            // C15: a must-locked account whose exit Mac is down must not read
-            // as healthy on OK's word alone. The mockup's own scene 3d
-            // (`w12-exits-peer-must-waiting`) draws this as a second pill in
-            // the header row beside OK — measured against the real 372 pt
-            // panel width (`V4.panelWidth`) that crowds the account's own
-            // name off the row entirely (`alice @example.com` clipped to
-            // `... M...`), a defect the mockup's wider canvas never caught.
-            // Its own line, right-aligned under the header, keeps the pill
-            // the first thing read after the name — still "at a glance",
-            // never at the name's expense.
+            // An account must-locked to a down exit Mac must not read as
+            // healthy on OK's word alone. Putting a third badge in the
+            // header row beside OK, at the panel's real 372 pt width
+            // (`V4.panelWidth`), crowds the account's own name off the row
+            // entirely (`alice @example.com` clipped to `... M...`). Its own
+            // line, right aligned under the header, keeps the pill the first
+            // thing read after the name without taking the name's place.
             if let waiting = exitWaitingPillText {
                 HStack(spacing: 0) {
                     Spacer(minLength: 0)
@@ -297,7 +294,7 @@ struct AccountCard<Actions: View>: View {
         exit?.waitingPill(peers: exitPeerRows)
     }
 
-    /// The sentence behind the waiting pill — the same one
+    /// The sentence behind the waiting pill, the same one
     /// ``AccountExitRow`` attaches to its own waiting line.
     private var exitWaitingPillHelp: String {
         "This account is pinned to that Mac and may not use another address, so its "
