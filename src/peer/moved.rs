@@ -39,9 +39,9 @@
 //!
 //! [`MovedKeys`] has no accessor, is serialized nowhere, and its `Debug` prints
 //! the shape and no bytes. No refusal in this file carries a peer, an address
-//! or any part of what was pasted, for the reason § "a link forwarded to the
-//! wrong person" gives: a refusal that says which of this Mac's peers was
-//! nearly a match tells a stranger who this Mac knows.
+//! or any part of what was pasted, because a link is forwarded into the wrong
+//! group chat sooner or later: a refusal that says which of this Mac's peers
+//! was nearly a match tells a stranger who this Mac knows.
 
 use std::net::SocketAddr;
 use std::time::Duration;
