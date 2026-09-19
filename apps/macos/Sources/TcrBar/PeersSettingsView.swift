@@ -294,7 +294,9 @@ struct PeersSettingsPane: View {
             // Sits under Announce my name because both rows answer "what does
             // this Mac put on a network", one for the office network and one
             // for the open internet.
-            PeerInternetRow(on: internetOn, state: internetState, onPress: pressInternet)
+            PeerInternetRow(
+                on: internetOn, state: internetState, onPress: pressInternet,
+                onRetry: retryReach)
         } header: {
             peersSectionHead(
                 "This Mac", "Press return to commit. Only the name is announced.")
@@ -1349,6 +1351,10 @@ struct PeersSettingsPane: View {
     /// which is what makes the transient state a state. Never persisted: a
     /// mapping outlives neither the router's lifetime nor this window.
     @State private var reachReading: PeerReachReading?
+    /// The row's own "Ask the router again" button was pressed and the
+    /// answer has not arrived yet. Cleared the moment `reachReading` is set
+    /// again, by the same capture that clears it.
+    @State private var isRetryingReach = false
 
     // MARK: - Values
 
@@ -1397,10 +1403,12 @@ struct PeersSettingsPane: View {
     private var internetOn: Bool { snapshot.internet ?? false }
 
     /// The line under the switch, decided in one place
-    /// (``PeerInternetReach/state(on:reading:now:)``) from the switch and the
-    /// last probe, against this pane's own clock.
+    /// (``PeerInternetReach/state(on:reading:now:)``) from the switch, the
+    /// last probe and whether the row's own button is the reason a fresh one
+    /// is in flight, against this pane's own clock.
     private var internetState: PeerInternetReach {
-        PeerInternetReach.state(on: internetOn, reading: reachReading, now: now)
+        PeerInternetReach.state(
+            on: internetOn, reading: reachReading, retrying: isRetryingReach, now: now)
     }
 
     /// The press: write the setting, then ask the router ONCE.
@@ -1428,6 +1436,34 @@ struct PeersSettingsPane: View {
                     // No silent fallback: an answer this build cannot read is
                     // said as that, in `tcr`'s own bytes, rather than drawn as
                     // a router that stayed quiet.
+                    reachReading = PeerReachReading(
+                        externalAddress: nil, listenPort: nil,
+                        mapping: .refused(output), readAt: Date())
+                    return
+                }
+                reachReading = reading
+            case .failed(let message):
+                reachReading = PeerReachReading(
+                    externalAddress: nil, listenPort: nil, mapping: .refused(message),
+                    readAt: Date())
+            }
+        }
+    }
+
+    /// The row's own "Ask the router again" button: the same probe
+    /// ``pressInternet(_:)`` runs on a press, without writing
+    /// `PeerCommand.internet` again, since the switch itself has not moved.
+    private func retryReach() {
+        reachReading = nil
+        isRetryingReach = true
+        controller.capture(PeerCommand.reach) { capture in
+            defer { isRetryingReach = false }
+            switch capture {
+            case .text(let output):
+                guard
+                    let reading = try? PeerReachReading.decode(
+                        Data(output.utf8), readAt: Date())
+                else {
                     reachReading = PeerReachReading(
                         externalAddress: nil, listenPort: nil,
                         mapping: .refused(output), readAt: Date())
