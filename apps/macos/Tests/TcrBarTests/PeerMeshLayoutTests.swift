@@ -189,7 +189,7 @@ final class PeerMeshLayoutTests: XCTestCase {
     /// The width was fixed at 58 pt whatever the reading said, and a reading
     /// has two shapes: a round trip, or the absence. `not measured` needs
     /// about 65 pt at this size, so the absence printed `not m…` on every
-    /// unmeasured edge in both appearances — and on a fresh network, where
+    /// unmeasured edge in both appearances, and on a fresh network, where
     /// nothing has been probed yet, that is every pill on the card.
     func testAPlateIsWideEnoughForWhatIsWrittenOnIt() {
         for reading in ["not measured", "16 ms", "210 ms", "8 ms"] {

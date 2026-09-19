@@ -277,7 +277,7 @@ public struct PeerMeshLayout: Equatable, Sendable {
     /// It was `via == nil ? 58 : 82`, regardless of content, and a reading
     /// has exactly two shapes: a round trip (`16 ms`) or the absence
     /// (`not measured`). The second needs about 65 pt at this size, so it
-    /// rendered as `not m…` on EVERY unmeasured edge, in both appearances —
+    /// rendered as `not m…` on EVERY unmeasured edge, in both appearances,
     /// and on the states where nothing has been probed yet that is every pill
     /// on screen. Naming an absence is this card's own discipline; truncating
     /// the name of it to four characters and an ellipsis is not.

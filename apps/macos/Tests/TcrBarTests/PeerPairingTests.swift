@@ -145,7 +145,7 @@ final class PeerPairingTests: XCTestCase {
         compare.set("418-902")
         XCTAssertEqual(
             compare.typed, "418902",
-            "punctuation reached the CLI, which refuses it as \"not six digits\" — a sentence "
+            "punctuation reached the CLI, which refuses it as \"not six digits\": a sentence "
                 + "that reads as a mismatch and is not one")
         XCTAssertTrue(compare.isComplete)
         XCTAssertEqual(

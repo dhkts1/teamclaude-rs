@@ -1325,7 +1325,7 @@ enum RenderStates {
             ("59-trust-compare-typed", .comparing(code: "418902"), "418902"),
             // 4. Pinned.
             ("60-trust-done", .done(peer: "tcr-4b8we1r0zp"), ""),
-            // 5. Refused, in the CLI's own words — a MISMATCH, which is the
+            // 5. Refused, in the CLI's own words. A MISMATCH, which is the
             //    one refusal this path exists to produce.
             (
                 "61-trust-refused",

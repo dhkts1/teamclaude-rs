@@ -438,8 +438,8 @@ enum V4 {
 
     // MARK: - The six digits (`.code`, `.code span`)
     //
-    // The pairing sheet's own block, transcribed from the onboarding mockup's
-    // style sheet the same way every token above was:
+    // The pairing sheet's own block, as a CSS declaration per constant, the
+    // same way every token above was written:
     //
     //   .code{display:flex;gap:10px;justify-content:center;margin:10px 0 2px}
     //   .code span{font:700 30px/1 "SF Mono",Menlo,monospace;letter-spacing:.06em;
@@ -452,9 +452,9 @@ enum V4 {
     static let pairCodePaddingV: CGFloat = 10
     static let pairCodePaddingH: CGFloat = 12
     static let pairCodeMarginTop: CGFloat = 10
-    /// How many digits sit in one plate: the mockup draws `418` `902`, two
-    /// groups of three, because a person reading six digits off another screen
-    /// reads them in groups.
+    /// How many digits sit in one plate: two groups of three, so the eye
+    /// compares `418` and `902` one group at a time. A person reading six
+    /// digits off another screen reads them in groups.
     static let pairCodeGroup: Int = 3
     /// The field the OTHER Mac's digits are typed into. One plate rather than
     /// two: typing across two boxes is a worse job than reading across them,

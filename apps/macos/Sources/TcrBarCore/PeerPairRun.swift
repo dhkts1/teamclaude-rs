@@ -132,7 +132,7 @@ public final class PeerPairRun: ObservableObject {
         else { return }
         submitting = true
         // `try?`: a child that has already exited answers `EPIPE` here, and
-        // that is not this app's failure to report — its termination is, and
+        // that is not this app's failure to report. Its termination is, and
         // `ended(exitCode:stderr:)` reports it with the child's own words.
         try? input.write(contentsOf: Data(submission.utf8))
         try? input.close()

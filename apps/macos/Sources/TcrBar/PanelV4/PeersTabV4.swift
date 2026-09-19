@@ -2142,7 +2142,7 @@ struct PeerTrustSheetHost: View {
 ///
 /// It took a `code: String?` and its Trust button read `enabled: code != nil`.
 /// Its only call site passed a literal `nil`. So the button could never be
-/// pressed, and `tcr peer pair` — which the press had already started — sat on
+/// pressed, and `tcr peer pair`, which the press had already started, sat on
 /// a `read_line` with no stdin for ten minutes and then exited refusing. The
 /// one job this tab exists for could not be finished in the UI at all.
 ///
@@ -2269,7 +2269,8 @@ struct PeerTrustSheet: View {
         }
     }
 
-    /// This Mac's six digits, in the mockup's two groups of three.
+    /// This Mac's six digits, in two groups of three, so the eye compares
+    /// them one group at a time.
     private func codeBlock(_ code: String) -> some View {
         HStack(spacing: V4.pairCodeGap) {
             ForEach(Array(groups(of: code).enumerated()), id: \.offset) { group in
