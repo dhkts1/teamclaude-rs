@@ -652,6 +652,15 @@ public struct LeaseDraft: Equatable, Identifiable, Sendable {
 
 /// The lease surfaces' words and argv, in one place.
 public enum PeerLease {
+    /// How close an end has to be before the meter states it instead of the
+    /// percentage: inside the hour.
+    ///
+    /// One hour because that is the span in which what an operator does
+    /// changes, they can wait it out or go and ask for more, and because the
+    /// panel's one-unit span reads `1h`, `44m`, `3m` across it without ever
+    /// needing two units.
+    public static let endsSoonSeconds: TimeInterval = 3600
+
     /// The Sharing section's Defaults row, in ONE line: `5h 20% · 7d 20% ·
     /// Fable full · ttl 5 min`.
     ///
@@ -844,10 +853,29 @@ extension PeerListDocument.PeerEntry {
     /// whichever sentence the row's meter is already saying and a fragment
     /// would have to agree with four of them.
     public func endsInSentence(now: Date) -> String? {
+        // Said once. While the end is close enough for the meter to state it
+        // (``endsInLabel(now:)``), the clause comes OUT of the paragraph: the
+        // same fact at the end of four lines and in the meter's own slot is
+        // the row telling an operator twice and neither time plainly.
+        guard endsInLabel(now: now) == nil else { return nil }
         guard let until, !leaseHasEnded(now: now) else { return nil }
         let remaining = Double(until) - now.timeIntervalSince1970
         guard remaining > 0 else { return nil }
         return "This lease ends in \(PeerFormat.span(remaining))."
+    }
+
+    /// `ends in 1h`, for the meter's right-hand slot, while the end is inside
+    /// the hour. `nil` at every other distance, where the percentage keeps
+    /// that slot.
+    ///
+    /// A lease about to stop was pixel for pixel the ordinary borrowing row,
+    /// and the one figure an operator needs then is not what fraction has
+    /// been spent, it is when the work stops.
+    public func endsInLabel(now: Date) -> String? {
+        guard let until, !leaseHasEnded(now: now) else { return nil }
+        let remaining = Double(until) - now.timeIntervalSince1970
+        guard remaining > 0, remaining <= PeerLease.endsSoonSeconds else { return nil }
+        return "ends in \(PeerFormat.span(remaining))"
     }
 }
 

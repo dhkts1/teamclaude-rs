@@ -518,10 +518,25 @@ final class PeersPanelStateWiringTests: XCTestCase {
     /// nothing to say.
     func testTheBorrowerRowNamesTheHourTheWorkStops() {
         let now = Date(timeIntervalSince1970: 1_786_000_000)
+        // Inside the hour the END is the headline: it takes the meter's own
+        // right-hand slot, where the percentage was, and comes OUT of the
+        // four-line paragraph, where it was the last clause of the last
+        // sentence on a row that is pixel for pixel the ordinary one.
         let inAnHour = PeerListDocument.PeerEntry(
             name: "studio-mac", trusted: true, serves: true, until: 1_786_003_600)
-        XCTAssertEqual(inAnHour.endsInSentence(now: now), "This lease ends in 1h.")
+        XCTAssertEqual(inAnHour.endsInLabel(now: now), "ends in 1h")
+        XCTAssertNil(
+            inAnHour.endsInSentence(now: now),
+            "the end is stated twice: once in the meter's slot and once at the end of the "
+                + "paragraph")
         XCTAssertFalse(inAnHour.leaseHasEnded(now: now))
+
+        // Further out, the percentage keeps its slot and the sentence keeps
+        // the clause: a lease ending tomorrow is not an amber row.
+        let inFiveHours = PeerListDocument.PeerEntry(
+            name: "studio-mac", trusted: true, serves: true, until: 1_786_018_000)
+        XCTAssertNil(inFiveHours.endsInLabel(now: now))
+        XCTAssertEqual(inFiveHours.endsInSentence(now: now), "This lease ends in 5h.")
 
         let noEnd = PeerListDocument.PeerEntry(name: "attic-nuc", trusted: true, serves: true)
         XCTAssertNil(noEnd.endsInSentence(now: now), "a lease with no end is given one")

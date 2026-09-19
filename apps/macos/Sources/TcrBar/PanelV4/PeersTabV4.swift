@@ -565,6 +565,10 @@ enum PeersSnapshotBuilder {
             // blocker: on the scene where this Mac has nothing spare and
             // depends entirely on the lender, the work stopped at an hour the
             // screen never named.
+            // The end, said in ONE of two places and never both: the meter's
+            // own slot while it is inside the hour, and otherwise a clause on
+            // whichever of the four sentences below this row draws.
+            let endsIn = entry.endsInLabel(now: now)
             let ends = entry.endsInSentence(now: now).map { " " + $0 } ?? ""
             let inFlight = entry.inFlight ?? 0
             // The same direction the pill above picked, from the same fact
@@ -580,7 +584,7 @@ enum PeersSnapshotBuilder {
                         sentence: "Nothing is being served while it is away, so this reads "
                             + "zero. The offer stands and starts again by itself when "
                             + "\(title) wakes." + ends,
-                        label: direction.meterLabel))
+                        label: direction.meterLabel, endsIn: endsIn))
             }
             if inFlight > 0 {
                 return .lease(
@@ -590,7 +594,7 @@ enum PeersSnapshotBuilder {
                             + "and it has spent \(PeerFormat.share(spent)) of what it offered "
                             + "you. It reads what it serves, and your sign-in stays here."
                             + ends,
-                        label: direction.meterLabel))
+                        label: direction.meterLabel, endsIn: endsIn))
             }
             if spent <= 0 {
                 return .lease(
@@ -598,7 +602,7 @@ enum PeersSnapshotBuilder {
                         spent: 0,
                         sentence: "\(title) has not served a request yet. The same offer "
                             + "stands as for every trusted Mac." + ends,
-                        label: direction.meterLabel))
+                        label: direction.meterLabel, endsIn: endsIn))
             }
             return .lease(
                 LeaseFraction(
@@ -606,7 +610,7 @@ enum PeersSnapshotBuilder {
                     sentence: "\(title) has used \(PeerFormat.share(spent)) of what you offered "
                         + "it this week"
                         + PeerFormat.ttlClause(entry.leaseTtlSeconds) + "." + ends,
-                    label: direction.meterLabel))
+                    label: direction.meterLabel, endsIn: endsIn))
         }
         if entry.carries, let bytes = entry.bytesPerHour, let cap = entry.byteCapPerHour {
             return .gateway(
@@ -2053,7 +2057,10 @@ struct LeaseMeter: View {
             fill: fraction.spent,
             value: fraction.value,
             sentence: fraction.sentence,
-            tint: Tok.unknown)
+            // Amber while the lease is ending inside the hour: the bar and
+            // the figure move together, so the countdown is not a lone
+            // coloured word, and the words say it too.
+            tint: fraction.isEndingSoon ? Tok.near : Tok.unknown)
     }
 }
 
