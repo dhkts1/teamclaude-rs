@@ -22,16 +22,45 @@ public struct PeerMeshPeer: Equatable, Sendable {
     /// Away. A dimmed tile and NO pill: a sleeping Mac's last numbers are a
     /// stale reading, and this card does not draw those.
     public var asleep: Bool
+    /// Whether the row this tile stands for currently has a path at all.
+    /// Defaults `true` so a caller that has not been taught the real fact yet
+    /// keeps drawing exactly what it drew before this field existed: a solid
+    /// edge and a reading. `false` draws a dotted edge and a dotted `no path
+    /// now` plate instead, never a reading: the row's own line one inch
+    /// below already says there is nothing to report.
+    public var hasPath: Bool
 
     public init(
         name: String, rttMs: Double? = nil, lossPct: Double? = nil, viaName: String? = nil,
-        asleep: Bool = false
+        asleep: Bool = false, hasPath: Bool = true
     ) {
         self.name = name
         self.rttMs = rttMs
         self.lossPct = lossPct
         self.viaName = viaName
         self.asleep = asleep
+        self.hasPath = hasPath
+    }
+}
+
+/// One line in the reading list drawn above ``PeerMeshLayout/maxMacsForGraph``
+/// trusted Macs, where the card answers the same question a graph asks
+/// without letting crossing edges and a collapsed tile stand in for it.
+public struct PeerMeshReading: Equatable, Sendable {
+    public var name: String
+    /// `direct · 16 ms · 1% lost`, `via attic-nuc · 88 ms`, or `asleep · no
+    /// path right now`.
+    public var text: String
+    /// Reads amber rather than the ordinary dim: a loss band above `ok`, or a
+    /// round trip with no loss reading yet. Never set for a no-path row:
+    /// there is nothing to warn about past "no path", which the text already
+    /// says.
+    public var warn: Bool
+
+    public init(name: String, text: String, warn: Bool) {
+        self.name = name
+        self.text = text
+        self.warn = warn
     }
 }
 
@@ -46,6 +75,13 @@ public enum PeerMeshTone: Equatable, Sendable {
     /// Green under 3 per cent, amber to 10, red above it, grey when the
     /// prober has not landed. One place, so the dot on a pill and the colour
     /// of its line cannot disagree.
+    ///
+    /// Grey answers one question only, "was loss measured", and a caller that
+    /// also knows the round trip is known must not repaint that as "nothing
+    /// measured": a known round trip with an unmeasured loss drops the pill's
+    /// dot instead of reusing this tone for it (``PeerMeshLayout/Pill/showsToneDot``).
+    /// Reserving grey that way is also why a sleeping Mac gets no pill at all
+    /// rather than a grey one drawn from its last, stale numbers.
     public static func forLoss(_ lossPct: Double?) -> PeerMeshTone {
         guard let lossPct else { return .unmeasured }
         if lossPct < 0.03 { return .ok }
@@ -84,14 +120,21 @@ public struct PeerMeshLayout: Equatable, Sendable {
     public struct Edge: Equatable, Sendable {
         public var from: CGPoint
         public var to: CGPoint
-        /// Dashed, because the bytes go through another Mac.
+        /// Dashed because the bytes go through another Mac.
         public var carried: Bool
+        /// Dashed because the row has no path at all right now. A separate
+        /// fact from ``carried``: the two share one dash style (the legend
+        /// reads "dashed: carried by another Mac, or no path"), but a
+        /// no-path edge names no forwarder and its tone is always grey,
+        /// which a carried edge's is not.
+        public var noPath: Bool
         public var tone: PeerMeshTone
 
-        public init(from: CGPoint, to: CGPoint, carried: Bool, tone: PeerMeshTone) {
+        public init(from: CGPoint, to: CGPoint, carried: Bool, noPath: Bool, tone: PeerMeshTone) {
             self.from = from
             self.to = to
             self.carried = carried
+            self.noPath = noPath
             self.tone = tone
         }
     }
@@ -99,17 +142,30 @@ public struct PeerMeshLayout: Equatable, Sendable {
     /// One reading, on an opaque plate, over the edge it describes.
     public struct Pill: Equatable, Sendable {
         public var frame: CGRect
-        /// `16 ms`, or `not measured`.
+        /// `16 ms`, `not measured`, or `no path now`.
         public var reading: String
         /// `via attic-nuc` on a carried path, and `nil` otherwise.
         public var via: String?
         public var tone: PeerMeshTone
+        /// Whether the small tone dot draws at all. `false` for a known
+        /// round trip with unmeasured loss: grey is reserved for a path
+        /// nothing has measured, not for a gap in one measurement, and for
+        /// a no-path plate, which carries no reading to colour.
+        public var showsToneDot: Bool
+        /// The plate's own border draws dashed on a no-path row, matching the
+        /// edge it sits on.
+        public var dashed: Bool
 
-        public init(frame: CGRect, reading: String, via: String?, tone: PeerMeshTone) {
+        public init(
+            frame: CGRect, reading: String, via: String?, tone: PeerMeshTone,
+            showsToneDot: Bool = true, dashed: Bool = false
+        ) {
             self.frame = frame
             self.reading = reading
             self.via = via
             self.tone = tone
+            self.showsToneDot = showsToneDot
+            self.dashed = dashed
         }
     }
 
@@ -124,6 +180,54 @@ public struct PeerMeshLayout: Equatable, Sendable {
 
     /// The most Macs the card draws before the rest collapse into one tile.
     public static let visibleCap = 6
+
+    /// Above this many trusted Macs the card stops drawing a graph at all:
+    /// crossing edges, a pill sitting on its own line, one edge with no pill,
+    /// and prints one reading per Mac instead
+    /// (``PeerMeshReading``/``readings(for:)``). The collapse tile above
+    /// ``visibleCap`` never has a chance to draw once this is past: the list
+    /// has no cap of its own, every trusted Mac gets its own line.
+    public static let maxMacsForGraph = 4
+
+    /// The reading list drawn above ``maxMacsForGraph`` trusted Macs: one
+    /// line per peer, in the words the graph's own pill and legend already
+    /// use, so switching between the two views never teaches a second
+    /// vocabulary for the same fact.
+    public static func readings(for peers: [PeerMeshPeer]) -> [PeerMeshReading] {
+        peers.map { peer in
+            PeerMeshReading(name: peer.name, text: readingText(for: peer), warn: isWarnReading(peer))
+        }
+    }
+
+    /// `direct · 16 ms · 1% lost`, `via attic-nuc · 88 ms`, or `asleep · no
+    /// path right now`. Loss is only stated when it was measured: a `nil`
+    /// loss says nothing, rather than printing a number that was never read,
+    /// and a no-path row states only that, since a round trip or a loss
+    /// figure would both claim something measured that was not.
+    static func readingText(for peer: PeerMeshPeer) -> String {
+        var parts: [String] = []
+        if peer.asleep { parts.append("asleep") }
+        if !peer.hasPath {
+            parts.append("no path right now")
+        } else {
+            parts.append(peer.viaName.map { "via \($0)" } ?? "direct")
+            if let rttMs = peer.rttMs { parts.append("\(Int(rttMs.rounded())) ms") }
+            if let lossPct = peer.lossPct {
+                parts.append(lossPct == 0 ? "no loss" : "\(Int((lossPct * 100).rounded()))% lost")
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Whether a reading line reads amber: a loss band past `ok`, or a round
+    /// trip whose loss was never read at all, the same "not a clean green"
+    /// fact the graph's dropped dot states by omission, restated here since
+    /// the list has no dot to drop. Never set for a sleeping or no-path row:
+    /// there is nothing past "no path" to warn about.
+    static func isWarnReading(_ peer: PeerMeshPeer) -> Bool {
+        guard peer.hasPath, !peer.asleep else { return false }
+        return PeerMeshTone.forLoss(peer.lossPct) != .ok
+    }
 
     /// Lay one mesh out.
     ///
@@ -224,13 +328,36 @@ public struct PeerMeshLayout: Equatable, Sendable {
 
         for (peer, frame) in peerNodes {
             let to = CGPoint(x: frame.midX, y: frame.minY)
+            let noPath = !peer.hasPath
             edges.append(
                 Edge(
-                    from: rootCentre, to: to, carried: peer.viaName != nil,
-                    tone: PeerMeshTone.forLoss(peer.lossPct)))
+                    from: rootCentre, to: to, carried: peer.viaName != nil, noPath: noPath,
+                    tone: noPath ? .unmeasured : PeerMeshTone.forLoss(peer.lossPct)))
             // A sleeping Mac gets no pill at all: its last numbers are a stale
             // reading and this card does not draw those.
             guard !peer.asleep else { continue }
+
+            if noPath {
+                // No path draws a dotted grey plate saying so, never a
+                // reading: a round trip or a loss figure both claim
+                // something was measured, and nothing was.
+                let reading = "no path now"
+                let plate = plateSize(reading: reading, via: nil)
+                guard
+                    let frameForPill = place(
+                        plate: plate, from: rootCentre, to: to, avoiding: taken, in: size)
+                else {
+                    unplaced += 1
+                    continue
+                }
+                taken.append(frameForPill)
+                pills.append(
+                    Pill(
+                        frame: frameForPill, reading: reading, via: nil, tone: .unmeasured,
+                        showsToneDot: false, dashed: true))
+                continue
+            }
+
             let reading = peer.rttMs.map { "\(Int($0.rounded())) ms" } ?? "not measured"
             let via = peer.viaName.map { "via \($0)" }
             let plate = plateSize(reading: reading, via: via)
@@ -242,10 +369,13 @@ public struct PeerMeshLayout: Equatable, Sendable {
                 continue
             }
             taken.append(frameForPill)
+            // A known round trip with unmeasured loss is not "nothing
+            // measured": the dot drops instead of reusing grey for it.
+            let showsDot = !(peer.rttMs != nil && peer.lossPct == nil)
             pills.append(
                 Pill(
                     frame: frameForPill, reading: reading, via: via,
-                    tone: PeerMeshTone.forLoss(peer.lossPct)))
+                    tone: PeerMeshTone.forLoss(peer.lossPct), showsToneDot: showsDot))
         }
 
         return PeerMeshLayout(
