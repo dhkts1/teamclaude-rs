@@ -1006,8 +1006,13 @@ enum RenderStates {
                         ])),
                 false
             ),
-            // No path at all, beside the asleep pill that used to carry this
-            // fact alone. No RTT anywhere: a stale reading renders as absent.
+            // Trusted and awake, but nothing has ever found a way to reach
+            // it: the case a firewall eating the port produces. A recent
+            // lastSeenMs keeps the freshness read as awake rather than
+            // asleep, and an empty paths array is the honest absence rather
+            // than a stale reading. This used to share `lastSeenMs` and a
+            // spent, ended lease with the asleep row below, which drew the
+            // same picture for two different facts.
             (
                 "w12-path-none",
                 peersSnapshot(
@@ -1017,8 +1022,7 @@ enum RenderStates {
                             .init(
                                 id: "tcr-4b8we1r0zp", name: "studio-mac",
                                 address: "studio-mac.local:7749", trusted: true,
-                                lastSeenMs: peerMsAgo(360), carries: true, serves: true,
-                                leaseSpent: 0, leaseTtlSeconds: 0)
+                                lastSeenMs: peerMsAgo(2), carries: true)
                         ])),
                 false
             ),
