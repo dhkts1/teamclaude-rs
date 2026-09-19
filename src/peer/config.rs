@@ -196,6 +196,15 @@ pub struct PeerFile {
     /// reading this never has to ask which of the two wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_lend: Option<LendGrant>,
+    /// The dead drop: where this Mac leaves its current address for a friend
+    /// that has also moved, and where it looks for that friend's.
+    ///
+    /// **Off by default**, the same rule every other peer switch here follows,
+    /// and absent from a file that never turned it on: see
+    /// [`DeadDropConfig::is_unset`] for why the key is not written in that
+    /// case. Boot-time for the publisher, hot for the fetch gate.
+    #[serde(default, skip_serializing_if = "DeadDropConfig::is_unset")]
+    pub dead_drop: DeadDropConfig,
 }
 
 /// What the three opt-in verbs write into [`PeerFile::listen`] when it is
@@ -262,6 +271,7 @@ impl Default for PeerFile {
             peers: Vec::new(),
             pending_invites: Vec::new(),
             default_lend: None,
+            dead_drop: DeadDropConfig::default(),
         }
     }
 }
@@ -523,13 +533,14 @@ pub enum Locator {
 
 /// What taught this node an endpoint.
 ///
-/// Recorded because the five differ in how much they are worth believing, not
+/// Recorded because the six differ in how much they are worth believing, not
 /// for display: `Paired` and `Hello` come out of a completed handshake against
 /// a pinned static key, `Beacon` from an unauthenticated LAN announcement,
-/// `Mapping` from this node's own port-mapping request, and `Brief` from a
-/// trusted peer's word about a peer we already trust. An endpoint is routing
-/// advice in every case, identity is re-proven by the handshake, so a wrong
-/// one costs a connect timeout and never a trust decision.
+/// `Mapping` from this node's own port-mapping request, `Brief` from a
+/// trusted peer's word about a peer we already trust, and `Drop` from a record
+/// left at a surface neither Mac owns. An endpoint is routing advice in every
+/// case, identity is re-proven by the handshake, so a wrong one costs a
+/// connect timeout and never a trust decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EndpointSource {
@@ -545,6 +556,15 @@ pub enum EndpointSource {
     /// trusts. Never an introduction, only a fresher address for a mutual
     /// friend.
     Brief,
+    /// Off a record this node fetched from the pair's dead drop, sealed under a
+    /// key derived from the pair's own rendezvous secret.
+    ///
+    /// **The weakest band.** Unlike [`Self::Brief`], which a mutual friend
+    /// vouched for over an authenticated session, this arrived through a
+    /// surface nobody here owns, and a peer this node has since forgotten still
+    /// holds the key that seals it. It buys one dial attempt and nothing else:
+    /// see [`crate::peer::probe::order_endpoints`] for where that is enforced.
+    Drop,
 }
 
 /// One place a peer was reached, when that was learned, and by what.
@@ -1051,6 +1071,102 @@ pub struct ControlGrants {
     /// Adds our build sha and boot id.
     #[serde(default)]
     pub diag: bool,
+    /// This peer and this Mac leave each other addresses at a dead drop.
+    ///
+    /// **Read on both sides**, the symmetry rule
+    /// [`crate::peer::discovery::observe_neighbor_briefs`] states for
+    /// [`Self::briefs`] and for the same reason: a peer this Mac does not
+    /// publish for does not get to write endpoints onto its rows either. Off by
+    /// default, like every other switch here.
+    #[serde(default)]
+    pub drop: bool,
+}
+
+/// How long one drop name is valid: one hour.
+///
+/// Both Macs must agree on it, so it is a number in the file and not a guess
+/// per side; a mismatch means the two never meet. One hour and not
+/// [`crate::peer::reach::SLOT_SECONDS`] (30) because a port slot is computed
+/// locally and costs nothing, while a drop slot costs one write per friend:
+/// 30-second slots would be 2,880 writes per friend per day.
+pub const DROP_SLOT_SECONDS: u64 = 3_600;
+
+fn default_drop_slot_seconds() -> u64 {
+    DROP_SLOT_SECONDS
+}
+
+/// The `deadDrop` object: where this Mac leaves its current address for a
+/// friend that has also moved, and where it looks for that friend's.
+///
+/// **Off in every field by default**, so a file with no `deadDrop` key and a
+/// `DeadDropConfig::default()` built in Rust are the same value, the rule
+/// [`PeerFile`]'s hand-written [`Default`] states. Nothing is published and
+/// nothing is fetched until the operator turns it on AND points it at a
+/// surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeadDropConfig {
+    /// The switch. Boot-time for the publisher, hot for the fetch gate.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The surface to publish on. Absent means off regardless of
+    /// [`Self::enabled`], which is what [`Self::is_live`] exists to say once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<StoreConfig>,
+    /// How long one drop name is valid, in seconds.
+    #[serde(default = "default_drop_slot_seconds")]
+    pub slot_seconds: u64,
+}
+
+impl Default for DeadDropConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            store: None,
+            slot_seconds: default_drop_slot_seconds(),
+        }
+    }
+}
+
+impl DeadDropConfig {
+    /// Whether this Mac publishes and fetches at all: the switch AND a surface.
+    ///
+    /// One function rather than two reads, so "on but pointed at nothing"
+    /// cannot mean one thing to the publisher and another to the fetcher.
+    pub fn is_live(&self) -> bool {
+        self.enabled && self.store.is_some()
+    }
+
+    /// Whether this is the value a file with no `deadDrop` key reads as.
+    ///
+    /// The `skip_serializing_if` predicate for [`PeerFile::dead_drop`]: a Mac
+    /// that never turned the dead drop on writes a peers file with no such key,
+    /// byte-identical to the one it wrote before this field existed. A key that
+    /// appeared on the next save would be a shape change every reader of that
+    /// file pays for, in exchange for saying "off" twice.
+    pub fn is_unset(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Which surface a dead drop uses, and what that surface needs.
+///
+/// The credential lives here, in the peers file, and never in
+/// `teamclaude.json`: this is the file whose 0600 mode is checked on read, the
+/// same rule [`PeerFile::network_key`] and `PeerRow::rendezvous_secret`
+/// already follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum StoreConfig {
+    /// Any HTTPS surface that takes a PUT and answers a GET: `url` is a
+    /// template containing `{name}`, used for both.
+    Https {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// One gist, written and read through the API.
+    Gist { gist_id: String, token: String },
 }
 
 /// How a grant's account reaches Anthropic: over the owner's Mac, or on the

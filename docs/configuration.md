@@ -634,6 +634,14 @@ cache.
 | `paths` | object | absent | hot | policy for choosing which endpoint to dial: `paths.prefer` (`"direct"` or `"via"`), `paths.maxLossPct` (default `5`), `paths.viaAllow` (which peers may carry when `via` is preferred). Absent means the built-in order, direct first, newest endpoint first |
 | `peers` | array of peer rows | `[]` | hot | one row per pinned peer, see below |
 | `pendingInvites` | array of invites | `[]` | hot | one-use join keys minted by `tcr peer invite` that have not been spent yet |
+| `deadDrop` | object | absent | boot-time for the publisher, hot for the fetch | where this Mac leaves its current address for a friend that has also moved. **Absent means off, which is the default**: nothing is published and nothing is fetched. A Mac that never turned it on writes no such key |
+| `deadDrop.enabled` | bool | `false` | boot-time | the switch |
+| `deadDrop.store` | object | absent | boot-time | the surface to publish on. Absent means off regardless of `enabled` |
+| `deadDrop.store.kind` | `"https"` \| `"gist"` | | boot-time | which surface |
+| `deadDrop.store.url` | string | | boot-time | `https` only: a template containing `{name}`, used for both the write and the read |
+| `deadDrop.store.gistId` | string | | boot-time | `gist` only |
+| `deadDrop.store.token` | string | absent | boot-time | bearer token for the surface. **Held in the clear in this file, mode 0600**, the same as `networkKey` and every `rendezvousSecret`; it goes here and never in `teamclaude.json`, because this is the file whose mode is checked on read |
+| `deadDrop.slotSeconds` | int | `3600` | boot-time | how long one drop name is valid. Both Macs must agree: a mismatch means they never meet |
 
 ### One entry in `peers[]`
 
@@ -655,7 +663,7 @@ never whether to trust it, so a wrong entry costs a connect timeout and nothing 
 | `addr` | string (`host:port`) | the socket to open. `direct` only |
 | `node` | string (52-char base32) | the forwarding peer's pinned key. `via` only |
 | `observedAtMs` | int (unix ms) | when this Mac observed the endpoint, on its own clock, never a time taken off the wire |
-| `source` | `"paired"` \| `"hello"` \| `"beacon"` \| `"mapping"` | what taught this Mac the endpoint: the pairing or enrolment itself, a `Hello` inside a session whose key checked out, a discovery beacon matching a pinned instance, or this Mac's own port mapping |
+| `source` | `"paired"` \| `"hello"` \| `"beacon"` \| `"mapping"` \| `"brief"` \| `"drop"` | what taught this Mac the endpoint: the pairing or enrolment itself, a `Hello` inside a session whose key checked out, a discovery beacon matching a pinned instance, this Mac's own port mapping, a trusted peer's word about a mutual friend, or a record left at a dead drop. The last two are the weakest and are dialled last, in that order |
 
 A file written before this key holds `addrs: ["host:port", ...]` instead. It is still read: each
 string becomes a `direct` endpoint sourced `paired` and dated `addedAt`, since the legacy key
@@ -675,6 +683,7 @@ naming it, rather than refusing the file.
 | `control.briefs` | this peer is told about our other peers, one hop out |
 | `control.lendable` | this peer is told our per-window lendable amounts and account counts |
 | `control.diag` | this peer is told our build sha and boot id |
+| `control.drop` | this peer and this Mac leave each other addresses at a dead drop. Read on both sides: a peer this Mac does not publish for does not get to write endpoints onto its rows either |
 
 One entry in `lend[]` (`tcr peer lend`, `tcr peer share`). A Mac may hold several of these at
 once, one per `(window, scope)` pair, because lending a new scope adds a lease rather than

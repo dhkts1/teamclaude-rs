@@ -374,7 +374,7 @@ pub fn order_endpoints(row: &PeerRow, table: &PathTable) -> Vec<Endpoint> {
 }
 
 /// Key 2 of [`order_endpoints`]: how much this node's own evidence backs the
-/// endpoint, in three bands.
+/// endpoint, in four bands.
 ///
 /// [`EndpointSource::Paired`] and [`EndpointSource::Hello`] came out of a
 /// completed handshake against the pinned static key, so they are the same
@@ -382,14 +382,21 @@ pub fn order_endpoints(row: &PeerRow, table: &PathTable) -> Vec<Endpoint> {
 /// this node's own port-mapping request and [`EndpointSource::Beacon`] an
 /// unauthenticated LAN announcement that matched a pinned instance id: two
 /// hints nothing proved, but nothing a remote peer chose either.
-/// [`EndpointSource::Brief`] is last and alone: it is a third machine's word
-/// about where a fourth one answers, the only band whose contents an attacker
-/// picks outright.
+/// [`EndpointSource::Brief`] is next to last and alone: it is a third
+/// machine's word about where a fourth one answers, a band whose contents an
+/// attacker picks outright.
+///
+/// [`EndpointSource::Drop`] is last, **below a brief and deliberately so**. A
+/// brief came from a Mac this node pinned, over a session that proved a static
+/// key, about a Mac this node also pinned. A dead-drop record came off a
+/// surface that can withhold and is sealed under a symmetric key a forgotten
+/// peer still holds: the weakest evidence on the list, so it sorts last.
 fn source_rank(endpoint: &Endpoint) -> u8 {
     match endpoint.source {
         EndpointSource::Paired | EndpointSource::Hello => 0,
         EndpointSource::Mapping | EndpointSource::Beacon => 1,
         EndpointSource::Brief => 2,
+        EndpointSource::Drop => 3,
     }
 }
 

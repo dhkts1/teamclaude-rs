@@ -29,7 +29,8 @@
         "control": {
           "briefs": false,
           "lendable": false,
-          "diag": false
+          "diag": false,
+          "drop": false
         }
       },
       "lend": [
@@ -79,7 +80,8 @@
         "control": {
           "briefs": false,
           "lendable": false,
-          "diag": false
+          "diag": false,
+          "drop": false
         }
       },
       "lend": [
