@@ -176,11 +176,25 @@ enum V4 {
     static var barHeight: CGFloat { compact ? 6 : 7 }
     static let barRadius: CGFloat = 4
     static let barTrackAlpha: Double = 0.08
-    /// A peer row whose lease has ENDED, drawn as past
-    /// (`settings-peers-short.html`'s own `.lz.ended`, decision row 13). The
-    /// same 0.55 the per-Mac sheet's ended lease row already uses, so the two
-    /// surfaces grey one state by one amount.
-    static let endedRowOpacity: Double = 0.55
+    /// What an ENDED lease dims: the freshness dot beside its row, and
+    /// nothing that carries a word.
+    ///
+    /// # Why this is no longer the whole row
+    ///
+    /// It was `endedRowOpacity`, applied to the entire card, and the card was
+    /// measured off the rendered PNGs: the body sentence 2.25:1 light and
+    /// 2.59:1 dark, `ended 09:36` 2.25:1, the `LEASE ENDED` pill 2.65:1, the
+    /// row title 3.98:1, and the **Re-lend button's own label 3.83:1**. AA
+    /// wants 4.5:1 for that text and 3:1 for that control. The state an
+    /// operator lands in after a lease ends was the least readable card in the
+    /// app, and its only way out was the least readable control on it.
+    ///
+    /// The word `ended` is on that card three times over: the pill, the
+    /// sentence, and the label beside Re-lend. This panel's own rule is that
+    /// colour is the second channel and never the first, so the meaning stays
+    /// in the words at full ink and the dimming is spent on the one element
+    /// that carries none.
+    static let endedGlyphOpacity: Double = 0.55
     static let barMinWidth: CGFloat = 2
     /// `.bar.capped{max-width:110px}` — the BY TOOL bars only.
     static let barCappedWidth: CGFloat = 110
@@ -410,7 +424,51 @@ enum V4 {
     /// `pillLabel` draws inside `pill.frame`, narrowed by this on the leading
     /// and trailing edges combined so the reading and via-line never touch
     /// the pill's own rounded border.
-    static let meshPillLabelInset: CGFloat = 20
+    ///
+    /// Bound to the layout's own value rather than written twice: the plate is
+    /// now sized to fit its text PLUS this gap, so a second copy here could
+    /// make the box and the words inside it disagree about how much room there
+    /// is, which is the shape of the truncation that made every unmeasured
+    /// reading print `not m…`.
+    static let meshPillLabelInset: CGFloat = PeerMeshLayout.pillLabelInset
+
+    /// The gap between the lines of a pairing request's card: the sentence,
+    /// the address, what Accept does, and the row of controls under them.
+    static let knockLineGap: CGFloat = 3
+
+    // MARK: - The six digits (`.code`, `.code span`)
+    //
+    // The pairing sheet's own block, as a CSS declaration per constant, the
+    // same way every token above was written:
+    //
+    //   .code{display:flex;gap:10px;justify-content:center;margin:10px 0 2px}
+    //   .code span{font:700 30px/1 "SF Mono",Menlo,monospace;letter-spacing:.06em;
+    //    border:1px solid var(--line-strong);border-radius:10px;padding:10px 12px}
+
+    static let pairCodeSize: CGFloat = 30
+    static let pairCodeTracking: CGFloat = 0.06 * 30
+    static let pairCodeGap: CGFloat = 10
+    static let pairCodeRadius: CGFloat = 10
+    static let pairCodePaddingV: CGFloat = 10
+    static let pairCodePaddingH: CGFloat = 12
+    static let pairCodeMarginTop: CGFloat = 10
+    /// How many digits sit in one plate: two groups of three, so the eye
+    /// compares `418` and `902` one group at a time. A person reading six
+    /// digits off another screen reads them in groups.
+    static let pairCodeGroup: Int = 3
+    /// The field the OTHER Mac's digits are typed into. One plate rather than
+    /// two: typing across two boxes is a worse job than reading across them,
+    /// and the grouping is what the eye needs, not the keyboard.
+    static let pairFieldSize: CGFloat = 22
+    static let pairFieldTracking: CGFloat = 0.14 * 22
+    static let pairFieldWidth: CGFloat = 150
+    static let pairFieldPaddingV: CGFloat = 8
+    /// The plate's own height. Derived rather than written: a
+    /// `RoundedRectangle` in a `ZStack` has no intrinsic size and takes every
+    /// point it is offered, which drew a 900 pt box in the first render of
+    /// this sheet.
+    static var pairFieldHeight: CGFloat { pairFieldSize + 2 * pairFieldPaddingV }
+    static let pairFieldCaptionGap: CGFloat = 4
 
     // MARK: - Must switch (`.sw2.small`)
 

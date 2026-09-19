@@ -3800,3 +3800,104 @@ fn internet_on_gives_this_mac_a_port_when_it_has_none() {
         "the verb must now name the port it maps: {stdout}"
     );
 }
+
+// MARK: - The `--json` lines a panel reads
+
+/// The exact bytes of every `tcr peer pair --json` line.
+///
+/// # Why a whole-line assertion and not a field-by-field one
+///
+/// The panel's side of this is a `Decodable` enum keyed on `event`
+/// (`apps/macos/Sources/TcrBarCore/PeerPairEvent.swift`), and what breaks it is
+/// not a wrong value but a renamed key: `waitSeconds` becoming `wait_seconds`
+/// decodes to nothing, the sheet never leaves its first state, and every gate
+/// on both sides stays green. So these compare the rendered line, which is the
+/// thing that actually crosses the pipe.
+///
+/// Serde writes the fields in declaration order and the tag first, which is why
+/// these literals can be exact. A reordering is a failing test here rather than
+/// a silent difference nobody renders.
+#[test]
+fn the_json_pairing_lines_are_exactly_these() {
+    assert_eq!(
+        pair::PairEvent::Asking {
+            addr: "10.0.1.24:7749".to_string(),
+            instance: "8f2c1ad63b0e4471".to_string(),
+            wait_seconds: 600,
+        }
+        .line()
+        .expect("an asking line renders"),
+        r#"{"event":"asking","addr":"10.0.1.24:7749","instance":"8f2c1ad63b0e4471","waitSeconds":600}"#
+    );
+    assert_eq!(
+        pair::PairEvent::Comparing {
+            code: "418902".to_string(),
+        }
+        .line()
+        .expect("a comparing line renders"),
+        r#"{"event":"comparing","code":"418902"}"#
+    );
+    assert_eq!(
+        pair::PairEvent::Trusted {
+            peer: "tcr-4b8we1r0zp".to_string(),
+        }
+        .line()
+        .expect("a trusted line renders"),
+        r#"{"event":"trusted","peer":"tcr-4b8we1r0zp"}"#
+    );
+    assert_eq!(
+        pair::PairEvent::Refused {
+            message: "peer pair: refused, 418902 here, 418903 there".to_string(),
+        }
+        .line()
+        .expect("a refused line renders"),
+        r#"{"event":"refused","message":"peer pair: refused, 418902 here, 418903 there"}"#
+    );
+}
+
+/// The wait a reader is told about is the wait this command actually keeps.
+///
+/// Two numbers, one fact: the panel arms its deadline off `waitSeconds` and
+/// `pair()` gives up at `PAIR_WAIT`. A literal 600 in the CLI would let one
+/// move without the other, and the panel would then either cancel a live
+/// handshake or sit forever on a process that has already exited.
+#[test]
+fn the_announced_wait_is_the_deadline_the_command_keeps() {
+    let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        .expect("main.rs reads");
+    assert!(
+        main.contains("wait_seconds: teamclaude_rs::peer::pair::PAIR_WAIT.as_secs()"),
+        "the asking line no longer takes its wait from PAIR_WAIT, so the panel's deadline and \
+         the command's can drift apart"
+    );
+}
+
+/// A refusal reaches stdout as a typed line, not only stderr.
+///
+/// The panel reads stdout. A refusal that went to stderr alone would leave the
+/// sheet in its last state with the process gone, which is the shape of the
+/// blocker this whole flag exists to close.
+#[test]
+fn every_refusal_is_announced_before_it_is_returned() {
+    let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        .expect("main.rs reads");
+    let start = main
+        .find("PeerAction::Pair(a) => {")
+        .expect("the pair arm is still there");
+    let arm = &main[start..];
+    let end = arm
+        .find("PeerAction::Invite(a) => {")
+        .expect("the arm still ends where the next one begins");
+    let arm = &arm[..end];
+    assert_eq!(
+        arm.matches("PairEvent::Refused").count(),
+        3,
+        "the pair arm no longer announces all three of its refusals (the knock, the ten-minute \
+         deadline and a mismatch) on stdout"
+    );
+    assert!(
+        arm.contains("if !a.json {"),
+        "the prose half is no longer gated, so a parser would be handed English on the stream \
+         it is reading"
+    );
+}

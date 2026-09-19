@@ -23,6 +23,17 @@ public enum PeerCommand {
     /// handshake itself, so comparing them binds this connection rather than
     /// two pasted fingerprints.
     public static func pair(address: String) -> [String] { ["peer", "pair", address] }
+
+    /// The same verb, told to print machine lines: `tcr peer pair <addr>
+    /// --json`.
+    ///
+    /// The panel runs THIS one, through ``PeerPairRun``, because the pairing
+    /// is one live handshake that asks a question on stdin halfway through and
+    /// cannot be split into two invocations. ``pair(address:)`` above stays as
+    /// the argv a person types in a terminal, and the two are one array plus a
+    /// flag rather than two literals, so the verb cannot be renamed in one
+    /// place only.
+    public static func pairJSON(address: String) -> [String] { pair(address: address) + ["--json"] }
     // There is NO `confirm` argv here, and that is deliberate. A
     // `tcr peer confirm <peer> <code>` was declared for a pairing sheet and
     // the CLI has never had the verb: the compare happens inside

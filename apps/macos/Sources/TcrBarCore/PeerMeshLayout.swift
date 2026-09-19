@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreText
 import Foundation
 
 // The mini mesh card at the top of the Peers tab.
@@ -232,8 +233,7 @@ public struct PeerMeshLayout: Equatable, Sendable {
             guard !peer.asleep else { continue }
             let reading = peer.rttMs.map { "\(Int($0.rounded())) ms" } ?? "not measured"
             let via = peer.viaName.map { "via \($0)" }
-            let plate = CGSize(
-                width: via == nil ? 58 : 82, height: via == nil ? 20 : 30)
+            let plate = plateSize(reading: reading, via: via)
             guard
                 let frameForPill = place(
                     plate: plate, from: rootCentre, to: to, avoiding: taken, in: size)
@@ -250,6 +250,67 @@ public struct PeerMeshLayout: Equatable, Sendable {
 
         return PeerMeshLayout(
             size: size, nodes: nodes, edges: edges, pills: pills, unplacedReadings: unplaced)
+    }
+
+    // MARK: - How wide a reading's plate has to be
+
+    /// The reading's own type size, and the forwarder line's under it. The
+    /// card draws both at exactly these (`MiniMeshCard.pillLabel`), and the
+    /// plate is measured at them, so the two cannot disagree about how much
+    /// room a word needs.
+    public static let pillReadingSize: CGFloat = 10
+    public static let pillViaSize: CGFloat = 9
+    /// What the plate holds beyond its text: the tone dot on the leading edge
+    /// and the rounded border either side. The view narrows its label box by
+    /// this same value, which is why it lives here rather than in the number
+    /// sheet: a plate sized without it and a label drawn inside it would be
+    /// two numbers for one gap.
+    public static let pillLabelInset: CGFloat = 20
+    /// One line, and two when a forwarder is named.
+    public static let pillOneLineHeight: CGFloat = 20
+    public static let pillTwoLineHeight: CGFloat = 30
+
+    /// A plate that fits what is written on it.
+    ///
+    /// # What a fixed width cost
+    ///
+    /// It was `via == nil ? 58 : 82`, regardless of content, and a reading
+    /// has exactly two shapes: a round trip (`16 ms`) or the absence
+    /// (`not measured`). The second needs about 65 pt at this size, so it
+    /// rendered as `not m…` on EVERY unmeasured edge, in both appearances,
+    /// and on the states where nothing has been probed yet that is every pill
+    /// on screen. Naming an absence is this card's own discipline; truncating
+    /// the name of it to four characters and an ellipsis is not.
+    ///
+    /// Measured with CoreText rather than estimated from a character count:
+    /// the system font is proportional, so `1` and `m` are not one width, and
+    /// a per-character guess is a second rendering engine that disagrees with
+    /// the real one on some string nobody tried.
+    public static func plateSize(reading: String, via: String?) -> CGSize {
+        var width = textWidth(reading, size: pillReadingSize)
+        if let via { width = max(width, textWidth(via, size: pillViaSize)) }
+        return CGSize(
+            width: (width + pillLabelInset).rounded(.up),
+            height: via == nil ? pillOneLineHeight : pillTwoLineHeight)
+    }
+
+    /// One string's typographic width in the system font at `size`.
+    ///
+    /// CoreText and not AppKit: this module holds no views and links no UI
+    /// framework, and `CTFontCreateUIFontForLanguage` answers with the same
+    /// system font `Font.system(size:)` draws with.
+    static func textWidth(_ text: String, size: CGFloat) -> CGFloat {
+        guard let font = CTFontCreateUIFontForLanguage(.system, size, nil) else {
+            // No silent fallback that pretends to be a measurement: an
+            // en-width per character is stated as the estimate it is, and it
+            // over-reserves rather than clipping. Not reachable on any macOS
+            // this app runs on; the guard exists because the API is optional.
+            return CGFloat(text.count) * size * 0.6
+        }
+        let line = CTLineCreateWithAttributedString(
+            NSAttributedString(
+                string: text, attributes: [kCTFontAttributeName as NSAttributedString.Key: font]))
+        return CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
     }
 
     /// The name under a tile, as wide as it may draw. Part of the layout

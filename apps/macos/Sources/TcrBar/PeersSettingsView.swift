@@ -960,7 +960,12 @@ struct PeersSettingsPane: View {
                     .foregroundStyle(Tok.inkFaint)
             }
         }
-        .opacity(ended ? V4.endedRowOpacity : 1)
+        // No blanket opacity here either: this row's Re-lend is the only way
+        // back from an ended lease, and it was drawn at the same 0.55 that put
+        // the tab's own copy of this control below AA
+        // (``V4/endedGlyphOpacity``). The three menus above it are already
+        // `.disabled` and AppKit dims those itself, so the state still reads
+        // as past without spending legibility on the one control that acts.
     }
 
     /// The three ends decision row 13 draws. `For 2 h` and `Until 18:00` are

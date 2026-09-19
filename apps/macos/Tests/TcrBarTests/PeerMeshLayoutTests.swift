@@ -183,4 +183,56 @@ final class PeerMeshLayoutTests: XCTestCase {
         XCTAssertEqual(layout.pills.first?.tone, .unmeasured)
         XCTAssertEqual(layout.edges.first?.carried, true)
     }
+
+    /// Every plate holds the words written on it.
+    ///
+    /// The width was fixed at 58 pt whatever the reading said, and a reading
+    /// has two shapes: a round trip, or the absence. `not measured` needs
+    /// about 65 pt at this size, so the absence printed `not m…` on every
+    /// unmeasured edge in both appearances, and on a fresh network, where
+    /// nothing has been probed yet, that is every pill on the card.
+    func testAPlateIsWideEnoughForWhatIsWrittenOnIt() {
+        for reading in ["not measured", "16 ms", "210 ms", "8 ms"] {
+            let plate = PeerMeshLayout.plateSize(reading: reading, via: nil)
+            let needed =
+                PeerMeshLayout.textWidth(reading, size: PeerMeshLayout.pillReadingSize)
+                + PeerMeshLayout.pillLabelInset
+            XCTAssertGreaterThanOrEqual(
+                plate.width, needed,
+                "the plate for \(reading) is narrower than the text it holds, so the reading "
+                    + "renders with an ellipsis where its last characters belong")
+        }
+        XCTAssertGreaterThan(
+            PeerMeshLayout.plateSize(reading: "not measured", via: nil).width,
+            PeerMeshLayout.plateSize(reading: "16 ms", via: nil).width,
+            "both readings get one width again, so one of the two must truncate")
+    }
+
+    /// A forwarder line is measured too, and it is the longer of the two.
+    func testACarriedPlateFitsItsForwarderLine() {
+        let plate = PeerMeshLayout.plateSize(
+            reading: "not measured", via: "via a-very-long-machine-name")
+        let needed =
+            PeerMeshLayout.textWidth("via a-very-long-machine-name", size: PeerMeshLayout.pillViaSize)
+            + PeerMeshLayout.pillLabelInset
+        XCTAssertGreaterThanOrEqual(
+            plate.width, needed,
+            "the forwarder's name is clipped, which is the one word that says WHICH Mac is "
+                + "carrying the bytes")
+        XCTAssertEqual(plate.height, PeerMeshLayout.pillTwoLineHeight)
+    }
+
+    /// The measurement is a real one. A positive control, because a text
+    /// measurer that answered zero would make every assertion above pass by
+    /// reporting that nothing needs any room.
+    func testTheTextMeasurerMeasures() {
+        let short = PeerMeshLayout.textWidth("8 ms", size: PeerMeshLayout.pillReadingSize)
+        let long = PeerMeshLayout.textWidth("not measured", size: PeerMeshLayout.pillReadingSize)
+        XCTAssertGreaterThan(short, 0, "the measurer answers zero, so every plate fits by default")
+        XCTAssertGreaterThan(long, short)
+        XCTAssertGreaterThan(
+            long, 55,
+            "`not measured` measures under 55 pt at 10 pt, which does not match any system "
+                + "font: the measurer is probably not using the font the card draws with")
+    }
 }

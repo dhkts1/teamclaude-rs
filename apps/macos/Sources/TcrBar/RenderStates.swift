@@ -373,10 +373,16 @@ enum RenderStates {
                 if renderSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
-        for scene in peerScenes {
+        for scene in peerSceneList {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeer(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
+        for scene in peerSheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeerSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
         for scene in controlScenes {
@@ -652,7 +658,38 @@ enum RenderStates {
     /// running panel would not produce from the same JSON. And the controller
     /// is ``PeerController/pinned(_:)``: no subprocess, no listener, no proxy,
     /// nothing that could reach `127.0.0.1:3456`.
-    private static var peerScenes: [(name: String, snapshot: PeersSnapshot, dry: Bool)] {
+    /// Every scene, plus the refusal banner each one draws (almost always
+    /// none).
+    private static var peerSceneList:
+        [(name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal)]
+    {
+        peerStates.map { ($0.name, $0.snapshot, $0.dry, PeerRefusal()) } + [
+            // A verb this panel ran was refused, and the tab is STILL THERE.
+            //
+            // It had no fixture, which is how the opposite shipped: a refusal
+            // used to be drawn instead of the whole tab and then wiped by the
+            // next poll about three seconds later. The message is the one a
+            // mismatched pairing produces, because that is the longest
+            // refusal on this path and the one most likely to be cut.
+            (
+                "63-peers-refused",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ])),
+                false,
+                PeerRefusal(
+                    message: "tcr peer share on failed (exit 1): peer share: refused, no Mac "
+                        + "is trusted yet, so there is nobody to share with")
+            )
+        ]
+    }
+
+    private static var peerStates: [(name: String, snapshot: PeersSnapshot, dry: Bool)] {
         [
             // 1. A fresh install: finding off, and the only state a one-Mac
             //    network ever has.
@@ -1246,18 +1283,121 @@ enum RenderStates {
     /// own frame, without `FleetView` needing a way to inject fixture peers.
     @MainActor
     private static func renderPeer(
-        _ scene: (name: String, snapshot: PeersSnapshot, dry: Bool),
+        _ scene: (name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal),
         appearance: Appearance,
         into directory: URL
     ) -> Bool {
         withDrawingAppearance(appearance.nsAppearance) {
-            // Density: absent, which is `PanelDensityPreference`'s own
-            // definition of the shipped default, the same write-then-remove
-            // every other scene in this file does.
-            UserDefaults.standard.removeObject(forKey: PanelDensityPreference.key)
+            rasterise(
+                peersPanel(
+                    snapshot: scene.snapshot, dry: scene.dry, refusal: scene.refusal,
+                    appearance: appearance),
+                named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
 
+    /// The five states of the Trust sheet, over the tab it opens from.
+    ///
+    /// **This is the surface that shipped unreviewable.** The sheet is where
+    /// the whole trust ritual happens and the harness had no fixture for it at
+    /// all, which is exactly how a sheet whose Trust button could never be
+    /// pressed passed every gate: nobody could look at it. One PNG per state,
+    /// both appearances.
+    ///
+    /// The runs are ``PeerPairRun/init(pinned:)``: no process, no pipe, no
+    /// subprocess of any kind, the same door ``PeerController/pinned(_:)``
+    /// gives the tab underneath.
+    private static var peerSheetScenes: [(name: String, state: PeerPairState, typed: String)] {
+        [
+            // 1. The knock is away and nobody over there has answered. The
+            //    instance id is the argument the OTHER operator types, so the
+            //    sheet prints it; this one is obviously fake, as every id in
+            //    this file is.
+            ("57-trust-waiting", .asking(instance: "8f2c1ad63b0e4471"), ""),
+            // 2. The pivotal screen: this Mac's six digits, and an empty field
+            //    for the six the other screen is showing. Trust is drawn
+            //    disabled here, which is the state an operator meets first.
+            ("58-trust-compare", .comparing(code: "418902"), ""),
+            // 3. The same screen with the other Mac's digits typed in full, so
+            //    the enabled control has a picture too. Without this one the
+            //    only rendered Trust button is a dim one, and "the control is
+            //    reachable" would again be a claim with no fixture behind it.
+            ("59-trust-compare-typed", .comparing(code: "418902"), "418902"),
+            // 4. Pinned.
+            ("60-trust-done", .done(peer: "tcr-4b8we1r0zp"), ""),
+            // 5. Refused, in the CLI's own words. A MISMATCH, which is the
+            //    one refusal this path exists to produce.
+            (
+                "61-trust-refused",
+                .refused(
+                    "peer pair: refused, 418902 here, 418903 there. A mismatch is the one "
+                        + "signal this path exists to produce, so it is not a retry prompt"),
+                "418903"
+            ),
+            // 6. The operator stopped it.
+            ("62-trust-cancelled", .cancelled, ""),
+        ]
+    }
+
+    /// One Trust sheet state, over the found-rows tab it opens from.
+    @MainActor
+    private static func renderPeerSheet(
+        _ scene: (name: String, state: PeerPairState, typed: String),
+        appearance: Appearance,
+        into directory: URL
+    ) -> Bool {
+        withDrawingAppearance(appearance.nsAppearance) {
+            let run = PeerPairRun(pinned: scene.state)
+            run.compare.set(scene.typed)
             let view =
-                PanelV4(
+                peersPanel(snapshot: trustSheetTab, dry: false, appearance: appearance)
+                .overlay {
+                    ZStack {
+                        Color.black.opacity(sheetScrimAlpha)
+                        PeerTrustSheet(
+                            peerName: "studio-mac",
+                            state: scene.state,
+                            compare: .constant(run.compare),
+                            snapshotMode: true
+                        )
+                        .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
+                        .shadow(radius: sheetShadowRadius)
+                    }
+                }
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+            return rasterise(
+                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
+
+    /// The tab underneath every Trust sheet: the found row the sheet was
+    /// opened from, already waiting, which is what the live panel draws.
+    private static var trustSheetTab: PeersSnapshot {
+        PeersSnapshotBuilder.waiting(
+            peersSnapshot(
+                PeerListDocument(
+                    finding: true,
+                    peers: [
+                        .init(
+                            name: "studio-mac", address: "studio-mac.local:7749",
+                            lastSeenMs: peerMsAgo(8))
+                    ])),
+            knocked: ["studio-mac.local:7749"])
+    }
+
+    /// The Peers tab as a panel, for the scene renderers above.
+    @MainActor
+    private static func peersPanel(
+        snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal = PeerRefusal(),
+        appearance: Appearance
+    ) -> some View {
+        // Density: absent, which is `PanelDensityPreference`'s own
+        // definition of the shipped default, the same write-then-remove
+        // every other scene in this file does.
+        UserDefaults.standard.removeObject(forKey: PanelDensityPreference.key)
+        let scene = (snapshot: snapshot, dry: dry)
+        return
+            PanelV4(
                     freshness: "updated 2s ago",
                     tabs: PanelTab.allCases,
                     selected: .peers,
@@ -1287,7 +1427,7 @@ enum RenderStates {
                     },
                     content: {
                         PeersTabV4(
-                            controller: PeerController.pinned(scene.snapshot),
+                            controller: PeerController.pinned(scene.snapshot, refusal: refusal),
                             snapshotMode: true)
                     },
                     footer: { EmptyView() }
@@ -1297,10 +1437,6 @@ enum RenderStates {
                 // panel sizes itself from a GeometryReader preference and
                 // `ImageRenderer` performs no second layout pass.
                 .fixedSize()
-
-            return rasterise(
-                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
-        }
     }
 
     // MARK: - Settings > Peers controls
@@ -1308,7 +1444,7 @@ enum RenderStates {
     /// One control, one state, one PNG.
     ///
     /// A FOURTH scene array, and the reason is the same class as
-    /// ``peerScenes``'s: these controls live on the Settings pane, whose own
+    /// ``peerSceneList``'s: these controls live on the Settings pane, whose own
     /// harness (`RenderSettings`) hosts a real window and can draw exactly ONE
     /// fixture per pane. A control with four states needs four pictures, so
     /// each one is rasterised here on its own, in the panel harness that needs

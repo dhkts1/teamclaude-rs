@@ -23,9 +23,16 @@ import TcrBarCore
 /// view renders; it does not compute.
 struct PeerRowModel: Identifiable, Equatable {
     enum Trust: Equatable {
-        /// Found, not trusted. Carries the argv `Trust` runs and the sentence
-        /// that says what pressing it buys.
-        case found(pairArguments: [String], promise: String)
+        /// Found, not trusted. Carries the address `Trust` dials and the
+        /// sentence that says what pressing it buys.
+        ///
+        /// The ADDRESS and not the argv it used to hold. Pairing is now a
+        /// held-open process whose argv is `PeerCommand.pairJSON(address:)`
+        /// and whose stdin this panel writes (``PeerPairRun``), so a row
+        /// carrying a pre-built `["peer", "pair", addr]` was carrying the one
+        /// spelling that cannot finish: it blocks on a `read_line` nothing can
+        /// answer. One value, built into argv in one place.
+        case found(dialAddress: String, promise: String)
         /// Trust was pressed, the knock is away, and the other operator has
         /// not answered.
         ///
@@ -372,8 +379,7 @@ enum PeersSnapshotBuilder {
                 title: title,
                 address: entry.address,
                 titleIsAddress: !named,
-                trust: .found(
-                    pairArguments: PeerCommand.pair(address: address), promise: promise),
+                trust: .found(dialAddress: address, promise: promise),
                 freshness: detail,
                 awake: seen.awake,
                 pills: [],
@@ -598,6 +604,14 @@ final class PeerController: ObservableObject {
     /// carries the whole reasoning, including what it costs at relaunch.
     @Published private(set) var knocked: Set<String> = []
 
+    /// The last verb `tcr` refused, if it has not been answered yet.
+    ///
+    /// Beside the snapshot and not in it, which is the whole of
+    /// ``PeerRefusal``'s reasoning: a refusal written into the snapshot was
+    /// drawn INSTEAD of the tab and then wiped by the next poll about three
+    /// seconds later.
+    @Published private(set) var refusal = PeerRefusal()
+
     /// The snapshot exactly as it was read, before the waiting overlay.
     ///
     /// Kept so that clearing an address from ``knocked`` restores the found
@@ -616,17 +630,23 @@ final class PeerController: ObservableObject {
         self.readSnapshot = .empty
     }
 
-    private init(pinned: PeersSnapshot) {
+    private init(pinned: PeersSnapshot, refusal: PeerRefusal) {
         self.interval = StatusPoller.defaultInterval
         self.isPinned = true
         self.snapshot = pinned
         self.readSnapshot = pinned
+        self.refusal = refusal
     }
 
     /// A controller that reads nothing, runs nothing and answers `pinned`
     /// forever.
-    static func pinned(_ snapshot: PeersSnapshot) -> PeerController {
-        PeerController(pinned: snapshot)
+    ///
+    /// `refusal` is how the harness draws the banner: a refused verb has no
+    /// fixture otherwise, because nothing in a render run can press a button.
+    static func pinned(_ snapshot: PeersSnapshot, refusal: PeerRefusal = PeerRefusal())
+        -> PeerController
+    {
+        PeerController(pinned: snapshot, refusal: refusal)
     }
 
     func start() {
@@ -652,16 +672,39 @@ final class PeerController: ObservableObject {
         publish()
     }
 
-    /// Trust, on a found row: send the knock AND remember that it went.
+    /// Trust, on a found row: start the pairing AND remember that it went.
     ///
-    /// One method rather than a `run` beside a `knocked.insert` at the call
-    /// site, because the two halves are one act, a press that ran the verb
-    /// and forgot to record it draws a row that has not changed, which is the
-    /// defect this state exists to fix.
-    func knock(address: String, arguments: [String]) {
-        knocked.insert(address)
-        publish()
-        run(arguments)
+    /// One method rather than a start beside a `knocked.insert` at the call
+    /// site, because the two halves are one act: a press that ran the verb and
+    /// forgot to record it draws a row that has not changed, which is the
+    /// defect the waiting state exists to fix.
+    ///
+    /// # Why this returns a run and no longer calls ``run(_:)``
+    ///
+    /// It used to be `run(PeerCommand.pair(address:))`: exec, wait, read the
+    /// exit code. That is the one spelling of this verb that cannot finish.
+    /// `tcr peer pair` holds a live handshake, prints six digits, and then
+    /// blocks reading the OTHER Mac's six digits off its stdin, which
+    /// ``TcrTool/run(executable:arguments:stdin:)`` does not give it. The
+    /// press therefore left a subprocess sitting for ten minutes and a sheet
+    /// whose Trust button was disabled forever.
+    ///
+    /// `nil` when `tcr` cannot be found, with the reason already on the tab
+    /// through ``report(failure:)``: a sheet over a binary that is not there
+    /// would have nothing to draw and no way to say why.
+    func startPairing(rowId: String, dialAddress: String) -> PeerPairRun? {
+        guard !isPinned else { return nil }
+        switch TcrTool.resolve() {
+        case .failure(let notFound):
+            report(
+                failure: "tcr not found (searched \(notFound.searched.count) locations). "
+                    + TcrTool.overrideRemedy)
+            return nil
+        case .success(let executable):
+            knocked.insert(rowId)
+            publish()
+            return PeerPairRun(address: dialAddress, executable: executable)
+        }
     }
 
     /// Cancel, on a waiting row. Stops this panel waiting; the request itself
@@ -711,14 +754,17 @@ final class PeerController: ObservableObject {
             guard let self else { return }
             self.pending.remove(key)
             if case .failed(let message) = outcome {
-                // No silent fallback: `tcr`'s own words, in the tab, rather
-                // than a press that looks like it worked. Through the read
-                // snapshot, so the failure is what the next publish draws too
-                // rather than being overwritten by a stale list.
-                self.readSnapshot = PeersSnapshotBuilder.failed(message)
-                self.publish()
+                // No silent fallback: `tcr`'s own words, on the tab, rather
+                // than a press that looks like it worked. In the refusal
+                // beside the snapshot and not in the snapshot itself, so the
+                // tab keeps every control it had and the next poll cannot wipe
+                // the sentence three seconds later (``PeerRefusal``).
+                self.refusal.refused(message)
                 return
             }
+            // The press did what it said. Whatever refusal was on screen is
+            // answered by that, which is one of the only two ways it goes.
+            self.refusal.succeeded()
             await self.refresh()
         }
     }
@@ -755,8 +801,13 @@ final class PeerController: ObservableObject {
     /// same place `tcr`'s own refusals land. One writer, so a message cannot
     /// be drawn in two different ways.
     func report(failure: String) {
-        readSnapshot = PeersSnapshotBuilder.failed(failure)
-        publish()
+        refusal.refused(failure)
+    }
+
+    /// The operator read the banner. The other way it goes is a verb that
+    /// succeeds.
+    func dismissRefusal() {
+        refusal.dismissed()
     }
 
     func isPending(_ arguments: [String]) -> Bool {
@@ -957,6 +1008,10 @@ struct PeersTabV4: View {
     /// The Trust sheet's peer, when one is open. Held here rather than on the
     /// row so two rows cannot open two sheets.
     @State private var trusting: PeerRowModel?
+    /// The `tcr peer pair` behind that sheet, alive for exactly as long as it
+    /// is up. One value beside ``trusting`` for the same reason: two rows
+    /// cannot start two pairings.
+    @State private var pairing: PeerPairRun?
     /// The row whose Block was chosen, while the confirm is up. Same reason:
     /// one value, so two rows cannot arm two bans.
     @State private var blocking: PeerRowModel?
@@ -965,7 +1020,17 @@ struct PeersTabV4: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // A refused verb, ABOVE the tab rather than instead of it. The
+            // tab keeps every control it had, and this stays until it is
+            // dismissed or a verb succeeds: the poll behind it cannot touch
+            // it, because it is not part of the read (``PeerRefusal``).
+            if let refused = controller.refusal.message {
+                refusalBanner(refused)
+            }
             if let failure = snapshot.failure {
+                // The READ failed, which is a different fact: this build has
+                // no peers document at all, so there is nothing to draw the
+                // banner over. A refused verb no longer lands here.
                 collapsed(failure)
             } else if snapshot.unsupported {
                 // This must NEVER be `Unreadable status output`
@@ -1028,15 +1093,22 @@ struct PeersTabV4: View {
         .onAppear { if !snapshotMode { controller.start() } }
         .onDisappear { controller.stop() }
         .sheet(item: $trusting) { row in
-            PeerTrustSheet(
-                peerName: row.title,
-                code: nil,
-                snapshotMode: snapshotMode,
-                onTrust: {
-                    if case .found(let arguments, _) = row.trust { controller.run(arguments) }
-                    trusting = nil
-                },
-                onCancel: { trusting = nil })
+            // The run is what the sheet draws, so there is nothing to draw
+            // without one: `startPairing` already put its own refusal on the
+            // tab, and this closes rather than presenting an empty sheet over
+            // it.
+            if let pairing {
+                PeerTrustSheetHost(
+                    peerName: row.title,
+                    run: pairing,
+                    snapshotMode: snapshotMode,
+                    onFinished: { pinned in
+                        if pinned { Task { await controller.refresh() } }
+                    },
+                    onClose: { closePairing(row: row) })
+            } else {
+                Color.clear.onAppear { trusting = nil }
+            }
         }
         // Block asks once, and the question names the address rather than the
         // name: the name is a string the other Mac chose, and the ban is on
@@ -1059,6 +1131,24 @@ struct PeersTabV4: View {
                     + "its key too once this Mac has learned one. A block does not lift by "
                     + "itself. Settings > Peers > Advanced is where it is lifted.")
         }
+    }
+
+    /// Close the Trust sheet, and make sure nothing it started outlives it.
+    ///
+    /// The `stop()` is not tidiness. A `tcr peer pair` left running holds a
+    /// handshake open for ten minutes with no surface anywhere showing it, so
+    /// a sheet dismissed by any path has to take its process with it.
+    ///
+    /// The row stops waiting only when nothing was pinned: after a successful
+    /// pairing the re-read turns it into a trusted row, and clearing the
+    /// waiting flag as well would be two writers for one row.
+    private func closePairing(row: PeerRowModel) {
+        if let pairing {
+            if case .done = pairing.state {} else { controller.stopWaiting(address: row.id) }
+            pairing.stop()
+        }
+        pairing = nil
+        trusting = nil
     }
 
     /// `confirmationDialog(presenting:)` needs a `Bool` binding beside the
@@ -1117,6 +1207,46 @@ struct PeersTabV4: View {
         .padding(.top, V4.marginAfterStrip(V4.cardGap))
     }
 
+    /// The refused verb, in `tcr`'s own words, with the one control that
+    /// answers it.
+    ///
+    /// Amber and not red: nothing is broken, an act was declined, and the
+    /// `w12-exits-*` rows are the surface this copies. Colour is the second
+    /// channel as everywhere here, so the sentence leads and the glyph
+    /// follows it.
+    private func refusalBanner(_ message: String) -> some View {
+        V4Card {
+            V4Row {
+                HStack(alignment: .top, spacing: V4.rowGap) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(V4.font(V4.dimSize))
+                        .foregroundStyle(Tok.near)
+                    VStack(alignment: .leading, spacing: 2) {
+                        NameText(text: "That was refused", lineLimit: 2)
+                        Text(message)
+                            .font(V4.font(V4.muteSize))
+                            .foregroundStyle(Tok.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .lineSpacing(V4.lineSpacing(V4.muteSize))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                }
+            } trailing: {
+                PeerActionButton(
+                    title: "Dismiss",
+                    systemImage: nil,
+                    help: "Clears this. It also clears by itself the next time a press does "
+                        + "what it was asked.",
+                    enabled: true
+                ) { controller.dismissRefusal() }
+            }
+        }
+        .padding(.top, V4.marginAfterStrip(V4.cardGap))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Refused. \(message)")
+    }
+
     // MARK: The egress line
 
     /// "Answering on studio-mac right now", the first thing an operator reads
@@ -1171,7 +1301,13 @@ struct PeersTabV4: View {
                     + "nothing at all until you press Trust on both screens.",
             yesRole: .plain
         )
-        .padding(.top, snapshot.answeringOn == nil ? V4.marginAfterStrip(V4.cardGap) : V4.cardGap)
+        // The strip's own margin collapses into this one only when this card
+        // is the FIRST thing under the tabs. A refusal banner or the egress
+        // line above it makes it an ordinary gap.
+        .padding(
+            .top,
+            snapshot.answeringOn == nil && !controller.refusal.isShowing
+                ? V4.marginAfterStrip(V4.cardGap) : V4.cardGap)
     }
 
     private var shareCard: some View {
@@ -1259,7 +1395,7 @@ struct PeersTabV4: View {
                 // `freshnessDot`).
                 HStack(spacing: V4.pillGap) {
                     switch row.trust {
-                    case .found(let arguments, _):
+                    case .found(let dialAddress, _):
                         PeerActionButton(
                             title: "Trust",
                             systemImage: "checkmark",
@@ -1270,9 +1406,17 @@ struct PeersTabV4: View {
                             help: "Asks \(row.title) to pair. Six digits appear on both "
                                 + "screens once somebody there accepts, and nothing changes "
                                 + "before that.",
-                            enabled: !controller.isPending(arguments)
+                            // One pairing at a time: the sheet IS the pairing,
+                            // and a second press behind an open sheet would
+                            // start a second held-open handshake this panel
+                            // has nowhere to draw.
+                            enabled: trusting == nil
                         ) {
-                            controller.knock(address: row.id, arguments: arguments)
+                            guard
+                                let run = controller.startPairing(
+                                    rowId: row.id, dialAddress: dialAddress)
+                            else { return }
+                            pairing = run
                             trusting = row
                         }
                     case .waiting(let address):
@@ -1313,10 +1457,11 @@ struct PeersTabV4: View {
                 }
             }
         }
-        // Row 13's greyed row. Opacity and not a different palette: the
-        // sentence and the `lease ended` pill carry the meaning, and colour is
-        // the second channel, never the first.
-        .opacity(row.meter.isEnded ? V4.endedRowOpacity : 1)
+        // No blanket opacity on an ended row. `V4.endedGlyphOpacity`'s own
+        // note carries the measurements: dimming the card put every text run
+        // on it, and its only control, below AA. The `lease ended` pill, the
+        // `ended` label and the sentence carry the meaning at full ink, and
+        // the one element with no word on it is what dims (`freshnessDot`).
     }
 
     /// Serve the mesh as a page and open it. A refusal is surfaced through
@@ -1421,6 +1566,9 @@ struct PeersTabV4: View {
             } label: {
                 Circle()
                     .fill(row.awake ? Tok.ok : Tok.inkFaint)
+                    // The one element on an ended row that dims. It carries
+                    // no word, so nothing legible is spent on saying "past".
+                    .opacity(row.meter.isEnded ? V4.endedGlyphOpacity : 1)
                     .frame(width: V4.dotSize, height: V4.dotSize)
                     // A 40 pt target that costs 8 pt of layout.
                     //
@@ -1540,33 +1688,39 @@ struct PeersTabV4: View {
             ),
         ]
         return V4Card {
-            VStack(alignment: .leading, spacing: 3) {
-                V4Row {
-                    VStack(alignment: .leading, spacing: 2) {
-                        // The proposed name (or the address, when no name was
-                        // sent) on its own line, and the address ALWAYS on a
-                        // second line rather than folded into one via
-                        // `knockTitle`: a `NameText` is one line by design
-                        // (`V4Text.swift`), and "loft-mini (10.0.1.24) wants
-                        // to pair" truncated to "loft-mini (10.0.1…" mid
-                        // address, which is exactly the part an operator is
-                        // meant to be able to check.
-                        NameText(text: PeerAdmission.knockNameLine(knock))
-                        if let address = PeerAdmission.knockAddressLine(knock) {
-                            MuteText(text: address, lineLimit: 1)
-                        }
-                        MuteText(text: PeerAdmission.knockDetail, lineLimit: nil)
-                    }
-                } trailing: {
-                    HStack(spacing: V4.pillGap) {
-                        ForEach(verbs, id: \.title) { verb in
-                            PeerActionButton(
-                                title: verb.title,
-                                systemImage: nil,
-                                help: verb.help,
-                                enabled: !controller.isPending(verb.argv),
-                                action: { controller.run(verb.argv) })
-                        }
+            VStack(alignment: .leading, spacing: V4.knockLineGap) {
+                // The whole card width for the sentence, and the buttons on
+                // their own row underneath.
+                //
+                // They used to sit in a `V4Row`'s trailing slot, which gives
+                // the trailing column `layoutPriority(1)` and clips the
+                // leading label to pay for it: three buttons squeezed the
+                // sentence to about 130 pt and it rendered `loft-mini wants
+                // t…`. The one line on this tab that says a stranger's Mac is
+                // asking to pair was cut mid-word, verb gone, in both
+                // appearances. Nothing about these three controls needs to be
+                // on the title's line.
+                //
+                // The proposed name (or the address, when no name was sent) on
+                // its own line, and the address ALWAYS on a second line rather
+                // than folded into one via `knockTitle`: "loft-mini
+                // (10.0.1.24) wants to pair" truncated to "loft-mini
+                // (10.0.1…" mid address, which is exactly the part an operator
+                // is meant to be able to check.
+                NameText(text: PeerAdmission.knockNameLine(knock), lineLimit: 2)
+                if let address = PeerAdmission.knockAddressLine(knock) {
+                    MuteText(text: address, lineLimit: 1)
+                }
+                MuteText(text: PeerAdmission.knockDetail, lineLimit: nil)
+                HStack(spacing: V4.pillGap) {
+                    Spacer(minLength: 0)
+                    ForEach(verbs, id: \.title) { verb in
+                        PeerActionButton(
+                            title: verb.title,
+                            systemImage: nil,
+                            help: verb.help,
+                            enabled: !controller.isPending(verb.argv),
+                            action: { controller.run(verb.argv) })
                     }
                 }
                 yesBlock(
@@ -1933,34 +2087,92 @@ struct PeerActionButton: View {
 
 // MARK: - The Trust sheet
 
+/// The Trust sheet plus the process behind it.
+///
+/// A wrapper rather than an `@ObservedObject` on ``PeerTrustSheet`` itself: the
+/// sheet is then a pure function of a ``PeerPairState``, which is what lets
+/// `--render-states` draw all five of its states from fixtures and what lets a
+/// test build one without a subprocess. Everything that has to observe a live
+/// run is here.
+struct PeerTrustSheetHost: View {
+    let peerName: String
+    @ObservedObject var run: PeerPairRun
+    var snapshotMode: Bool = false
+    /// Called once the pairing has settled, with whether a key was pinned. The
+    /// tab re-reads on `true`: the peers file changed and the row is a trusted
+    /// row now.
+    var onFinished: (Bool) -> Void = { _ in }
+    var onClose: () -> Void = {}
+
+    var body: some View {
+        PeerTrustSheet(
+            peerName: peerName,
+            state: run.state,
+            compare: $run.compare,
+            submitting: run.submitting,
+            snapshotMode: snapshotMode,
+            onTrust: { run.submitComparedCode() },
+            // Cancel on a live run stops the child and leaves the sheet
+            // saying so; on a settled one there is nothing to stop and the
+            // button is Close.
+            onCancel: {
+                if run.state.isLive {
+                    run.cancel()
+                } else {
+                    onClose()
+                }
+            }
+        )
+        .onChange(of: run.state) { state in
+            guard !state.isLive else { return }
+            if case .done = state { onFinished(true) }
+        }
+    }
+}
+
 /// The six-digit compare, in ``LoginSheet``'s shape.
 ///
 /// The AirPods and Apple TV pairing shape, which is the whole reason it is six
-/// digits and not a fingerprint: both screens show the same number and a person
-/// presses Trust on both. The code comes from the handshake itself
+/// digits and not a fingerprint: both screens show a number and a person reads
+/// one off the other screen. The code comes from the handshake itself
 /// (`get_handshake_hash()`), so comparing it binds THIS connection rather than
 /// two pasted strings.
 ///
-/// # Two sheets, and the one with no digits says so
+/// # What this sheet had to become
 ///
-/// With `code == nil` there is no compare to make and nothing to say about the
-/// other screen. Decision row 10: the knock this Mac just sent reveals no
-/// static key, the six digits are phase 2, and they cannot exist until
-/// somebody over there presses Accept. The sheet used to print "<name> is
-/// showing the same six digits" unconditionally, beside a Trust button it had
-/// disabled and six middle dots where the number goes, so the one true state
-/// of the pairing flow was drawn as a lie. It now says what is happening,
-/// draws no digit block at all, and keeps Trust disabled with a help that
-/// says what it is waiting for.
+/// It took a `code: String?` and its Trust button read `enabled: code != nil`.
+/// Its only call site passed a literal `nil`. So the button could never be
+/// pressed, and `tcr peer pair`, which the press had already started, sat on
+/// a `read_line` with no stdin for ten minutes and then exited refusing. The
+/// one job this tab exists for could not be finished in the UI at all.
 ///
-/// `snapshotMode` draws a still glyph where the spinner goes, for the reason
-/// ``LoginSheet`` records: `ImageRenderer` rasterises a `ProgressView` as the
-/// "prohibited" placeholder, so a fixture of the waiting state would show a
-/// state this app never draws.
+/// Now it draws a typed ``PeerPairState`` fed by a live ``PeerPairRun``, and
+/// the digits go BACK down that process's stdin. Five states, each with its own
+/// words: asking (the far Mac's instruction, by instance id), comparing (this
+/// Mac's digits large, a field for the other Mac's), done, refused (the CLI's
+/// own line) and cancelled.
+///
+/// **There is no "they match" button, and that is a refusal rather than an
+/// omission.** A button spelled that way lets an operator confirm without ever
+/// looking at the other screen, which is the one thing the six digits exist to
+/// force. The field makes the comparison the only way through, and the compare
+/// itself is done by the process holding the handshake.
+///
+/// `snapshotMode` draws a still glyph where the spinner goes, and a still plate
+/// where the text field goes, for the reason ``LoginSheet`` and ``PeerSwitch``
+/// record: `ImageRenderer` rasterises a `ProgressView` and an AppKit-backed
+/// control as the macOS "prohibited" placeholder, so a fixture drawn through
+/// them would picture the harness's limit rather than the sheet.
 struct PeerTrustSheet: View {
     let peerName: String
-    /// `nil` until the handshake has produced one. Never fabricated.
-    let code: String?
+    /// Where the pairing is, as the running command reported it. Never a
+    /// literal at a call site: ``PeersTabV4`` builds it from ``PeerPairRun``.
+    let state: PeerPairState
+    /// The digits read off the OTHER Mac. A binding, because the field writes
+    /// it and ``PeerPairRun`` is what sends it.
+    @Binding var compare: PeerPairCompare
+    /// Whether the digits are already on their way down the pipe.
+    var submitting: Bool = false
     var snapshotMode: Bool = false
     var onTrust: () -> Void = {}
     var onCancel: () -> Void = {}
@@ -1969,64 +2181,55 @@ struct PeerTrustSheet: View {
         VStack(alignment: .leading, spacing: V4.buttonGap) {
             HStack(spacing: V4.rowGap) {
                 glyph
-                Text(
-                    code == nil
-                        ? PeerAdmission.waitingTitle(name: peerName) : "Trust \(peerName)?"
-                )
-                .font(V4.font(V4.summarySize, .semibold))
-                .foregroundStyle(Tok.ink)
-                .fixedSize(horizontal: false, vertical: true)
-            }
-
-            // The digits block is drawn only when there ARE digits. Six middle
-            // dots where a number belongs is the glyph a password field uses,
-            // so an ambiguous emptiness read as "digits present but masked",
-            // and the sentence under it asserted the other Mac was showing
-            // them while the request sat unanswered over there.
-            if let code {
-                Text(code)
-                    .font(.system(size: 28, weight: .semibold, design: .monospaced))
-                    .tracking(6)
+                Text(state.title(peerName: peerName))
+                    .font(V4.font(V4.summarySize, .semibold))
                     .foregroundStyle(Tok.ink)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .accessibilityLabel(
-                        "Pairing code \(code.map(String.init).joined(separator: " "))")
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            Text(
-                code == nil
-                    ? PeerAdmission.waitingSentence
-                    : "\(peerName) is showing the same six digits. If they match, press Trust "
-                        + "on both screens. It will be able to carry your traffic without "
-                        + "reading it, and nothing is shared until you turn sharing on."
-            )
-            .font(V4.font(V4.dimSize))
-            .foregroundStyle(Tok.inkDim)
-            .fixedSize(horizontal: false, vertical: true)
-            .lineSpacing(V4.lineSpacing(V4.dimSize))
-            .frame(maxWidth: .infinity, alignment: .leading)
+            // The digit block is drawn only when there ARE digits, which is
+            // exactly the `comparing` state. A placeholder where a number
+            // belongs reads as "digits present but masked", and the sentence
+            // under it would be asserting something about the other screen
+            // while the request sits unanswered over there.
+            if case .comparing(let code) = state {
+                codeBlock(code)
+                comparedField
+            }
+
+            Text(state.sentence(peerName: peerName))
+                .font(V4.font(V4.dimSize))
+                .foregroundStyle(Tok.inkDim)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineSpacing(V4.lineSpacing(V4.dimSize))
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            // The other Mac's half of the job, named while this one waits. A
+            // "waiting" sheet with no instruction leaves the person at the
+            // other screen with nothing to do, which is how a pairing sits for
+            // ten minutes and then refuses itself.
+            if let instruction = state.farSideInstruction {
+                Text(instruction)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.mute)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(V4.lineSpacing(V4.muteSize))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             HStack(spacing: V4.buttonGap) {
                 Spacer(minLength: 0)
                 PeerActionButton(
-                    title: "Cancel", systemImage: nil,
-                    // Once the knock is away, "nothing is written" is no
-                    // longer true of the other Mac: the request is sitting in
-                    // its pending queue. Closing this sheet writes nothing
-                    // HERE, and the row's own Cancel is what stops waiting.
-                    help: code == nil
-                        ? "Closes this. The request stands on that Mac until somebody answers "
-                            + "it or it expires; the row's Cancel stops waiting here."
-                        : "Nothing is written and \(peerName) stays untrusted."
+                    title: state.isLive ? "Cancel" : "Close", systemImage: nil,
+                    help: cancelHelp
                 ) { onCancel() }
-                PeerActionButton(
-                    title: "Trust", systemImage: "checkmark",
-                    help: code == nil
-                        ? "Waits for the digits. There is nothing to compare until somebody on "
-                            + "\(peerName) accepts the request."
-                        : "Pins \(peerName)'s key on this Mac.",
-                    enabled: code != nil
-                ) { onTrust() }
+                if state.isLive {
+                    PeerActionButton(
+                        title: "Trust", systemImage: "checkmark",
+                        help: trustHelp,
+                        enabled: canTrust
+                    ) { onTrust() }
+                }
             }
         }
         .padding(.vertical, V4.cardPaddingV)
@@ -2035,16 +2238,144 @@ struct PeerTrustSheet: View {
         .background(Tok.panel)
     }
 
+    /// Trust is pressable only with six digits in the field and nothing
+    /// already in flight. Never on `asking`, where there is nothing to
+    /// compare against yet.
+    private var canTrust: Bool {
+        guard case .comparing = state else { return false }
+        return compare.isComplete && !submitting
+    }
+
+    private var cancelHelp: String {
+        switch state {
+        case .asking:
+            return "Stops waiting and ends the pairing here. The request stands on that Mac "
+                + "until somebody answers it or it expires."
+        case .comparing:
+            return "Ends the pairing. Nothing is written and \(peerName) stays untrusted."
+        case .done, .refused, .cancelled:
+            return "Closes this."
+        }
+    }
+
+    private var trustHelp: String {
+        switch state {
+        case .asking:
+            return "Waits for the digits. There is nothing to compare until somebody on "
+                + "\(peerName) accepts the request."
+        default:
+            return "Sends the digits you typed to be compared with this handshake's own. A "
+                + "match pins \(peerName)'s key; a mismatch is refused and not retried."
+        }
+    }
+
+    /// This Mac's six digits, in two groups of three, so the eye compares
+    /// them one group at a time.
+    private func codeBlock(_ code: String) -> some View {
+        HStack(spacing: V4.pairCodeGap) {
+            ForEach(Array(groups(of: code).enumerated()), id: \.offset) { group in
+                Text(group.element)
+                    .font(
+                        .system(size: V4.pairCodeSize, weight: .bold, design: .monospaced)
+                    )
+                    .tracking(V4.pairCodeTracking)
+                    .foregroundStyle(Tok.ink)
+                    .padding(.vertical, V4.pairCodePaddingV)
+                    .padding(.horizontal, V4.pairCodePaddingH)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: V4.pairCodeRadius)
+                            .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth)
+                    )
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, V4.pairCodeMarginTop)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "This Mac shows \(code.map(String.init).joined(separator: " "))")
+    }
+
+    /// Three at a time, so six digits read as `418 902` and not as one run.
+    private func groups(of code: String) -> [String] {
+        stride(from: 0, to: code.count, by: V4.pairCodeGroup).map { start in
+            let from = code.index(code.startIndex, offsetBy: start)
+            let to = code.index(from, offsetBy: min(V4.pairCodeGroup, code.count - start))
+            return String(code[from..<to])
+        }
+    }
+
+    /// Where the OTHER Mac's digits are typed.
+    ///
+    /// A plain field on the panel's own plate rather than a system text field
+    /// in a box: everything else on this sheet is drawn, and a focus ring from
+    /// a different design system in the middle of it is the seam.
+    @ViewBuilder
+    private var comparedField: some View {
+        let typed = compare.typed
+        VStack(spacing: V4.pairFieldCaptionGap) {
+            // The caption, not a placeholder inside the box. A placeholder
+            // spelled `000000` is six digits where a value belongs, which is
+            // the same defect as the six middle dots this sheet already
+            // refuses: it reads as a number that is present.
+            Text("What \(peerName) is showing")
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(Tok.mute)
+            ZStack {
+                RoundedRectangle(cornerRadius: V4.pairCodeRadius)
+                    .fill(Tok.ink.opacity(V4.buttonFillAlpha))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: V4.pairCodeRadius)
+                            .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth)
+                    )
+                if snapshotMode {
+                    Text(typed)
+                        .font(
+                            .system(
+                                size: V4.pairFieldSize, weight: .semibold, design: .monospaced)
+                        )
+                        .tracking(V4.pairFieldTracking)
+                        .foregroundStyle(Tok.ink)
+                } else {
+                    TextField(
+                        "",
+                        text: Binding(
+                            get: { compare.typed },
+                            set: { compare.set($0) })
+                    )
+                    .textFieldStyle(.plain)
+                    .multilineTextAlignment(.center)
+                    .font(
+                        .system(size: V4.pairFieldSize, weight: .semibold, design: .monospaced)
+                    )
+                    .foregroundStyle(Tok.ink)
+                    .onSubmit { if canTrust { onTrust() } }
+                }
+            }
+            .frame(width: V4.pairFieldWidth, height: V4.pairFieldHeight)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("The six digits \(peerName) is showing")
+        .accessibilityValue(typed)
+    }
+
     @ViewBuilder
     private var glyph: some View {
-        if code == nil {
+        switch state {
+        case .asking:
             if snapshotMode {
                 Image(systemName: "clock").foregroundStyle(Tok.inkDim)
             } else {
                 ProgressView().controlSize(.small)
             }
-        } else {
+        case .comparing:
             Image(systemName: "number").foregroundStyle(Tok.unmeasured)
+        case .done:
+            Image(systemName: "checkmark.seal").foregroundStyle(Tok.ok)
+        case .refused:
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(Tok.near)
+        case .cancelled:
+            Image(systemName: "xmark.circle").foregroundStyle(Tok.mute)
         }
     }
 }
