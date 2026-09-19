@@ -128,14 +128,23 @@ extension PeerFormat {
     /// path reads `via loft-mini` rather than `via tcr-4b8we1r0zp`. An id with
     /// no name keeps the id: an operator can look that up, and inventing a
     /// name would be worse.
+    ///
+    /// The first line, the one a dial tries first, is prefixed `tried first
+    /// · `. It says `tried first`, never `in use`: nothing on the wire
+    /// reports which path a connection is actually using, and a label
+    /// nothing measured is a lie. A row with a single path still gets the
+    /// prefix, because it is still the path dialled first. Do not "improve"
+    /// this into `in use` without a wire field to back it.
     public static func pathLines(
         _ paths: [PeerListDocument.PeerPath], names: [String: String] = [:]
     ) -> [PeerPathLine] {
         guard !paths.isEmpty else {
             return [PeerPathLine(text: "no path right now", tone: .absent)]
         }
-        return paths.map { path in
-            PeerPathLine(text: pathLine(path, names: names), tone: tone(path))
+        return paths.enumerated().map { index, path in
+            let text = pathLine(path, names: names)
+            return PeerPathLine(
+                text: index == 0 ? "tried first · \(text)" : text, tone: tone(path))
         }
     }
 

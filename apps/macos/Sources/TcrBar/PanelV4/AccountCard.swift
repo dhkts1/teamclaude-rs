@@ -99,7 +99,12 @@ struct AccountCard<Actions: View>: View {
                         if let rotation = rotationPillText {
                             V4Pill(text: rotation, help: account.rotationHelp)
                         }
-                        V4Pill(text: statePillText, role: statePillRole, help: account.stateHelp)
+                        // Not drawn while the waiting pill below is showing:
+                        // a card whose exit Mac is down must not also read
+                        // green OK at a glance.
+                        if exitWaitingPillText == nil {
+                            V4Pill(text: statePillText, role: statePillRole, help: account.stateHelp)
+                        }
                     }
                 }
                 .accessibilityElement(children: .combine)
