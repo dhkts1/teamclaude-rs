@@ -135,6 +135,18 @@ final class PeerLendModeTests: XCTestCase {
         let serve = PeerLease.modeSentence(.serve, peer: "studio-mac")
         let hand = PeerLease.modeSentence(.hand, peer: "studio-mac")
         XCTAssertNotEqual(serve, hand)
+        // Neither sentence opens by restating the segment the operator just
+        // selected. `Over this Mac (now).` under a control already reading
+        // `Over this Mac` is the label twice and the fact never.
+        for (sentence, label) in [(serve, LendMode.serve.label), (hand, LendMode.hand.label)] {
+            XCTAssertFalse(
+                sentence.hasPrefix(label),
+                "the mode sentence opens by repeating its own segment's label: \(sentence)")
+            XCTAssertFalse(
+                sentence.contains("(now)"),
+                "the parenthetical is back, and it says nothing the selected segment does "
+                    + "not already say: \(sentence)")
+        }
         for sentence in [serve, hand, LendMode.serve.label, LendMode.hand.label] {
             for word in ["IK", "NAT-PMP", "UPnP", "egress", "serve mode", "hand mode"] {
                 XCTAssertFalse(

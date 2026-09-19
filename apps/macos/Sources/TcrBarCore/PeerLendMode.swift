@@ -44,17 +44,22 @@ extension PeerLease {
     /// The sentence under the control, which changes ENTIRELY between the two
     /// modes rather than swapping one word: the fact that changes is who reads
     /// the request, and that is not a cosmetic difference.
+    ///
+    /// It opens with the FACT, never with its own segment's label. Each arm
+    /// began `Over this Mac (now).` and `With a handed key (now).`, directly
+    /// under a segmented control already showing the selected one of those two
+    /// labels: the first words of the explaining sentence said only what the
+    /// control above it had said, and the parenthetical said nothing at all.
     public static func modeSentence(_ mode: LendMode, peer: String) -> String {
         switch mode {
         case .serve:
-            return "Over this Mac (now). \(peer)'s requests travel through you and leave on "
-                + "your own address; you see each one before it is sent. Turning this off "
-                + "stops it immediately, mid request if one is running."
+            return "\(peer)'s requests travel through you and leave on your own address; you "
+                + "see each one before it is sent. Turning this off stops it immediately, "
+                + "mid request if one is running."
         case .hand:
-            return "With a handed key (now). \(peer) holds a short lived key and sends its "
-                + "own requests, on its own address; you never see what it asks. You keep "
-                + "renewing the key behind the scenes, and to stop it, you just stop "
-                + "renewing."
+            return "\(peer) holds a short lived key and sends its own requests, on its own "
+                + "address; you never see what it asks. You keep renewing the key behind the "
+                + "scenes, and to stop it, you just stop renewing."
         }
     }
 
