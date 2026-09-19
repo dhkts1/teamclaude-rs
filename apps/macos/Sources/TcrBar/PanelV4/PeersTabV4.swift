@@ -1548,7 +1548,7 @@ struct PeersTabV4: View {
         Image(systemName: "ellipsis")
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(Tok.mute)
-            .frame(width: 16, height: PeersTabV4.hitTarget)
+            .frame(width: V4.rowMenuIconWidth, height: PeersTabV4.hitTarget)
             .contentShape(Rectangle())
     }
 
@@ -1741,7 +1741,7 @@ struct PeersTabV4: View {
         Text(footer)
             .font(V4.font(V4.byToolLineSize))
             .foregroundStyle(Tok.mute)
-            .padding(.top, 2)
+            .padding(.top, V4.limitedLineTopMargin)
             .padding(.horizontal, V4.sectionHeadMarginSide)
             .help(
                 "This Mac shows at most 12 found Macs, and at most 2 from one address, so a "
@@ -1833,8 +1833,8 @@ struct PeersTabV4: View {
             .fixedSize(horizontal: false, vertical: true)
             .lineSpacing(V4.lineSpacing(V4.muteSize))
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 5)
-            .padding(.horizontal, 8)
+            .padding(.vertical, V4.yesBlockPaddingV)
+            .padding(.horizontal, V4.yesBlockPaddingH)
             .background(
                 RoundedRectangle(cornerRadius: V4.buttonRadius)
                     .fill(role.tint.opacity(0.07))
@@ -1843,7 +1843,7 @@ struct PeersTabV4: View {
                 RoundedRectangle(cornerRadius: V4.buttonRadius)
                     .strokeBorder(role.tint.opacity(0.35), lineWidth: V4.panelBorderWidth)
             )
-            .padding(.top, 6)
+            .padding(.top, V4.yesBlockMarginTop)
     }
 
     // MARK: Geometry
@@ -2022,7 +2022,7 @@ struct PeerSwitch: View {
                 Circle()
                     .fill(Tok.panelTopEdge)
                     .frame(width: Self.knob, height: Self.knob)
-                    .padding(2)
+                    .padding(V4.peerSwitchKnobInset)
             }
             .frame(width: Self.trackWidth, height: Self.trackHeight)
             .opacity(enabled ? 1 : 0.4)

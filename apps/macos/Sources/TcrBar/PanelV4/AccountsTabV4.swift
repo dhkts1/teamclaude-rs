@@ -269,7 +269,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 HStack(spacing: 3) {
                     Circle()
                         .fill(pillRole(tally.kind).tint)
-                        .frame(width: 7, height: 7)
+                        .frame(width: V4.tallyDotSize, height: V4.tallyDotSize)
                     Text("\(tally.count)")
                         .font(V4.font(V4.muteSize))
                         .foregroundStyle(Tok.mute)
