@@ -1379,10 +1379,11 @@ struct PeersTabV4: View {
                 }
             }
         }
-        // Row 13's greyed row. Opacity and not a different palette: the
-        // sentence and the `lease ended` pill carry the meaning, and colour is
-        // the second channel, never the first.
-        .opacity(row.meter.isEnded ? V4.endedRowOpacity : 1)
+        // No blanket opacity on an ended row. `V4.endedGlyphOpacity`'s own
+        // note carries the measurements: dimming the card put every text run
+        // on it, and its only control, below AA. The `lease ended` pill, the
+        // `ended` label and the sentence carry the meaning at full ink, and
+        // the one element with no word on it is what dims (`freshnessDot`).
     }
 
     /// Serve the mesh as a page and open it. A refusal is surfaced through
@@ -1487,6 +1488,9 @@ struct PeersTabV4: View {
             } label: {
                 Circle()
                     .fill(row.awake ? Tok.ok : Tok.inkFaint)
+                    // The one element on an ended row that dims. It carries
+                    // no word, so nothing legible is spent on saying "past".
+                    .opacity(row.meter.isEnded ? V4.endedGlyphOpacity : 1)
                     .frame(width: V4.dotSize, height: V4.dotSize)
                     // A 40 pt target that costs 8 pt of layout.
                     //

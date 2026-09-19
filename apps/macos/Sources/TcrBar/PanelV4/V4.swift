@@ -176,11 +176,25 @@ enum V4 {
     static var barHeight: CGFloat { compact ? 6 : 7 }
     static let barRadius: CGFloat = 4
     static let barTrackAlpha: Double = 0.08
-    /// A peer row whose lease has ENDED, drawn as past
-    /// (`settings-peers-short.html`'s own `.lz.ended`, decision row 13). The
-    /// same 0.55 the per-Mac sheet's ended lease row already uses, so the two
-    /// surfaces grey one state by one amount.
-    static let endedRowOpacity: Double = 0.55
+    /// What an ENDED lease dims: the freshness dot beside its row, and
+    /// nothing that carries a word.
+    ///
+    /// # Why this is no longer the whole row
+    ///
+    /// It was `endedRowOpacity`, applied to the entire card, and the card was
+    /// measured off the rendered PNGs: the body sentence 2.25:1 light and
+    /// 2.59:1 dark, `ended 09:36` 2.25:1, the `LEASE ENDED` pill 2.65:1, the
+    /// row title 3.98:1, and the **Re-lend button's own label 3.83:1**. AA
+    /// wants 4.5:1 for that text and 3:1 for that control. The state an
+    /// operator lands in after a lease ends was the least readable card in the
+    /// app, and its only way out was the least readable control on it.
+    ///
+    /// The word `ended` is on that card three times over: the pill, the
+    /// sentence, and the label beside Re-lend. This panel's own rule is that
+    /// colour is the second channel and never the first, so the meaning stays
+    /// in the words at full ink and the dimming is spent on the one element
+    /// that carries none.
+    static let endedGlyphOpacity: Double = 0.55
     static let barMinWidth: CGFloat = 2
     /// `.bar.capped{max-width:110px}` — the BY TOOL bars only.
     static let barCappedWidth: CGFloat = 110

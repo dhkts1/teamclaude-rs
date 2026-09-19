@@ -619,9 +619,18 @@ final class PeersPanelStateWiringTests: XCTestCase {
                 + "only lease expired keeps its meter and a sentence about the offer standing")
         let card = try slice(
             tab, from: "private func peerCard(", to: "/// A found row's own menu")
+        XCTAssertFalse(
+            card.contains(".opacity(row.meter.isEnded"),
+            "the whole ended card is dimmed again. Measured off the rendered PNGs at the 0.55 "
+                + "this used to apply: the body sentence 2.25:1 light and 2.59:1 dark, the "
+                + "`ended` label 2.25:1, the pill 2.65:1, the title 3.98:1 and the Re-lend "
+                + "label 3.83:1, against AA's 4.5:1 for that text and 3:1 for that control")
+        let dot = try slice(
+            tab, from: "private func freshnessDot(", to: "@ViewBuilder")
         XCTAssertTrue(
-            card.contains(".opacity(row.meter.isEnded ? V4.endedRowOpacity : 1)"),
-            "the ended row is no longer greyed, so it reads as live")
+            dot.contains(".opacity(row.meter.isEnded ? V4.endedGlyphOpacity : 1)"),
+            "nothing on an ended row reads as past any more: the dim belongs on the one "
+                + "element that carries no word")
         XCTAssertTrue(
             tab.contains("pills(entry, awake: seen.awake, ended: meter.isEnded)"),
             "the pills derive ended for themselves again, so the row can draw a live pill "
@@ -644,13 +653,33 @@ final class PeersPanelStateWiringTests: XCTestCase {
             "another state takes the second pill ahead of the ended one")
     }
 
-    /// Both surfaces grey one state by one amount.
-    func testTheEndedGreyIsOneToken() throws {
+    /// Neither surface dims a control an operator has to be able to read.
+    ///
+    /// This used to assert both surfaces carried ONE opacity token, which
+    /// they did: both dimmed their whole ended row by 0.55, and both put
+    /// their Re-lend below AA doing it. One spelling of a defect is still the
+    /// defect, so what is gated now is that neither surface has a row-wide
+    /// dim at all.
+    func testNeitherSurfaceDimsTheWayOutOfAnEndedLease() throws {
         let pane = try source("apps/macos/Sources/TcrBar/PeersSettingsView.swift")
+        XCTAssertFalse(
+            pane.contains(".opacity(ended ? "),
+            "the pane's ended lease row is dimmed as a whole again, and its Re-lend button is "
+                + "the only way back from that state")
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertFalse(
+            tab.contains("V4.endedRowOpacity"),
+            "the retired row-wide token is back in the tab")
+        let sheet = try source("apps/macos/Sources/TcrBar/PanelV4/V4.swift")
+        // The DECLARATION, not the word: the token's replacement carries its
+        // retirement in a doc-comment, and a bare search for the old name
+        // matches the sentence that retires it.
         XCTAssertTrue(
-            pane.contains(".opacity(ended ? V4.endedRowOpacity : 1)"),
-            "the sheet's ended lease row carries its own literal grey again, so the tab and "
-                + "the sheet can drift")
+            sheet.contains("static let endedGlyphOpacity"),
+            "the number sheet no longer declares what an ended row dims")
+        XCTAssertFalse(
+            sheet.contains("static let endedRowOpacity"),
+            "the retired token is declared again, so a call site can dim a whole row by name")
     }
 
     // MARK: - Item 8: the fixtures
