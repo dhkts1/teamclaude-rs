@@ -431,6 +431,15 @@ enum V4 {
     /// is, which is the shape of the truncation that made every unmeasured
     /// reading print `not m…`.
     static let meshPillLabelInset: CGFloat = PeerMeshLayout.pillLabelInset
+    /// The legend line under the drawing: `solid: direct · dashed: …`.
+    static let meshLegendSize: CGFloat = 11.5
+    static let meshLegendMarginTop: CGFloat = 6
+    /// The reading list drawn above `PeerMeshLayout.maxMacsForGraph` trusted
+    /// Macs: one line per Mac instead of the graph.
+    static let meshReadingsGap: CGFloat = 5
+    static let meshReadingsMarginTop: CGFloat = 4
+    static let meshReadingNameSize: CGFloat = 12.5
+    static let meshReadingTextSize: CGFloat = 12
 
     /// The gap between the lines of a pairing request's card: the sentence,
     /// the address, what Accept does, and the row of controls under them.
