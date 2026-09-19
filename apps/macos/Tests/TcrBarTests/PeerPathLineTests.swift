@@ -59,6 +59,31 @@ final class PeerPathLineTests: XCTestCase {
         XCTAssertEqual(lines[0].tone, .absent)
     }
 
+    /// Three absences, three answers, and the CALLER picks.
+    ///
+    /// One sentence covered two different facts: this Mac looked and found no
+    /// way there, and the live half of the read never answered at all. They
+    /// are not the same thing to somebody deciding whether to go and look at
+    /// the other Mac. The third case is a row with work visibly in flight,
+    /// where the traffic is the proof a path exists and the line would
+    /// contradict the sentence two lines above it.
+    func testTheThreeAbsencesAreThreeDifferentAnswers() {
+        XCTAssertEqual(
+            PeerFormat.pathLines([], absence: .measured)[0].text, "no path right now")
+        XCTAssertEqual(
+            PeerFormat.pathLines([], absence: .notReported)[0].text, "path not reported")
+        XCTAssertEqual(
+            PeerFormat.pathLines([], absence: .notReported)[0].tone, .absent,
+            "an unread half is the absence tone, not a warning: nothing is wrong")
+        XCTAssertTrue(
+            PeerFormat.pathLines([], absence: .silent).isEmpty,
+            "a row with traffic on it still prints an absent path under the proof it has one")
+        // An absence never overrides real paths: whichever the caller picked,
+        // a row with paths draws them.
+        XCTAssertEqual(PeerFormat.pathLines([path()], absence: .silent).count, 1)
+        XCTAssertEqual(PeerFormat.pathLines([path()], absence: .notReported).count, 1)
+    }
+
     /// And it never prints a number: no RTT, no loss, no zero standing in for
     /// a measurement nobody took.
     func testTheNoPathLineCarriesNoFigures() {

@@ -123,6 +123,23 @@ public struct PeerListDocument: Decodable, Equatable, Sendable {
     /// until `tcr` writes the field.
     public var exits: [String: AccountExit]
 
+    /// Whether the LIVE half of the read answered, for the one row that has
+    /// to tell "this Mac looked and found no way there" from "nothing
+    /// looked".
+    ///
+    /// Not a wire key and never decoded: ``mergingLive(_:)`` is its only
+    /// writer. `nil` means no live read was folded in at all, which is every
+    /// document built by hand, and those keep the measured wording rather
+    /// than reporting an absence nobody observed.
+    ///
+    /// It is HERE and not on a row because that is where the fact is. A row's
+    /// `paths` array is `[]` in both cases, deliberately (see
+    /// ``PeerEntry/paths``, whose own note says the two readings were the
+    /// same sentence), and no per-row key distinguishes them; what does is
+    /// whether `tcr peer status --json` answered at all, which is one fact
+    /// about one read.
+    public var liveAnswered: Bool?
+
     enum CodingKeys: String, CodingKey {
         case supported, finding, sharing, peers, answeringOn
         case name, announceName, nodeId, listenAddress, via, maxHops, internet
@@ -641,8 +658,17 @@ extension PeerListDocument {
     ///    so they cannot collide with one.
     /// 3. **An unsupported read is returned unchanged**, not emptied.
     public func mergingLive(_ read: LivePeersRead) -> PeerListDocument {
-        guard read.supported, !read.peers.isEmpty else { return self }
+        // Whether the live half answered is recorded on EVERY path through
+        // here, including the two that change nothing else: a read that was
+        // not supported is exactly the case a row has to word differently,
+        // and it used to be dropped on the floor here.
+        guard read.supported, !read.peers.isEmpty else {
+            var unread = self
+            unread.liveAnswered = read.supported
+            return unread
+        }
         var out = self
+        out.liveAnswered = true
         var live: [String: PeerEntry] = [:]
         for row in read.peers where row.id != nil {
             live[row.id ?? ""] = row

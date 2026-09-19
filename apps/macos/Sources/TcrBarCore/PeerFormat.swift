@@ -136,10 +136,12 @@ extension PeerFormat {
     /// prefix, because it is still the path dialled first. Do not "improve"
     /// this into `in use` without a wire field to back it.
     public static func pathLines(
-        _ paths: [PeerListDocument.PeerPath], names: [String: String] = [:]
+        _ paths: [PeerListDocument.PeerPath], names: [String: String] = [:],
+        absence: PeerPathAbsence = .measured
     ) -> [PeerPathLine] {
         guard !paths.isEmpty else {
-            return [PeerPathLine(text: "no path right now", tone: .absent)]
+            guard let sentence = absence.sentence else { return [] }
+            return [PeerPathLine(text: sentence, tone: .absent)]
         }
         return paths.enumerated().map { index, path in
             let text = pathLine(path, names: names)
@@ -179,6 +181,36 @@ extension PeerFormat {
         case 2: return "\(names[0]) and \(names[1])"
         default:
             return names.dropLast().joined(separator: ", ") + " and \(names[names.count - 1])"
+        }
+    }
+}
+
+/// What an empty path list MEANS, decided by the caller because only the
+/// caller knows.
+///
+/// One sentence, `no path right now`, used to cover two different facts: this
+/// Mac looked and found no way to reach that one, and the live half of the
+/// read never answered, so nothing looked. They are not the same thing to
+/// somebody deciding whether to walk over to the other Mac, and the second one
+/// is a claim this panel cannot make.
+///
+/// The third case prints nothing at all: on a row with requests in flight or a
+/// running lease, the traffic IS the proof a path exists, and an absent-path
+/// line under it contradicts the sentence two lines above it.
+public enum PeerPathAbsence: Equatable, Sendable {
+    /// This Mac looked, and there is no way to reach that one right now.
+    case measured
+    /// The live half was not read, so nothing measured anything.
+    case notReported
+    /// Say nothing: work is visibly flowing over a path this row cannot name.
+    case silent
+
+    /// The line, or `nil` for the case that draws none.
+    public var sentence: String? {
+        switch self {
+        case .measured: return "no path right now"
+        case .notReported: return "path not reported"
+        case .silent: return nil
         }
     }
 }

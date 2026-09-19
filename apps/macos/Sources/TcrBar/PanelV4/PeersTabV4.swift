@@ -89,6 +89,13 @@ struct PeerRowModel: Identifiable, Equatable {
     /// against a `tcr` whose live half this build could not read, in which
     /// case the row draws exactly what it drew before the paths existed.
     let pathLines: [PeerPathLine]
+    /// Whether the wire named ANY way to reach this Mac.
+    ///
+    /// The bare fact, kept beside the worded lines because a reader of those
+    /// lines cannot recover it: an empty path list draws one of three
+    /// different things (``PeerPathAbsence``) and one of them draws nothing at
+    /// all, so "no line" and "no path" are not the same state.
+    var hasPath: Bool = false
     /// The first path's own figures, kept beside the worded lines for the mini
     /// mesh: the card draws a dot and a number, not a sentence, and re-parsing
     /// them out of `pathLines` would be a second place the wording matters.
@@ -317,7 +324,9 @@ enum PeersSnapshotBuilder {
             finding: document.finding,
             sharing: document.sharing,
             rows: document.peers.map {
-                row($0, sharing: document.sharing, now: now, names: peerNames(document))
+                row(
+                    $0, sharing: document.sharing, now: now, names: peerNames(document),
+                    liveAnswered: document.liveAnswered)
             },
             answeringOn: document.answeringOn,
             readAt: now,
@@ -390,7 +399,7 @@ enum PeersSnapshotBuilder {
 
     private static func row(
         _ entry: PeerListDocument.PeerEntry, sharing: Bool, now: Date,
-        names: [String: String] = [:]
+        names: [String: String] = [:], liveAnswered: Bool? = nil
     ) -> PeerRowModel {
         let address = entry.address ?? entry.name ?? "unknown"
         let named = entry.name != nil
@@ -430,6 +439,15 @@ enum PeersSnapshotBuilder {
         // it about whether the lease is over, and deriving "ended" a second
         // time is how the row ends up with a live pill over a dead meter.
         let meter = meter(entry, title: title, sharing: sharing, awake: seen.awake, now: now)
+        // Which of the three absences this row's empty path list means, and
+        // only this caller can answer it. Work in flight or a running lease
+        // is traffic, and traffic is the proof a path exists: the row printed
+        // `2 requests are on studio-mac's accounts now` two lines above `no
+        // path right now`, which is the card contradicting itself. Otherwise
+        // the live half either answered and found nothing, or never answered.
+        let working = (entry.inFlight ?? 0) > 0 || meter.isLiveLease
+        let absence: PeerPathAbsence =
+            working ? .silent : (liveAnswered == false ? .notReported : .measured)
         return PeerRowModel(
             id: identity,
             title: title,
@@ -444,7 +462,8 @@ enum PeersSnapshotBuilder {
             lend: entry.lend,
             // Newest first, as the serving process ordered them: the first
             // line is the path a dial would try first.
-            pathLines: PeerFormat.pathLines(entry.paths, names: names),
+            pathLines: PeerFormat.pathLines(entry.paths, names: names, absence: absence),
+            hasPath: !entry.paths.isEmpty,
             pathRttMs: entry.paths.first?.rttMs,
             pathLossPct: entry.paths.first?.lossPct,
             pathViaName: entry.paths.first.flatMap { path in

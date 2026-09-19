@@ -346,6 +346,34 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "growth the budget cannot see comes out of the footer")
     }
 
+    /// The row decides which absence its empty path list means, and a row
+    /// with traffic on it prints none.
+    ///
+    /// `PeerFormat` cannot answer this: only the caller knows whether the
+    /// live half answered and whether work is in flight. The row printed
+    /// `2 requests are on studio-mac's accounts now` two lines above `no path
+    /// right now`, which is one card saying traffic is flowing over a route
+    /// it also says does not exist.
+    func testTheRowPicksWhichAbsenceItsPathListMeans() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let builder = try slice(
+            tab, from: "private static func row(", to: "private static func pills(")
+        XCTAssertTrue(
+            builder.contains("(entry.inFlight ?? 0) > 0 || meter.isLiveLease"),
+            "traffic no longer silences the absent path line, so a row can contradict "
+                + "itself two lines apart")
+        XCTAssertTrue(
+            builder.contains("working ? .silent"),
+            "a row with work in flight prints an absence again")
+        XCTAssertTrue(
+            builder.contains("liveAnswered == false ? .notReported : .measured"),
+            "a live half that never answered is reported as a measured absence, which is a "
+                + "claim this panel did not measure")
+        XCTAssertTrue(
+            builder.contains("absence: absence"),
+            "the decision is made and then not handed to the lines it decides")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
