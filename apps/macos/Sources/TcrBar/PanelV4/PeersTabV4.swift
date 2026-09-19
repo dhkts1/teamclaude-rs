@@ -604,6 +604,14 @@ final class PeerController: ObservableObject {
     /// carries the whole reasoning, including what it costs at relaunch.
     @Published private(set) var knocked: Set<String> = []
 
+    /// The last verb `tcr` refused, if it has not been answered yet.
+    ///
+    /// Beside the snapshot and not in it, which is the whole of
+    /// ``PeerRefusal``'s reasoning: a refusal written into the snapshot was
+    /// drawn INSTEAD of the tab and then wiped by the next poll about three
+    /// seconds later.
+    @Published private(set) var refusal = PeerRefusal()
+
     /// The snapshot exactly as it was read, before the waiting overlay.
     ///
     /// Kept so that clearing an address from ``knocked`` restores the found
@@ -622,17 +630,23 @@ final class PeerController: ObservableObject {
         self.readSnapshot = .empty
     }
 
-    private init(pinned: PeersSnapshot) {
+    private init(pinned: PeersSnapshot, refusal: PeerRefusal) {
         self.interval = StatusPoller.defaultInterval
         self.isPinned = true
         self.snapshot = pinned
         self.readSnapshot = pinned
+        self.refusal = refusal
     }
 
     /// A controller that reads nothing, runs nothing and answers `pinned`
     /// forever.
-    static func pinned(_ snapshot: PeersSnapshot) -> PeerController {
-        PeerController(pinned: snapshot)
+    ///
+    /// `refusal` is how the harness draws the banner: a refused verb has no
+    /// fixture otherwise, because nothing in a render run can press a button.
+    static func pinned(_ snapshot: PeersSnapshot, refusal: PeerRefusal = PeerRefusal())
+        -> PeerController
+    {
+        PeerController(pinned: snapshot, refusal: refusal)
     }
 
     func start() {
@@ -740,14 +754,17 @@ final class PeerController: ObservableObject {
             guard let self else { return }
             self.pending.remove(key)
             if case .failed(let message) = outcome {
-                // No silent fallback: `tcr`'s own words, in the tab, rather
-                // than a press that looks like it worked. Through the read
-                // snapshot, so the failure is what the next publish draws too
-                // rather than being overwritten by a stale list.
-                self.readSnapshot = PeersSnapshotBuilder.failed(message)
-                self.publish()
+                // No silent fallback: `tcr`'s own words, on the tab, rather
+                // than a press that looks like it worked. In the refusal
+                // beside the snapshot and not in the snapshot itself, so the
+                // tab keeps every control it had and the next poll cannot wipe
+                // the sentence three seconds later (``PeerRefusal``).
+                self.refusal.refused(message)
                 return
             }
+            // The press did what it said. Whatever refusal was on screen is
+            // answered by that, which is one of the only two ways it goes.
+            self.refusal.succeeded()
             await self.refresh()
         }
     }
@@ -784,8 +801,13 @@ final class PeerController: ObservableObject {
     /// same place `tcr`'s own refusals land. One writer, so a message cannot
     /// be drawn in two different ways.
     func report(failure: String) {
-        readSnapshot = PeersSnapshotBuilder.failed(failure)
-        publish()
+        refusal.refused(failure)
+    }
+
+    /// The operator read the banner. The other way it goes is a verb that
+    /// succeeds.
+    func dismissRefusal() {
+        refusal.dismissed()
     }
 
     func isPending(_ arguments: [String]) -> Bool {
@@ -998,7 +1020,17 @@ struct PeersTabV4: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // A refused verb, ABOVE the tab rather than instead of it. The
+            // tab keeps every control it had, and this stays until it is
+            // dismissed or a verb succeeds: the poll behind it cannot touch
+            // it, because it is not part of the read (``PeerRefusal``).
+            if let refused = controller.refusal.message {
+                refusalBanner(refused)
+            }
             if let failure = snapshot.failure {
+                // The READ failed, which is a different fact: this build has
+                // no peers document at all, so there is nothing to draw the
+                // banner over. A refused verb no longer lands here.
                 collapsed(failure)
             } else if snapshot.unsupported {
                 // This must NEVER be `Unreadable status output`
@@ -1175,6 +1207,46 @@ struct PeersTabV4: View {
         .padding(.top, V4.marginAfterStrip(V4.cardGap))
     }
 
+    /// The refused verb, in `tcr`'s own words, with the one control that
+    /// answers it.
+    ///
+    /// Amber and not red: nothing is broken, an act was declined, and the
+    /// `w12-exits-*` rows are the surface this copies. Colour is the second
+    /// channel as everywhere here, so the sentence leads and the glyph
+    /// follows it.
+    private func refusalBanner(_ message: String) -> some View {
+        V4Card {
+            V4Row {
+                HStack(alignment: .top, spacing: V4.rowGap) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(V4.font(V4.dimSize))
+                        .foregroundStyle(Tok.near)
+                    VStack(alignment: .leading, spacing: 2) {
+                        NameText(text: "That was refused", lineLimit: 2)
+                        Text(message)
+                            .font(V4.font(V4.muteSize))
+                            .foregroundStyle(Tok.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .lineSpacing(V4.lineSpacing(V4.muteSize))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                }
+            } trailing: {
+                PeerActionButton(
+                    title: "Dismiss",
+                    systemImage: nil,
+                    help: "Clears this. It also clears by itself the next time a press does "
+                        + "what it was asked.",
+                    enabled: true
+                ) { controller.dismissRefusal() }
+            }
+        }
+        .padding(.top, V4.marginAfterStrip(V4.cardGap))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Refused. \(message)")
+    }
+
     // MARK: The egress line
 
     /// "Answering on studio-mac right now", the first thing an operator reads
@@ -1229,7 +1301,13 @@ struct PeersTabV4: View {
                     + "nothing at all until you press Trust on both screens.",
             yesRole: .plain
         )
-        .padding(.top, snapshot.answeringOn == nil ? V4.marginAfterStrip(V4.cardGap) : V4.cardGap)
+        // The strip's own margin collapses into this one only when this card
+        // is the FIRST thing under the tabs. A refusal banner or the egress
+        // line above it makes it an ordinary gap.
+        .padding(
+            .top,
+            snapshot.answeringOn == nil && !controller.refusal.isShowing
+                ? V4.marginAfterStrip(V4.cardGap) : V4.cardGap)
     }
 
     private var shareCard: some View {

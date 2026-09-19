@@ -373,7 +373,7 @@ enum RenderStates {
                 if renderSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
-        for scene in peerScenes {
+        for scene in peerSceneList {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if renderPeer(scene, appearance: appearance, into: directory) { written += 1 }
@@ -658,7 +658,38 @@ enum RenderStates {
     /// running panel would not produce from the same JSON. And the controller
     /// is ``PeerController/pinned(_:)``: no subprocess, no listener, no proxy,
     /// nothing that could reach `127.0.0.1:3456`.
-    private static var peerScenes: [(name: String, snapshot: PeersSnapshot, dry: Bool)] {
+    /// Every scene, plus the refusal banner each one draws (almost always
+    /// none).
+    private static var peerSceneList:
+        [(name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal)]
+    {
+        peerStates.map { ($0.name, $0.snapshot, $0.dry, PeerRefusal()) } + [
+            // A verb this panel ran was refused, and the tab is STILL THERE.
+            //
+            // It had no fixture, which is how the opposite shipped: a refusal
+            // used to be drawn instead of the whole tab and then wiped by the
+            // next poll about three seconds later. The message is the one a
+            // mismatched pairing produces, because that is the longest
+            // refusal on this path and the one most likely to be cut.
+            (
+                "63-peers-refused",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ])),
+                false,
+                PeerRefusal(
+                    message: "tcr peer share on failed (exit 1): peer share: refused, no Mac "
+                        + "is trusted yet, so there is nobody to share with")
+            )
+        ]
+    }
+
+    private static var peerStates: [(name: String, snapshot: PeersSnapshot, dry: Bool)] {
         [
             // 1. A fresh install: finding off, and the only state a one-Mac
             //    network ever has.
@@ -1252,13 +1283,15 @@ enum RenderStates {
     /// own frame, without `FleetView` needing a way to inject fixture peers.
     @MainActor
     private static func renderPeer(
-        _ scene: (name: String, snapshot: PeersSnapshot, dry: Bool),
+        _ scene: (name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal),
         appearance: Appearance,
         into directory: URL
     ) -> Bool {
         withDrawingAppearance(appearance.nsAppearance) {
             rasterise(
-                peersPanel(snapshot: scene.snapshot, dry: scene.dry, appearance: appearance),
+                peersPanel(
+                    snapshot: scene.snapshot, dry: scene.dry, refusal: scene.refusal,
+                    appearance: appearance),
                 named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
         }
     }
@@ -1355,7 +1388,8 @@ enum RenderStates {
     /// The Peers tab as a panel, for the scene renderers above.
     @MainActor
     private static func peersPanel(
-        snapshot: PeersSnapshot, dry: Bool, appearance: Appearance
+        snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal = PeerRefusal(),
+        appearance: Appearance
     ) -> some View {
         // Density: absent, which is `PanelDensityPreference`'s own
         // definition of the shipped default, the same write-then-remove
@@ -1393,7 +1427,7 @@ enum RenderStates {
                     },
                     content: {
                         PeersTabV4(
-                            controller: PeerController.pinned(scene.snapshot),
+                            controller: PeerController.pinned(scene.snapshot, refusal: refusal),
                             snapshotMode: true)
                     },
                     footer: { EmptyView() }
@@ -1410,7 +1444,7 @@ enum RenderStates {
     /// One control, one state, one PNG.
     ///
     /// A FOURTH scene array, and the reason is the same class as
-    /// ``peerScenes``'s: these controls live on the Settings pane, whose own
+    /// ``peerSceneList``'s: these controls live on the Settings pane, whose own
     /// harness (`RenderSettings`) hosts a real window and can draw exactly ONE
     /// fixture per pane. A control with four states needs four pictures, so
     /// each one is rasterised here on its own, in the panel harness that needs

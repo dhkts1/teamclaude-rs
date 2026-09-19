@@ -682,6 +682,73 @@ final class PeersPanelStateWiringTests: XCTestCase {
             "the retired token is declared again, so a call site can dim a whole row by name")
     }
 
+    // MARK: - A refused verb keeps the tab
+
+    /// A refusal goes and stays until one of exactly two things happens.
+    ///
+    /// The poll is the third thing that used to clear it, about three seconds
+    /// after it appeared, and it is the one this type exists to stop: a
+    /// refusal is not part of the read, so a read cannot touch it.
+    func testARefusalSurvivesEverythingButAnAnswer() {
+        var refusal = PeerRefusal()
+        XCTAssertFalse(refusal.isShowing)
+        refusal.refused("peer share: refused, no Mac is trusted yet")
+        XCTAssertEqual(refusal.message, "peer share: refused, no Mac is trusted yet")
+        refusal.refused("peer pair: refused, 418902 here, 418903 there")
+        XCTAssertEqual(
+            refusal.message, "peer pair: refused, 418902 here, 418903 there",
+            "the newest refusal does not win, so the operator reads an answer to a press they "
+                + "made two presses ago")
+        refusal.dismissed()
+        XCTAssertNil(refusal.message)
+        refusal.refused("again")
+        refusal.succeeded()
+        XCTAssertNil(refusal.message, "a verb that did what it was asked left the refusal up")
+    }
+
+    /// The tab draws the banner ABOVE itself and keeps every control.
+    func testARefusedVerbNoLongerReplacesTheTab() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let body = try slice(tab, from: "var body: some View {", to: "/// Close the Trust sheet")
+        XCTAssertTrue(
+            body.contains("if let refused = controller.refusal.message {")
+                && body.contains("refusalBanner(refused)"),
+            "a refused verb is no longer drawn as a banner above the tab")
+        let banner = try XCTUnwrap(body.range(of: "refusalBanner(refused)")).lowerBound
+        let find = try XCTUnwrap(body.range(of: "findCard")).lowerBound
+        XCTAssertTrue(banner < find, "the banner is below the controls it is an answer to")
+        XCTAssertTrue(
+            body.contains("findCard"),
+            "the tab no longer draws its own controls at all when something was refused, "
+                + "which is the blocker: the Find switch, the mesh, every row and the Share "
+                + "switch disappeared to report one failed press")
+    }
+
+    /// The refusal is not written into the snapshot the poll replaces.
+    func testTheRefusalIsNotPartOfTheRead() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let run = try slice(
+            tab, from: "private func run(arguments: [String], stdin: String?) {",
+            to: "/// Runs one verb and hands back what it PRINTED")
+        XCTAssertTrue(
+            run.contains("self.refusal.refused(message)"),
+            "a refused verb no longer lands in the refusal beside the snapshot")
+        XCTAssertFalse(
+            run.contains("PeersSnapshotBuilder.failed(message)"),
+            "a refused verb is written into the snapshot again, so the tab is replaced by one "
+                + "card and the next poll wipes the card about three seconds later")
+        XCTAssertTrue(
+            run.contains("self.refusal.succeeded()"),
+            "a verb that succeeded no longer clears the banner, so an answered refusal stays "
+                + "on screen")
+        let report = try slice(
+            tab, from: "func report(failure: String) {", to: "func dismissRefusal()")
+        XCTAssertTrue(
+            report.contains("refusal.refused(failure)"),
+            "a failure this panel produced outside a verb lands somewhere else again, so one "
+                + "message can be drawn two ways")
+    }
+
     // MARK: - Item 8: the fixtures
 
     /// The knock card, the waiting row and both ended rows have a scene.
@@ -692,13 +759,27 @@ final class PeersPanelStateWiringTests: XCTestCase {
     func testEveryNewStateHasAPanelFixture() throws {
         let harness = try source("apps/macos/Sources/TcrBar/RenderStates.swift")
         let scenes = try slice(
-            harness, from: "private static var peerScenes:", to: "/// The fixture Settings")
+            harness, from: "private static var peerSceneList:", to: "/// The fixture Settings")
         for scene in [
             "52-peers-knock", "53-peers-waiting", "54-peers-lease-ended",
             "55-peers-lease-ends-soon",
+            // A refused verb, which had none: the banner is the surface every
+            // refusal on this tab lands on.
+            "63-peers-refused",
         ] {
             XCTAssertTrue(
                 scenes.contains("\"\(scene)\""),
+                "\(scene) has no fixture, so the state it draws is unreviewable")
+        }
+        // The Trust sheet's own five states, in their own scene array. This
+        // is the surface that shipped with a control nobody could press, and
+        // the harness having no picture of it is how that passed every gate.
+        for scene in [
+            "57-trust-waiting", "58-trust-compare", "59-trust-compare-typed",
+            "60-trust-done", "61-trust-refused", "62-trust-cancelled",
+        ] {
+            XCTAssertTrue(
+                harness.contains("\"\(scene)\""),
                 "\(scene) has no fixture, so the state it draws is unreviewable")
         }
         XCTAssertTrue(
