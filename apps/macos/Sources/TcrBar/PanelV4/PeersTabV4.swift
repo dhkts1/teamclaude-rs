@@ -1420,7 +1420,11 @@ struct PeersTabV4: View {
                     case .found(let dialAddress, _):
                         PeerActionButton(
                             title: "Trust",
-                            systemImage: "checkmark",
+                            // No glyph. A checkmark is the universal "already
+                            // done", and this row's own sub-line two lines
+                            // below reads `not trusted`. The word is the
+                            // control.
+                            systemImage: nil,
                             // What the press really does, per decision row 10:
                             // it SENDS a request. The six digits are phase 2
                             // and cannot appear until somebody on that Mac
@@ -2249,7 +2253,10 @@ struct PeerTrustSheet: View {
                 ) { onCancel() }
                 if state.isLive {
                     PeerActionButton(
-                        title: "Trust", systemImage: "checkmark",
+                        // No glyph here either: this button carries the same
+                        // "already done" checkmark while it is DISABLED,
+                        // which is the state it spends most of its life in.
+                        title: "Trust", systemImage: nil,
                         help: trustHelp,
                         enabled: canTrust
                     ) { onTrust() }

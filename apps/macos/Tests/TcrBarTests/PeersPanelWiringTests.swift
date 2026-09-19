@@ -285,6 +285,20 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "sentence behind it at all")
     }
 
+    /// Neither Trust control wears a checkmark.
+    ///
+    /// A checkmark is the universal "already done". It was drawn on the found
+    /// row's button, whose own subtitle two lines below reads `not trusted`,
+    /// and on the sheet's Trust button while that button was disabled. The
+    /// word is the control.
+    func testNoTrustControlDrawsACheckmark() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertFalse(
+            tab.contains("systemImage: \"checkmark\""),
+            "a Trust control carries a checkmark again, which reads as done on a row that "
+                + "says not trusted and on a button that cannot be pressed yet")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
