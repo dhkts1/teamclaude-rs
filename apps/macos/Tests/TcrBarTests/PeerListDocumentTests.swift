@@ -284,10 +284,18 @@ final class PeerListDocumentTests: XCTestCase {
     /// A scope shape this build cannot name (a future fourth variant of
     /// `tcr_peer_wire::LendScope`, an externally tagged object with neither
     /// `group` nor `accounts`) must not throw the row, and its own lease id,
-    /// away: the row still draws under `all`, the same default an absent
-    /// `scope` key already means, rather than the whole `[PeerLendGrant]`
+    /// away: the row still draws, rather than the whole `[PeerLendGrant]`
     /// array, and every OTHER lease on the row with it, failing to decode.
-    func testAnUnrecognizedScopeShapeFallsBackToAllRatherThanLosingTheRow() throws {
+    ///
+    /// It is `.unknown`, not `.all`: this used to fall back to `all`, the
+    /// same default an absent `scope` key means, which could not tell "no
+    /// scope was written" from "a scope was written and this build could not
+    /// read it". The second case silently WIDENED a lease the operator had
+    /// narrowed to one group or account into a grant covering every account
+    /// this Mac holds. `.unknown` is honest about the difference and
+    /// `LeaseDraft.refusal` refuses to save one rather than send `--scope
+    /// all` for a scope nobody here actually read.
+    func testAnUnrecognizedScopeShapeFallsBackToUnknownRatherThanLosingTheRowOrWidening() throws {
         let document = try decode(
             """
             {"peers":[{"trusted":true,"lend":[{"id":"ls-1","scope":{"tenant":"acme"},
@@ -295,7 +303,10 @@ final class PeerListDocumentTests: XCTestCase {
             """)
         let grant = try XCTUnwrap(document.peers.first?.lend.first)
         XCTAssertEqual(grant.leaseId, "ls-1", "the row survives even though its scope did not")
-        XCTAssertEqual(grant.scope, .all)
-        XCTAssertEqual(grant.scopeLabel, "All accounts")
+        XCTAssertEqual(grant.scope, .unknown)
+        XCTAssertEqual(grant.scopeLabel, "an unknown scope")
+        XCTAssertNotEqual(
+            grant.scope, .all,
+            "a scope this build cannot parse must never read as every account")
     }
 }

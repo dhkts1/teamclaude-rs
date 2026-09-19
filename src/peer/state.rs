@@ -572,10 +572,14 @@ impl PeerState {
             .collect();
         if closed.len() > MAX_LEARNED_KEYS {
             closed.sort_by_key(|index| self.accepted[*index].opened_at_ms);
-            let doomed: std::collections::BTreeSet<usize> = closed
-                .into_iter()
-                .take(self.accepted.len().saturating_sub(MAX_LEARNED_KEYS))
-                .collect();
+            // OVER THE CLOSED ROWS, which is what the bound is counted in. It
+            // dropped `self.accepted.len() - MAX_LEARNED_KEYS`, and that length
+            // counts the OPEN windows too, so every window still open cost one
+            // extra learned key: the oldest keys went early and an operator who
+            // blocked that Mac got an address-only ban.
+            let doomed_count = closed.len().saturating_sub(MAX_LEARNED_KEYS);
+            let doomed: std::collections::BTreeSet<usize> =
+                closed.into_iter().take(doomed_count).collect();
             let mut index = 0;
             self.accepted.retain(|_| {
                 let keep = !doomed.contains(&index);

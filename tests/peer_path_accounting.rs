@@ -430,7 +430,10 @@ async fn two_carried_requests_land_on_one_path_and_the_other_stays_at_zero() {
         .expect("the target has a status row");
 
     let went = path_of(&row.paths, &target_addr.to_string());
-    let never = path_of(&row.paths, &elsewhere.id.display());
+    // A forwarded path's `endpoint` is the carrying Mac's WIRE id now, for the
+    // reason `peers_block` states: it is the key the panel resolves names by,
+    // and the display form could never be found in that map.
+    let never = path_of(&row.paths, &elsewhere.id.to_wire());
 
     assert_eq!(
         went.bytes_per_hour,

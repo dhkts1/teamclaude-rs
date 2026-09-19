@@ -111,7 +111,7 @@ const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
 const INLINE_WAIT_MAX_SECS: i64 = 15;
 /// How many times one account may be inline-retried on a transient `429` before
 /// we give up on it and rotate — bounds a pathological same-account loop.
-const MAX_SAME_ACCOUNT_429: u32 = 2;
+pub(crate) const MAX_SAME_ACCOUNT_429: u32 = 2;
 /// Hold applied to a transient 429 that carries NO retry-after / reset header
 /// (σ5, 2026-07-18 live capture: Anthropic burst 429s carry neither). Short so a
 /// cold-fan-out that trips every account recovers in seconds instead of the ~60s
@@ -121,7 +121,7 @@ const NO_GUIDANCE_HOLD_SECS: i64 = 15;
 /// Max random jitter (seconds) added to the no-guidance hold: desync the un-park
 /// of accounts that tripped together, so a synchronized wave can't re-arm a
 /// sliding-window limiter.
-const NO_GUIDANCE_JITTER_MAX_SECS: i64 = 5;
+pub(crate) const NO_GUIDANCE_JITTER_MAX_SECS: i64 = 5;
 /// Ceiling for a quota-rejection hold, mirroring `MAX_RATE_LIMIT_HOLD_SECONDS`
 /// in `manager/mod.rs` (which clamps again, so this is the value that actually
 /// binds at the call site).
@@ -258,7 +258,7 @@ fn backoff_529_secs(retried: u32, retry_after: Option<i64>) -> u64 {
 
 /// How a transient (non-quota-rejected) 429 should be handled.
 #[derive(Debug, PartialEq, Eq)]
-enum Transient429 {
+pub(crate) enum Transient429 {
     /// Wait `secs` inline on the same account, then retry it.
     InlineWait(i64),
     /// Park the account for `secs` and route THIS request elsewhere.
@@ -321,7 +321,11 @@ pub(crate) fn jittered_quota_hold(retry_after: i64, nanos: u32) -> i64 {
 }
 
 /// ignores it and stays byte-identical to the historical behavior.
-fn classify_transient_429(retry_after: Option<i64>, retried: u32, jitter: i64) -> Transient429 {
+pub(crate) fn classify_transient_429(
+    retry_after: Option<i64>,
+    retried: u32,
+    jitter: i64,
+) -> Transient429 {
     match retry_after {
         Some(secs) => {
             let wait = secs.clamp(1, 300);
@@ -381,7 +385,7 @@ const DNS_FAILURE_MARKERS: [&str; 4] = [
 /// The chain must be WALKED. `reqwest::Error`'s `Display` prints only its own top
 /// frame and never recurses (the same property that forces `?err` over `%err` at
 /// the log site below), so the resolver text lives strictly in a `source()`.
-fn is_offline_error(err: &reqwest::Error) -> bool {
+pub(crate) fn is_offline_error(err: &reqwest::Error) -> bool {
     let mut frame: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(cause) = frame {
         let rendered = cause.to_string().to_ascii_lowercase();
@@ -2714,26 +2718,32 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // `TakeTheDirectPath` before a file, a key or a socket is touched. The
         // decision, the refusal and the one fallback log line are all in
         // `peer::egress`.
-        match crate::peer::egress::pinned_egress(crate::peer::egress::PinnedAttempt {
-            manager: &manager,
-            account_idx: idx,
-            method: &method,
-            path_and_query: &path_and_query,
-            headers: build_upstream_headers(&req_headers, &token),
-            body: body_bytes.clone(),
-            peers_path: &crate::peer::egress::peers_path(),
-            session_key,
-            session_kind,
-            wire_session_id: wire_session_id.as_deref(),
-            model: request_model.clone(),
-            tool_uses: &wire_tool_uses,
-            tool_results: &wire_tool_results,
-        })
-        .await
-        {
-            crate::peer::egress::PinnedEgress::TakeTheDirectPath => {}
-            crate::peer::egress::PinnedEgress::Answered(response) => return response,
-        }
+        let already_paced =
+            match crate::peer::egress::pinned_egress(crate::peer::egress::PinnedAttempt {
+                manager: &manager,
+                account_idx: idx,
+                method: &method,
+                path_and_query: &path_and_query,
+                headers: build_upstream_headers(&req_headers, &token),
+                body: body_bytes.clone(),
+                peers_path: &crate::peer::egress::peers_path(),
+                session_key,
+                session_kind,
+                wire_session_id: wire_session_id.as_deref(),
+                model: request_model.clone(),
+                tool_uses: &wire_tool_uses,
+                tool_results: &wire_tool_results,
+            })
+            .await
+            {
+                // `paced` and not a second `throttle_send`: a pin that could not
+                // be honoured has already waited on this account's own bucket
+                // inside the exit lock, and pacing it again below made one client
+                // request spend two slots on the one account an operator had
+                // explicitly asked to shape.
+                crate::peer::egress::PinnedEgress::TakeTheDirectPath { paced } => paced,
+                crate::peer::egress::PinnedEgress::Answered(response) => return response,
+            };
         // This account's OWN client — fetched INSIDE the loop, keyed on the idx
         // this iteration is actually about to serve. Hoisting this above the
         // loop (as it used to be) reused whichever account was selected FIRST
@@ -2789,7 +2799,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // about to be hit; both the 401 force-refresh retry and the transient-429
         // retry loop back here, so every retry is paced against whichever account it
         // rotated to.
-        manager.throttle_send(&path, idx).await;
+        if !already_paced {
+            manager.throttle_send(&path, idx).await;
+        }
 
         let resp = match builder.send().await {
             Ok(resp) => resp,
@@ -2880,7 +2892,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             }
                         });
                     let peers_path = crate::peer::egress::peers_path();
-                    if let Some(carried) = crate::peer::egress::retry_through_peer(
+                    let carry = crate::peer::egress::retry_through_peer(
                         crate::peer::egress::CarriedRequest {
                             url: &url,
                             method: &method,
@@ -2889,8 +2901,21 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             peers_path: &peers_path,
                         },
                     )
-                    .await
-                    {
+                    .await;
+                    // A GATEWAY THAT TOOK THE CARRY AND FAILED IS AN ANSWER,
+                    // never a fall-through. The ladder below this arm sleeps
+                    // and retries the same account, or benches it and rotates,
+                    // and either way sends a request the splice may already
+                    // have put on the wire a second time. Nothing else on this
+                    // path can say so: `unknown_outcome_transport_failure` is
+                    // written by the direct attempt's own error arm, which a
+                    // carry never reaches, so the terminal answer was a 503
+                    // the client is built to retry. Same typed outcome as the
+                    // pinned sibling, same 502 with `x-should-retry: false`.
+                    if let crate::peer::egress::ViaCarry::TakenAndFailed(gap) = &carry {
+                        return crate::peer::egress::delivered_unknown_response(gap);
+                    }
+                    if let crate::peer::egress::ViaCarry::Carried(carried) = carry {
                         // A carried request is a served request, and it is
                         // recorded exactly like one, the counter, the
                         // wire-session table and the ring buffer, in the order
@@ -2922,7 +2947,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                 tool_results: &wire_tool_results,
                                 upstream_headers: &carried.upstream_headers,
                             },
-                        );
+                        )
+                        .await;
                         return carried.response;
                     }
                 }

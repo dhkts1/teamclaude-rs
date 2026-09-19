@@ -55,7 +55,17 @@ public enum PeerJoinLink {
     /// panel that pre-judged it would refuse links a newer `tcr` accepts. The
     /// one thing checked is that at least one key is present, because a link
     /// with neither is a no-op with a spinner on it.
-    public static func invocation(for url: URL) -> Result<PeerSecretInvocation, Refusal> {
+    ///
+    /// `replace` carries the confirmation sheet's own answer through to argv:
+    /// the CLI refuses to overwrite an existing network key without
+    /// `--replace` (`src/main.rs`'s `peer join` arm), and until this flag
+    /// existed no Swift call site ever passed it, so the destructive Join
+    /// button on a keyed Mac always ran a command built to fail. `false` by
+    /// default, so every other caller (the fingerprint check, the existing
+    /// tests) still gets the plain three-argument invocation.
+    public static func invocation(
+        for url: URL, replace: Bool = false
+    ) -> Result<PeerSecretInvocation, Refusal> {
         guard url.scheme?.lowercased() == scheme else {
             return .failure(.notOurScheme(url.scheme))
         }
@@ -72,9 +82,12 @@ public enum PeerJoinLink {
             ($0.name == "nk" || $0.name == "jk") && !($0.value ?? "").isEmpty
         }
         guard !keyed.isEmpty else { return .failure(.carriesNoKey) }
+        var arguments = ["peer", "join", "--stdin"]
+        if replace {
+            arguments.append("--replace")
+        }
         return .success(
-            PeerSecretInvocation(
-                arguments: ["peer", "join", "--stdin"], stdin: url.absoluteString))
+            PeerSecretInvocation(arguments: arguments, stdin: url.absoluteString))
     }
 
     /// What may be written to a log about a link: its shape, and which keys it
@@ -204,7 +217,12 @@ extension PeerCommand {
     ///
     /// Returns the refusal rather than an invocation when the URL is not a
     /// join link, so a caller cannot pipe an arbitrary URL into `tcr`.
-    public static func join(link: URL) -> Result<PeerSecretInvocation, PeerJoinLink.Refusal> {
-        PeerJoinLink.invocation(for: link)
+    ///
+    /// `replace` is the confirmation sheet's own answer, carried straight
+    /// through to ``PeerJoinLink/invocation(for:replace:)``.
+    public static func join(
+        link: URL, replace: Bool = false
+    ) -> Result<PeerSecretInvocation, PeerJoinLink.Refusal> {
+        PeerJoinLink.invocation(for: link, replace: replace)
     }
 }

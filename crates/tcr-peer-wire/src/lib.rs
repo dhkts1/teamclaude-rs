@@ -1274,6 +1274,23 @@ pub enum Control {
         /// When the bearer above stops working, absolute, so the borrower can
         /// stop using it without waiting for a 401.
         expires_at_ms: i64,
+        /// The owner's own utilization on the lease's window at the instant
+        /// this frame went out, raw, with no guard band applied.
+        ///
+        /// **It is the baseline a [`Self::UsageHint`] is a rise above.** The
+        /// borrower never sees the owner's window except through the rate-limit
+        /// headers on its own answers, so without a reading from before the
+        /// first of them there is no pair to subtract and the first answer on
+        /// every lease is free.
+        ///
+        /// `None` is not a figure of zero and is never sent by this build: it
+        /// is what a peer OLDER than this one leaves out, and the borrower
+        /// refuses such a handoff by the lender's name rather than storing a
+        /// bearer whose spend it could never report. An old BORROWER ignores
+        /// the field and keeps its own build's behaviour, which is why the
+        /// field is added rather than the frame replaced.
+        #[serde(default)]
+        utilization: Option<f64>,
     },
     /// What a hand-mode borrow just cost, reported by the BORROWER.
     ///

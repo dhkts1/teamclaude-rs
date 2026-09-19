@@ -1096,10 +1096,12 @@ renewed every 30 minutes on a 2-hour lifetime; turning it off, or shutting down,
 mapping instead of leaving it on the router. See [peers.md](peers.md) § "Reaching a Mac off
 your network" for the fallback path when the mapping itself is unreachable.
 
-**A running server honours both settings without a restart.** The server holds the mapping and
-asks the flag between renewals, so `off` ends the keeper and deletes through whichever protocol
-granted the mapping. This used to be read once at boot, which meant `off` ran in the CLI,
-deleted over NAT-PMP, and the server's next renewal simply created the mapping again.
+**A running server honours both settings without a restart.** It re-reads the flag about every
+five seconds, the way it re-reads `peer.find`: `off` ends the keeper and deletes through
+whichever protocol granted the mapping, and `on` starts a keeper and asks the router again. The
+flag used to be read once at boot, which meant `off` ran in the CLI, deleted over NAT-PMP, and
+the server's next renewal simply created the mapping again; `on` then reached nothing at all
+until the next restart.
 
 ### `tcr peer pending`
 

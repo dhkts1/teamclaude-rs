@@ -50,6 +50,12 @@ use crate::warmer::{AccountWarmer, LiveWarmer};
 // to reach its `pub(super) fn effective_threshold`, and a sibling module that
 // is not declared does not exist. See `peer_lend.rs`'s own doc-comment.
 mod peer_lend;
+// The one TYPE that module owns and the lease layer names: what a hand grant
+// hands over, chosen as one value so a bearer can never be paired with another
+// account's expiry or another account's baseline. The module itself stays
+// private, so this re-export is the whole of its surface beyond the methods on
+// `Manager`.
+pub use peer_lend::HandedCredential;
 mod pins;
 mod probing;
 mod refresh;

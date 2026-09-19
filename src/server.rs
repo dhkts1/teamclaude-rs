@@ -1051,17 +1051,28 @@ async fn boot_peer_listener(
     // see `reach::MappingGuard`.
     let mapping = crate::peer::reach::start_peer_mapping(peers_path, file.internet, local);
 
+    // And the switch, re-read for as long as this process serves, the way the
+    // beacon re-reads `peer.find`. `internet off` reached a running server
+    // already, through the keeper's own re-read and the CLI's own delete;
+    // `internet on` reached nothing, because the only callers of
+    // `start_peer_mapping` were boot ones. `docs/cli.md` said a running server
+    // honours both without a restart.
+    spawn_internet_keeper(peers_path, local, mapping, shutdown, background);
+
     // The beacon, announced by the process that is actually listening.
     spawn_beacon(peers_path, local.port(), shutdown, background);
 
     // The reverse carriers, for a Mac nothing can dial.
     //
-    // Asked ONCE, at boot, against the two facts `reach` measures: a router
-    // mapping this process holds, and a global IPv6 address. A Mac with either
-    // one can be dialled and asking a friend to hold a socket for it anyway
-    // would spend a third machine's bytes on a path it does not need
+    // Asked against the two facts `reach` measures: a router mapping this
+    // process holds, and a global IPv6 address. A Mac with either one can be
+    // dialled and asking a friend to hold a socket for it anyway would spend a
+    // third machine's bytes on a path it does not need
     // (`tunnel::reverse_carry_is_wanted` is that decision, and it is a pure
     // function so both answers are testable without a router).
+    //
+    // Re-asked while this process serves, because the mapping keeper above was
+    // started moments ago and its first router round trip has not landed yet.
     //
     // One keeper task per pinned friend that may carry for this node. They are
     // supervised and stopped with everything else here; each one opens a
@@ -1070,9 +1081,6 @@ async fn boot_peer_listener(
 
     let mut stop = shutdown.subscribe();
     background.push(tokio::spawn(supervise("peer-listener", async move {
-        // Held here and nowhere else: dropping this future at shutdown takes
-        // the router mapping away with it.
-        let _mapping = mapping;
         tokio::select! {
             result = listener::serve_on_with(listening, context) => {
                 if let Err(err) = result {
@@ -1218,24 +1226,67 @@ fn spawn_beacon(
     })));
 }
 
-/// Start one carrier keeper per friend, when this Mac cannot be dialled at all.
+/// Keep this process's router mapping in step with `peer.internet`.
+///
+/// Holds the keeper the boot decision started, if any, and is the only thing
+/// that holds it: dropping the handle stops the keeper, which deletes the
+/// mapping over the protocol that granted it, and this task is dropped at
+/// shutdown with everything else here.
+///
+/// The decision is [`crate::peer::reach::keeper_step`] and the loop is
+/// [`crate::peer::reach::keep_internet_mapping`]; what is here is the wiring
+/// and the one thing a test may not do, which is ask this machine's real
+/// router.
+fn spawn_internet_keeper(
+    peers_path: &std::path::Path,
+    local: SocketAddr,
+    held: Option<crate::peer::reach::MappingGuard>,
+    shutdown: &watch::Sender<bool>,
+    background: &mut Vec<JoinHandle<()>>,
+) {
+    let peers_path = peers_path.to_path_buf();
+    let mut stop = shutdown.subscribe();
+    background.push(tokio::spawn(supervise("peer-internet", async move {
+        let starting = peers_path.clone();
+        let watching = crate::peer::reach::keep_internet_mapping(
+            peers_path,
+            local,
+            crate::peer::reach::INTERNET_POLL_INTERVAL,
+            None,
+            move || crate::peer::reach::start_peer_mapping(&starting, true, local),
+            held,
+        );
+        tokio::select! {
+            _ = watching => {}
+            _ = stop.changed() => {}
+        }
+    })));
+}
+
+/// Keep one carrier keeper per friend running for as long as nothing can dial
+/// this Mac.
 ///
 /// Split out of [`boot_peer_listener`] because it is a decision and a fan-out
 /// rather than another line of wiring: the decision is
 /// [`crate::peer::tunnel::reverse_carry_is_wanted`], and the fan-out is one
 /// task per friend that `forwarders_for` says may carry for this node.
 ///
-/// # A boot-time answer, and why that is the honest scope
+/// # Why the decision is re-asked, and what it costs
 ///
-/// The mapping and the IPv6 address are read once here. A Mac that gains a
-/// mapping later keeps its keepers running, which costs a socket per friend
-/// and nothing else, and a Mac that LOSES one does not start them until it
-/// restarts. Re-asking per round would put a router probe on a loop this
-/// process runs forever, and the probe replaces the lifetime of the mapping it
-/// is asking about (`tcr peer reach`'s own `--map` is opt-in for exactly that
-/// reason). The tighter answer is the keeper reading the record
-/// `reach::record_mappings_at` already writes, which is a change to the
-/// keeper's own loop rather than to this fan-out.
+/// It was taken once, here, two statements after the mapping keeper thread was
+/// spawned: before its first NAT-PMP round trip could publish anything. So
+/// `reach::external_socket()` was `None` on every boot, and a Mac its router
+/// would map perfectly well parked `MAX_PARKED_PER_PEER` carriers at every
+/// friend it had, seconds before it became dialable. The boot test binds
+/// loopback, where no mapping is ever asked for, so nothing observed the
+/// ordering.
+///
+/// Re-asking costs no router traffic: both facts are read out of this
+/// process's own memory, the mapping from the register the keeper publishes to
+/// and the addresses from this machine's own interfaces. A probe on a loop
+/// would be the expensive answer, and it would also replace the lifetime of
+/// the mapping it was asking about (`tcr peer reach`'s own `--map` is opt-in
+/// for exactly that reason).
 fn spawn_reverse_carriers(
     peers_path: &std::path::Path,
     key: &crate::peer::id::NodeKey,
@@ -1243,30 +1294,61 @@ fn spawn_reverse_carriers(
     shutdown: &watch::Sender<bool>,
     background: &mut Vec<JoinHandle<()>>,
 ) {
-    let held = crate::peer::reach::external_socket();
-    let global_v6 = crate::peer::reach::global_v6_addresses();
-    // `external_socket` answers with the mapped socket rather than the
-    // `Mapping` the decision takes, so the presence of one is converted here
-    // and the absence of one stays an absence: a node with no mapping and no
-    // IPv6 is the whole of what `Wanted` means.
-    let mapping = held.map(|socket| crate::peer::reach::Mapping {
+    let peers_path = peers_path.to_path_buf();
+    let node = key.id();
+    let context = context.clone();
+    let mut stop = shutdown.subscribe();
+    background.push(tokio::spawn(supervise("peer-reverse", async move {
+        let watching = crate::peer::tunnel::watch_reverse_need(
+            crate::peer::tunnel::REVERSE_RECHECK_INTERVAL,
+            None,
+            reverse_need_now,
+            || park_reverse_carriers(&peers_path, &node, &context),
+            |carriers: watch::Sender<bool>| {
+                // Every keeper for this fan-out selects on this channel, so
+                // one send ends all of them; a receiver that has already gone
+                // is not an error to report.
+                carriers.send_replace(true);
+            },
+            None,
+        );
+        tokio::select! {
+            _ = watching => {}
+            _ = stop.changed() => {}
+        }
+    })));
+}
+
+/// Whether this Mac needs a friend to hold a carrier for it, right now.
+///
+/// `external_socket` answers with the mapped socket rather than the `Mapping`
+/// the decision takes, so the presence of one is converted here and the
+/// absence of one stays an absence: a node with no mapping and no IPv6 is the
+/// whole of what `Wanted` means.
+fn reverse_need_now() -> crate::peer::tunnel::ReverseNeed {
+    let mapping = crate::peer::reach::external_socket().map(|socket| crate::peer::reach::Mapping {
         protocol: crate::peer::reach::MapProtocol::Tcp,
         internal_port: socket.port(),
         external_port: socket.port(),
         lifetime_secs: 0,
         epoch_secs: 0,
     });
-    match crate::peer::tunnel::reverse_carry_is_wanted(mapping.as_ref(), &global_v6) {
-        crate::peer::tunnel::ReverseNeed::NotWanted(why) => {
-            tracing::debug!(
-                reason = ?why,
-                "peer reverse: this Mac can be dialled, so no friend is asked to hold a carrier"
-            );
-            return;
-        }
-        crate::peer::tunnel::ReverseNeed::Wanted => {}
-    }
+    crate::peer::tunnel::reverse_carry_is_wanted(
+        mapping.as_ref(),
+        &crate::peer::reach::global_v6_addresses(),
+    )
+}
 
+/// Ask every friend that may carry for this node to hold a carrier, and hand
+/// back the channel that stops them again.
+///
+/// [`None`] when there is nobody to ask, which is not a failure: a Mac nothing
+/// can dial and nobody may carry for can still borrow, and the line says so.
+fn park_reverse_carriers(
+    peers_path: &std::path::Path,
+    node: &tcr_peer_wire::PeerId,
+    context: &crate::peer::listener::SessionContext,
+) -> Option<watch::Sender<bool>> {
     let store = match crate::peer::config::PeerStore::open(peers_path) {
         Ok(store) => store,
         Err(err) => {
@@ -1274,53 +1356,58 @@ fn spawn_reverse_carriers(
                 error = %err,
                 "peer reverse: the peers file did not read, so no friend is asked to carry"
             );
-            return;
+            return None;
         }
     };
-    let friends = crate::peer::tunnel::reverse_carriers(&store, &key.id());
+    let friends = crate::peer::tunnel::reverse_carriers(&store, node);
+    // A handle either way, including for the Mac with nobody to ask: the
+    // supervisor reads its absence as "ask again at the next wake", and
+    // saying this line every five seconds for as long as the operator has
+    // pinned nobody is not news.
+    let (release, _) = watch::channel(false);
     if friends.is_empty() {
         tracing::info!(
             "peer reverse: nothing can dial this Mac and no pinned Mac may carry for it, so a \
              borrow from here is all it can do (`tcr peer allow <peer> carry` on a friend)"
         );
-        return;
+        return Some(release);
     }
     tracing::info!(
         friends = friends.len(),
         "peer reverse: nothing can dial this Mac, so it is asking friends to hold a carrier"
     );
-    // `MAX_PARKED_PER_PEER` keepers per friend, not one, because that constant
-    // IS the concurrency an undialable Mac gets on a friend's desk and its own
-    // doc says so: one parked carrier serves exactly one forward and is then
-    // gone, so a single keeper gives this Mac a pool of one and the second of
-    // two streams a borrow needs (the lease ask, then the SERVE) arrives to an
-    // empty desk. The desk refuses anything past the cap, which is what keeps
-    // this number a ceiling rather than a race: a keeper whose park is refused
-    // waits `retry` and tries again.
     for friend in friends {
+        // `MAX_PARKED_PER_PEER` keepers per friend, not one, because that
+        // constant IS the concurrency an undialable Mac gets on a friend's
+        // desk and its own doc says so: one parked carrier serves exactly one
+        // forward and is then gone, so a single keeper gives this Mac a pool
+        // of one and the second of two streams a borrow needs (the lease ask,
+        // then the SERVE) arrives to an empty desk. The desk refuses anything
+        // past the cap, which is what keeps this number a ceiling rather than
+        // a race: a keeper whose park is refused waits `retry` and tries
+        // again.
         for _ in 0..crate::peer::tunnel::MAX_PARKED_PER_PEER {
             let friend = friend.clone();
             let context = context.clone();
-            let mut stop = shutdown.subscribe();
-            background.push(tokio::spawn(supervise("peer-reverse", async move {
-            let keeper = crate::peer::tunnel::keep_reverse_carrier(
-                friend,
-                crate::peer::probe::PROBE_INTERVAL,
-                None,
-                |friend: crate::peer::config::PeerRow| {
-                    let context = context.clone();
-                    async move {
-                        crate::peer::listener::park_one_carrier(&friend, &context).await
-                    }
-                },
-            );
-            tokio::select! {
-                _ = keeper => {}
-                _ = stop.changed() => {}
-            }
-        })));
+            let mut stop = release.subscribe();
+            tokio::spawn(supervise("peer-reverse-carrier", async move {
+                let keeper = crate::peer::tunnel::keep_reverse_carrier(
+                    friend,
+                    crate::peer::probe::PROBE_INTERVAL,
+                    None,
+                    |friend: crate::peer::config::PeerRow| {
+                        let context = context.clone();
+                        async move { crate::peer::listener::park_one_carrier(&friend, &context).await }
+                    },
+                );
+                tokio::select! {
+                    _ = keeper => {}
+                    _ = stop.changed() => {}
+                }
+            }));
         }
     }
+    Some(release)
 }
 
 /// Write this fleet's lendable headroom, per window, into the lender's ledger.

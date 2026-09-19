@@ -106,6 +106,30 @@ final class PeerJoinLinkTests: XCTestCase {
             "tcr://peer/join with no key")
     }
 
+    /// **`replace: true` puts `--replace` on argv, and its absence never
+    /// does.**
+    ///
+    /// The confirmation sheet's destructive Join used to call
+    /// ``PeerController/join(link:)`` with no way to say so, so on a Mac
+    /// that already had a network key the command ALWAYS ran without
+    /// `--replace`, the one flag `tcr peer join` requires to take that
+    /// overwrite, and always failed, silently, past a sheet that had just
+    /// told the operator pressing Join would replace it.
+    ///
+    /// Watched red: this is `testTheWholeLinkIsWhatGoesOnStdin` with
+    /// `replace: true` added; drop the `if replace { arguments.append(...) }`
+    /// in `invocation(for:replace:)` and this fails.
+    func testReplaceTrueAppendsTheFlagAndFalseNever() throws {
+        let link = try url("tcr://peer/join?v=1&nk=AAAABBBBCCCCDDDD")
+        let replacing = try XCTUnwrap(
+            try? PeerJoinLink.invocation(for: link, replace: true).get())
+        XCTAssertEqual(replacing.arguments, ["peer", "join", "--stdin", "--replace"])
+
+        let notReplacing = try XCTUnwrap(try? PeerJoinLink.invocation(for: link).get())
+        XCTAssertEqual(notReplacing.arguments, ["peer", "join", "--stdin"])
+        XCTAssertFalse(notReplacing.arguments.contains("--replace"))
+    }
+
     /// `PeerCommand.join(link:)` is the app's entry point and answers the same
     /// way, so no caller can pipe an arbitrary URL into `tcr`.
     func testTheCommandFactoryRefusesAnArbitraryUrl() throws {

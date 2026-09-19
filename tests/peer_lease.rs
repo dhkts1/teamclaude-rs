@@ -937,7 +937,10 @@ fn a_frame_is_refused_for_a_forbidden_path_and_an_oversized_body() {
         serve::serve_request_from(&credential_path, &HeaderMap::new(), LEASE, REQUEST).is_err()
     );
 
-    let huge = Ask {
+    // A body over ONE FRAME is carried now, in as many frames as it takes: a
+    // request that size is the routine shape of a long conversation, and
+    // refusing it declined exactly the traffic this mesh exists for.
+    let over_one_frame = Ask {
         path: "/v1/messages",
         model: None,
         group: None,
@@ -947,12 +950,32 @@ fn a_frame_is_refused_for_a_forbidden_path_and_an_oversized_body() {
         method: "POST",
         headers: HeaderMap::new(),
     };
+    let built = serve::serve_request_from(&over_one_frame, &HeaderMap::new(), LEASE, REQUEST)
+        .expect("a body over one frame is chunked, not refused");
+    assert_eq!(built.body_bytes, serve::MAX_BODY_BYTES + 1);
+    assert_eq!(
+        built.flow,
+        serve::SERVE_FLOW,
+        "a frame this build writes says which flow it is going to use"
+    );
+
+    // What is still refused is a body over what the whole stream carries.
+    let huge = Ask {
+        path: "/v1/messages",
+        model: None,
+        group: None,
+        affinity: None,
+        tried_local: 1,
+        body: Bytes::from(vec![b'x'; serve::MAX_RELAYED_BODY_BYTES + 1]),
+        method: "POST",
+        headers: HeaderMap::new(),
+    };
     let refused = serve::serve_request_from(&huge, &HeaderMap::new(), LEASE, REQUEST)
-        .expect_err("a body over one frame is refused");
+        .expect_err("a body over the whole relay's ceiling is refused");
     assert!(
         refused
             .to_string()
-            .contains(&serve::MAX_BODY_BYTES.to_string()),
+            .contains(&serve::MAX_RELAYED_BODY_BYTES.to_string()),
         "the refusal names the ceiling it hit: {refused}"
     );
 }
@@ -2216,6 +2239,67 @@ mod mesh {
         addr
     }
 
+    /// A lender that reads a borrow and answers nothing at all.
+    ///
+    /// The shape of EVERY lender-side refusal that happens before an upstream
+    /// is reached: the header gate (`listener.rs`, `inspect` turned off while a
+    /// borrower still holds a lease), and each `bail!` in
+    /// `serve::handle_serve_on` (a wire version, a path, a method or a request
+    /// id this build will not serve). All of them close the stream with no
+    /// frame written back.
+    ///
+    /// It reads the frames a lender reads and then goes silent, rather than
+    /// closing the socket, because a close is a RACE on loopback: the
+    /// borrower's own write can fail with the connection already gone, which
+    /// hides the defect behind the kernel's timing. A lender that simply never
+    /// answers is the same fact to the borrower and it is the same every run.
+    pub async fn spawn_lender_that_takes_nothing(
+        key_dir: PathBuf,
+        peers_path: PathBuf,
+    ) -> SocketAddr {
+        let listening = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the silent lender");
+        let addr = listening.local_addr().expect("silent lender addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listening.accept().await else {
+                    return;
+                };
+                let key_dir = key_dir.clone();
+                let peers_path = peers_path.clone();
+                tokio::spawn(async move {
+                    let key = NodeKey::load_or_mint(&key_dir).expect("the lender's node key");
+                    let store = PeerStore::open(&peers_path).expect("the lender's peers file");
+                    let rows = store.peers();
+                    let Ok(mut session) = noise::accept_handshake(
+                        &mut stream,
+                        key.secret_bytes(),
+                        noise::Handshake::Return,
+                        &[],
+                        move |remote| noise::pin_check_rows(remote, &rows),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    let Ok(header) =
+                        serve::recv_control::<_, StreamHeader>(&mut stream, &mut session).await
+                    else {
+                        return;
+                    };
+                    assert_eq!(header.kind, StreamKind::Serve);
+                    // The request frame, read exactly as a lender reads it, and
+                    // then nothing: no ack, no reply, and the stream held open
+                    // so the borrower's own deadline is what ends this.
+                    let _ = noise::recv_encrypted(&mut stream, &mut session.transport).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+        addr
+    }
+
     /// Every DECRYPTED request frame the lender read, in order.
     pub type CapturedFrames = Arc<Mutex<Vec<Vec<u8>>>>;
 
@@ -2313,9 +2397,18 @@ mod mesh {
                         .push(frame.clone());
                     let request: serve::ServeRequest =
                         serde_json::from_slice(&frame).expect("the request frame parses");
+                    // The ack, where a lender writes it: the borrower holds its
+                    // body until this frame arrives.
+                    serve::send_control(&mut stream, &mut session, &serve::ServeAck::Accepted)
+                        .await
+                        .expect("the ack frame");
                     let _body = noise::recv_encrypted(&mut stream, &mut session.transport)
                         .await
                         .expect("the body frame");
+                    let end = noise::recv_encrypted(&mut stream, &mut session.transport)
+                        .await
+                        .expect("the body terminator");
+                    assert!(end.is_empty(), "a body ends with an empty frame");
                     assert_eq!(request.body_bytes, 2, "the fixture ask carries `{{}}`");
 
                     let reply = serve::ServeReply::Served {
@@ -2329,6 +2422,9 @@ mod mesh {
                     noise::send_encrypted(&mut stream, &mut session.transport, fleet::CANNED)
                         .await
                         .expect("the reply body");
+                    noise::send_encrypted(&mut stream, &mut session.transport, b"")
+                        .await
+                        .expect("the reply body terminator");
                 });
             }
         });
@@ -2439,9 +2535,20 @@ mod mesh {
                                 .expect("the request frame");
                             let _request: serve::ServeRequest =
                                 serde_json::from_slice(&frame).expect("the request frame parses");
+                            serve::send_control(
+                                &mut stream,
+                                &mut session,
+                                &serve::ServeAck::Accepted,
+                            )
+                            .await
+                            .expect("the ack frame");
                             let _body = noise::recv_encrypted(&mut stream, &mut session.transport)
                                 .await
                                 .expect("the body frame");
+                            let end = noise::recv_encrypted(&mut stream, &mut session.transport)
+                                .await
+                                .expect("the body terminator");
+                            assert!(end.is_empty(), "a body ends with an empty frame");
                             let reply = serve::ServeReply::Served {
                                 status: 200,
                                 headers: vec![(
@@ -2460,6 +2567,9 @@ mod mesh {
                             )
                             .await
                             .expect("the reply body");
+                            noise::send_encrypted(&mut stream, &mut session.transport, b"")
+                                .await
+                                .expect("the reply body terminator");
                         }
                         other => panic!("this lender takes no {other:?} stream"),
                     }
@@ -3098,6 +3208,7 @@ async fn a_lender_forwards_only_the_allowlisted_headers() {
             headers: hostile,
             body_bytes: 2,
             proto: tcr_peer_wire::PROTO_VERSION,
+            flow: serve::SERVE_FLOW,
         },
     )
     .await;
@@ -3207,6 +3318,7 @@ async fn a_non_post_relayed_request_is_refused() {
             headers: Vec::new(),
             body_bytes: 2,
             proto: tcr_peer_wire::PROTO_VERSION,
+            flow: serve::SERVE_FLOW,
         },
     )
     .await;
@@ -3494,26 +3606,27 @@ fn a_utilization_rise_is_the_largest_single_accounts_and_never_a_credit() {
     );
 }
 
-/// **An answer too large to carry is still an answer, and it is still
-/// charged.**
+/// **An answer larger than one frame is CARRIED, and it is charged.**
 ///
-/// The review's finding at `serve.rs`: `serve_on_own_account` returned `Err`
-/// for a reply over `MAX_BODY_BYTES` (65 519 bytes, which any long completion
-/// is), and that `Err` reached `handle_serve_on`'s `if served.is_ok()`, which
-/// debited 0.0. The lender's own account had already paid for the request. The
-/// stream then died with no reply frame, so the borrower saw nothing, timed
-/// out, and asked another lender to run the same request: the lender paid
-/// unmetered and the fleet paid twice.
+/// This test used to assert the opposite, and the re-review named that as the
+/// defect: the fix before this one made an over-cap answer a readable 502
+/// instead of a dead stream, but it left `MAX_BODY_BYTES` (65 519 bytes) as the
+/// ceiling on a whole answer. Claude Code always streams, so every borrowed
+/// answer of any length was bought on the lender's account, debited, and handed
+/// back to the borrower as an error with no content.
 ///
-/// Both halves are measured here. The borrower gets a 502 it can read rather
-/// than a dead stream, and the lease is charged the rise the lender measured
-/// (0.07, from the scripted reader) rather than nothing.
+/// A body travels as a run of frames terminated by an empty one now, so the
+/// size of an answer is no longer a thing the borrower can be refused over.
+/// Both halves are measured: the client gets the WHOLE body, byte for byte, and
+/// the lease is charged the rise the lender measured (0.07, from the scripted
+/// reader).
 ///
-/// Watch it fail by restoring the `bail!` in `serve_on_own_account`'s
-/// over-cap branch: `open_serve` answers `Err`, the first assertion names it,
-/// and `spent` is 0.0.
+/// Watch it fail by restoring the one-frame refusal in `serve_on_own_account`
+/// (`if body.len() > MAX_BODY_BYTES { return Ok(undeliverable_answer(..)) }`):
+/// the status is 502 and the body is the refusal's own JSON rather than the
+/// answer's bytes.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_answer_too_large_to_carry_is_answered_and_charged() {
+async fn an_answer_larger_than_one_frame_is_carried_and_charged() {
     // One byte over what a frame carries: the smallest reply that reaches the
     // branch, so the test cannot pass because the body was enormous.
     let (upstream, hits) = fleet::spawn_huge_upstream(serve::MAX_BODY_BYTES + 1).await;
@@ -3583,13 +3696,25 @@ async fn an_answer_too_large_to_carry_is_answered_and_charged() {
     let ask = ask_for("/v1/messages");
     let answer = serve::open_serve(&lender_id, &lease, &ask, &client_headers(), &store)
         .await
-        .expect("a reply too large to carry must not kill the SERVE stream")
+        .expect("a reply over one frame must not kill the SERVE stream")
         .served()
         .expect("the borrower is answered rather than left to re-ask elsewhere");
     assert_eq!(
         answer.status().as_u16(),
-        502,
-        "the borrower is told its request was served and the answer cannot be carried"
+        200,
+        "an answer over one frame is carried to the client, not refused back to it"
+    );
+    let carried = axum::body::to_bytes(answer.into_body(), 64 * 1024 * 1024)
+        .await
+        .expect("the carried answer's body reads");
+    assert_eq!(
+        carried.len(),
+        serve::MAX_BODY_BYTES + 1,
+        "every byte of the answer arrives, across as many frames as it took"
+    );
+    assert!(
+        carried.iter().all(|byte| *byte == b'x'),
+        "the body is the origin's own bytes and not a refusal's JSON"
     );
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -3718,9 +3843,23 @@ async fn hostile_serve(
     serve::send_control(&mut stream, &mut session, &request)
         .await
         .expect("the frame is written");
+    // THE ACK, read exactly where a borrower reads it. A refusal here is a
+    // refusal before the body, so it is reported in the same word the caller
+    // already reads; a lender that closed the stream instead answers `Err`,
+    // which is what every `bail!` in `handle_serve_on` does.
+    let ack: serve::ServeAck = serve::recv_control(&mut stream, &mut session).await?;
+    if let serve::ServeAck::Refused { refusal } = ack {
+        return Ok(serve::ServeReply::Refused { refusal });
+    }
+
+    // The body, and then the empty frame that ends it: a body is a run of
+    // frames now, and a lender waits for the terminator before it serves.
     teamclaude_rs::peer::noise::send_encrypted(&mut stream, &mut session.transport, b"{}")
         .await
         .expect("the body is written");
+    teamclaude_rs::peer::noise::send_encrypted(&mut stream, &mut session.transport, b"")
+        .await
+        .expect("the body terminator is written");
 
     serve::recv_control(&mut stream, &mut session).await
 }
@@ -3902,6 +4041,7 @@ async fn a_lender_refuses_a_local_control_path_in_a_frame() {
             headers: Vec::new(),
             body_bytes: 2,
             proto: tcr_peer_wire::PROTO_VERSION,
+            flow: serve::SERVE_FLOW,
         },
     )
     .await;
@@ -3915,6 +4055,170 @@ async fn a_lender_refuses_a_local_control_path_in_a_frame() {
         0,
         "nothing was served: a relayed request for this Mac's own control route \
          never reaches its proxy"
+    );
+}
+
+/// **A borrower speaking the older SERVE flow is refused BY NAME, and nothing
+/// is served on its behalf.**
+///
+/// The ack is a change to the ORDER of frames on this stream: flow 1 wrote the
+/// body straight after the request frame and waited for a reply, flow 2 waits
+/// to be acknowledged first. Serving a flow-1 borrower on this build would mean
+/// reading a body nobody acknowledged and leaving that borrower to report every
+/// outcome as "may have been billed", which is the defect the ack exists to
+/// fix, so the lender refuses rather than guesses.
+///
+/// The missing field reads 0 through `#[serde(default)]`, so a frame from a
+/// build written before the field existed lands in the same refusal rather than
+/// failing to parse.
+///
+/// Watch it fail by deleting the `request.flow != SERVE_FLOW` arm in
+/// `handle_serve_on`: the lender acks, serves the request on its own account,
+/// and the upstream's hit count goes to 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_borrower_on_the_older_serve_flow_is_refused_and_nothing_is_served() {
+    let (upstream, hits, _served) = fleet::spawn_upstream().await;
+    let lender_proxy =
+        fleet::spawn_proxy(fleet::lending_manager(&upstream, Default::default())).await;
+
+    let pair = hostile_pair();
+    let peer_addr = mesh::spawn_lender(
+        pair.key_dir.clone(),
+        pair.peers_path.clone(),
+        pair.ledger.clone(),
+        lender_proxy,
+        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        fleet::dry_manager(),
+    )
+    .await;
+
+    // Flow 1: the order this stream had before the ack. `0` is the same case,
+    // it is what a frame with no `flow` field at all parses to.
+    for flow in [0, 1] {
+        let answered = hostile_serve(
+            peer_addr,
+            &pair.lender_key,
+            &pair.borrower_key,
+            serve::ServeRequest {
+                lease_id: LEASE,
+                request_id: u128::from(flow) + 1,
+                method: "POST".to_string(),
+                path: "/v1/messages".to_string(),
+                headers: Vec::new(),
+                body_bytes: 2,
+                proto: tcr_peer_wire::PROTO_VERSION,
+                flow,
+            },
+        )
+        .await;
+        assert!(
+            answered.is_err(),
+            "a borrower on SERVE flow {flow} is refused, not served on a guess about \
+             which frame comes next"
+        );
+    }
+
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing reached the lender's own account: a flow this build does not speak is \
+         refused before anything is sent upstream"
+    );
+}
+
+/// **An answer that cannot be carried back says `x-should-retry: false`.**
+///
+/// The review's finding: `undeliverable_answer` is the one answer this build is
+/// CERTAIN already ran on the lender's account and was debited, and it was the
+/// one answer with no `x-should-retry` on it. Its siblings both set it
+/// (`lease.rs`'s `delivered_unknown_response`, `egress.rs`'s of the same name)
+/// and `src/proxy.rs` makes it the house rule for an answer that means "do not
+/// send this again". Without it the SDK behind the borrower retries a request
+/// that has already been paid for.
+///
+/// The branch is reached the way production reaches it: the lender's own
+/// upstream answers a `content-length` it does not deliver and closes, so
+/// reading the body fails AFTER the account has served the request. The
+/// `upstream` here is that server directly rather than the lender's proxy,
+/// because a proxy in between would answer its own error and the read would
+/// succeed.
+///
+/// Watch it fail by removing the header pair from `undeliverable_answer`: the
+/// status is still 502 and the assertion on the header goes red.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_cannot_be_carried_back_is_never_retryable() {
+    // An upstream that promises 4 096 bytes, sends 8, and closes.
+    let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the truncating upstream");
+    let truncating = listening
+        .local_addr()
+        .expect("the truncating upstream's addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listening.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut scratch = vec![0_u8; 8192];
+                let _ = stream.read(&mut scratch).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 4096\r\n\r\ntruncate",
+                    )
+                    .await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    let pair = hostile_pair();
+    let peer_addr = mesh::spawn_lender(
+        pair.key_dir.clone(),
+        pair.peers_path.clone(),
+        pair.ledger.clone(),
+        format!("http://{truncating}"),
+        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        fleet::dry_manager(),
+    )
+    .await;
+
+    let answered = hostile_serve(
+        peer_addr,
+        &pair.lender_key,
+        &pair.borrower_key,
+        serve::ServeRequest {
+            lease_id: LEASE,
+            request_id: 1,
+            method: "POST".to_string(),
+            path: "/v1/messages".to_string(),
+            headers: Vec::new(),
+            body_bytes: 2,
+            proto: tcr_peer_wire::PROTO_VERSION,
+            flow: serve::SERVE_FLOW,
+        },
+    )
+    .await
+    .expect("an answer that cannot be read is still an answer, never a dead stream");
+
+    let serve::ServeReply::Served {
+        status, headers, ..
+    } = answered
+    else {
+        panic!("the lender answers `Served` with its own 502, not a refusal");
+    };
+    assert_eq!(
+        status, 502,
+        "the request ran and its answer cannot be carried"
+    );
+    let retry = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-should-retry"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        retry,
+        Some("false"),
+        "this request was served and debited on the lender's account; a client that \
+         retries it pays for it twice"
     );
 }
 
@@ -6292,6 +6596,264 @@ async fn a_borrow_that_was_delivered_is_never_offered_to_another_lender() {
     drop(homes);
 }
 
+/// **A hand-mode failure that never reached an upstream is not a delivery.**
+///
+/// The review's finding at `lease.rs`: the hand arm of `try_serve` mapped EVERY
+/// `Err` from `serve_on_handed_bearer` to the no-retry 502, including a connect
+/// or resolver failure where no byte left this Mac. `reqwest` reports "the
+/// socket never opened" and "the reply never arrived" as one type, so a lease
+/// whose upstream this Mac could not even reach ended the ladder and told the
+/// client its request may already have been paid for.
+///
+/// What the arm now asks is this predicate, and it is the same pair of
+/// questions `src/proxy.rs` asks on the direct path (`is_connect`, plus the
+/// resolver check). It is measured against REAL `reqwest` errors carrying the
+/// production context string, on both sides of the answer: the connect failure
+/// that must fall through to the next lender, and the timeout that must not. A
+/// test that measured only the first would pass against a predicate answering
+/// "nothing left this Mac" for everything, which is the expensive direction to
+/// be wrong in.
+///
+/// Watch it fail by dropping `cause.is_connect()` from the predicate: a refused
+/// connect is then read as a request that may already have run, which is the
+/// behaviour this replaces. Wrapping is NOT where the risk turned out to be:
+/// `anyhow`'s own `downcast_ref` already walks the chain, measured by mutating
+/// the walk back to a bare `downcast_ref` and watching this test stay green.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_failure_is_not_a_delivery_and_a_timeout_is() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_millis(150))
+        .build()
+        .expect("a client");
+
+    // A port bound and immediately dropped: nothing listens, so the connect is
+    // refused rather than hanging.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port to learn its number");
+    let dead = closed.local_addr().expect("the dead address");
+    drop(closed);
+
+    let refused = client
+        .post(format!("http://{dead}/v1/messages"))
+        .send()
+        .await
+        .expect_err("nothing listens there");
+    assert!(refused.is_connect(), "the fixture is a connect failure");
+    let wrapped = anyhow::Error::new(refused)
+        // The production context, verbatim from `serve_on_handed_bearer`.
+        .context("peer hand: the request on the handed bearer did not reach upstream");
+    assert!(
+        lease::nothing_left_this_mac(&wrapped),
+        "a connect failure under a context string is still a connect failure, and the \
+         next lender may be asked"
+    );
+
+    // THE OTHER SIDE, and the one that costs money if it is wrong. A request
+    // that went out and whose answer never came back may have run upstream.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the silent upstream");
+    let silent_addr = silent.local_addr().expect("the silent address");
+    let held = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((conn, _)) = silent.accept().await {
+            open.push(conn);
+        }
+    });
+    let timed_out = client
+        .post(format!("http://{silent_addr}/v1/messages"))
+        .send()
+        .await
+        .expect_err("a server that never answers");
+    held.abort();
+    assert!(
+        !timed_out.is_connect(),
+        "the fixture connected before it timed out"
+    );
+    let wrapped = anyhow::Error::new(timed_out)
+        .context("peer hand: the request on the handed bearer did not reach upstream");
+    assert!(
+        !lease::nothing_left_this_mac(&wrapped),
+        "a request that connected and then got no answer may have run on the owner's \
+         account, so it is never offered to another lender"
+    );
+
+    // And something that is not a transport error at all is never read as one.
+    assert!(
+        !lease::nothing_left_this_mac(&anyhow::anyhow!("peer hand: a frame did not parse")),
+        "only a transport failure can prove nothing left this Mac"
+    );
+}
+
+/// **A lender that answers nothing has taken nothing, and the ladder goes
+/// on.**
+///
+/// The review's finding: the borrower set `delivered` on the line that wrote
+/// the body, so every lender-side refusal that happens BEFORE an upstream is
+/// reached, the header gate with `inspect` turned off, and each `bail!` in
+/// `handle_serve_on`, produced a no-retry 502 claiming the request may have
+/// been billed, and skipped every remaining lender for the rest of the ask's
+/// TTL. Nothing had been sent anywhere.
+///
+/// The fix is one frame: [`serve::ServeAck`]. The lender acknowledges taking
+/// the request once its gates have passed and before it sends upstream, and the
+/// borrower writes the body only after that ack. No ack is "not this lender".
+///
+/// The lender here reads the stream header and the request frame and then
+/// answers nothing, which is what every one of those refusals looks like from
+/// the borrower's end.
+///
+/// Watch it fail on the pre-ack build: the body is written before anything is
+/// read back, so the answer is `DeliveredUnknown`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lender_that_never_acknowledges_has_taken_nothing() {
+    let lender_home = tempfile::tempdir().expect("the lender's temp home");
+    let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
+    let lender_peers = lender_home.path().join("tcr-peers.json");
+    let borrower_peers = borrower_home.path().join("tcr-peers.json");
+    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+        .expect("the lender's key")
+        .id();
+    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+        .expect("the borrower's key")
+        .id();
+
+    write_peers(
+        &lender_peers,
+        vec![lender_row_for(
+            borrower_id,
+            vec![LendGrant::new(Window::SevenDay, 0.50, 300, 5)],
+        )],
+    );
+    let addr =
+        mesh::spawn_lender_that_takes_nothing(lender_home.path().to_path_buf(), lender_peers).await;
+    write_peers(
+        &borrower_peers,
+        vec![borrower_row_for(lender_id, true, vec![addr.to_string()])],
+    );
+    let store = PeerStore::open(&borrower_peers).expect("the borrower's peers file");
+
+    let lease = lease_with(LEASE, 0.20, 0.0);
+    let ask = ask_for("/v1/messages");
+    let answer = serve::open_serve_within(
+        &lender_id,
+        &lease,
+        &ask,
+        &client_headers(),
+        &store,
+        std::time::Duration::from_millis(400),
+    )
+    .await;
+
+    assert!(
+        matches!(answer, Ok(serve::Borrowed::NotThisLender)),
+        "a lender that never acknowledged has nothing of this request, so the next lender \
+         may be asked and the client must not be told its request may have been billed"
+    );
+}
+
+/// **A lender that refuses at its own gate is "not this lender", and the next
+/// one serves.**
+///
+/// The review's finding: every refusal on the lender's half happens after the
+/// borrower has already written the body, and the borrower set `delivered` on
+/// that write. So a Mac that had turned `inspect` off, while the borrower still
+/// held a live lease from it, answered nothing at all: the stream closed, the
+/// borrower read `DeliveredUnknown` and told its client the request may have
+/// been billed, with every remaining lender skipped.
+///
+/// The fix is one frame. The lender acknowledges TAKING the request once its
+/// header and lease gates have passed and before it sends anything upstream,
+/// and the borrower writes the body only after that ack. A close with no ack is
+/// a lender that took nothing.
+///
+/// Two lenders in file order in front of one origin. The first has `inspect`
+/// off, so its stream gate refuses; the second serves. The instrument is the
+/// origin's own arrival count plus the status the client is handed.
+///
+/// Watch it fail on the pre-ack build: the answer is a 502 from the first
+/// lender's silent close and the origin sees no arrival at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lender_that_refuses_at_its_gate_is_not_this_lender_and_the_next_serves() {
+    let (upstream, arrivals, _served) = fleet::spawn_upstream().await;
+    let lender_proxy =
+        fleet::spawn_proxy(fleet::lending_manager(&upstream, Default::default())).await;
+
+    let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
+    let borrower_peers = borrower_home.path().join("tcr-peers.json");
+    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+        .expect("the borrower's key")
+        .id();
+
+    // Two lenders, asked in the order they are written: the first one grants a
+    // lease and refuses the SERVE stream, the second one serves.
+    let mut rows = Vec::new();
+    let mut homes = Vec::new();
+    for inspect in [false, true] {
+        let home = tempfile::tempdir().expect("a lender's temp home");
+        let peers = home.path().join("tcr-peers.json");
+        let id = teamclaude_rs::peer::id::NodeKey::load_or_mint(home.path())
+            .expect("the lender's key")
+            .id();
+        let mut row = lender_row_for(
+            borrower_id,
+            vec![LendGrant::new(Window::SevenDay, 0.20, 300, 2)],
+        );
+        // THE GATE THIS TEST IS ABOUT. `inspect` off is a lender that will hand
+        // out a lease over CONTROL and refuse the SERVE stream that spends it,
+        // which is exactly the shape an operator creates by turning disclosure
+        // off while a borrower holds a cached lease.
+        row.allow.inspect = inspect;
+        write_peers(&peers, vec![row]);
+        let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::new()));
+        {
+            let mut held = ledger.lock().expect("ledger lock");
+            held.note_owner_headroom(Window::SevenDay, 0.30);
+        }
+        let addr = mesh::spawn_lender(
+            home.path().to_path_buf(),
+            peers,
+            ledger,
+            lender_proxy.clone(),
+            std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+            fleet::dry_manager(),
+        )
+        .await;
+        rows.push(borrower_row_for(id, true, vec![addr.to_string()]));
+        homes.push(home);
+    }
+
+    let file = teamclaude_rs::peer::config::PeerFile {
+        peers: rows,
+        borrow_timeout_ms: 3_000,
+        ..teamclaude_rs::peer::config::PeerFile::default()
+    };
+    teamclaude_rs::peer::config::save(&borrower_peers, &file)
+        .expect("the borrower's peers file writes");
+
+    let provider = PeerLeaseProvider::new(borrower_peers.clone());
+    let ask = ask_for("/v1/messages");
+    let answer = provider
+        .try_serve(&ask)
+        .await
+        .expect("a refusal on the first lender must not end the ladder");
+    assert_eq!(
+        answer.status().as_u16(),
+        200,
+        "a lender that took nothing is not this lender, so the next one serves the client"
+    );
+    assert_eq!(
+        arrivals.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one origin arrival: the refusing lender sent nothing and the serving \
+         lender sent it once"
+    );
+
+    drop(homes);
+}
+
 /// **`borrowTimeoutMs` on the peers file is the deadline `open_serve` actually
 /// uses**, not just a value [`serve::open_serve_within`] can be handed by
 /// hand.
@@ -6431,6 +6993,88 @@ fn a_second_ask_is_cut_out_of_what_is_left_not_out_of_the_whole() {
         (fraction - 0.10).abs() < 1e-9,
         "the second lease is what is LEFT (0.30 - 0.20), not the grant ceiling again: \
          {fraction}"
+    );
+}
+
+/// **Two scopes over the same accounts subtract from each other.**
+///
+/// The review's finding: `committed_fraction` counted only live leases whose
+/// scope STRING matched the new ask's, while `headroom_for` combines the two
+/// figures with `scoped.min(all)` and so treats them as one pool. An `all`
+/// lease and a `group:work` lease over the same accounts therefore never
+/// subtracted from each other, and the same headroom was promised twice: the
+/// `all` lease could spend the whole window and the group lease still read as
+/// fully funded.
+///
+/// Measured on the figure itself rather than through a mint, because the mint
+/// needs a fleet reader that can enforce a group and the claim under test is
+/// the arithmetic. Both directions are asserted: the group ask sees the `all`
+/// lease, and the `all` ask sees the group lease. A scope this ledger CAN
+/// prove disjoint is still disjoint, which is the third leg: two account sets
+/// that name nobody in common do not subtract.
+///
+/// Watch it fail by restoring the `scope_key(..) == key` filter in
+/// `Ledger::committed_fraction`: the first two assertions read 0.0, and the
+/// ledger says nothing is promised while two leases are live.
+#[test]
+fn a_lease_on_an_overlapping_scope_is_already_promised_room() {
+    let now = teamclaude_rs::now_ms();
+    let borrower = PeerId([7_u8; 32]);
+    let work = tcr_peer_wire::LendScope::Group("work".to_string());
+    let all = tcr_peer_wire::LendScope::All;
+    let live = |lease_id: u128, budget: f64| Lease {
+        lease_id,
+        window: Window::SevenDay,
+        unit: LeaseUnit::Fraction(budget),
+        granted_at_ms: now,
+        expires_at_ms: now + 300_000,
+        spent: 0.0,
+        max_inflight: 2,
+        until: None,
+    };
+
+    let mut ledger = Ledger::new();
+    ledger.record_scoped(live(0xA11, 0.20), borrower, all.clone());
+    ledger.record_scoped(live(0xB22, 0.05), borrower, work.clone());
+
+    assert!(
+        (ledger.committed_fraction(&work, Window::SevenDay, now) - 0.25).abs() < 1e-9,
+        "a `group:work` ask is cut out of what is left after BOTH leases, and the ledger \
+         says {}",
+        ledger.committed_fraction(&work, Window::SevenDay, now)
+    );
+    assert!(
+        (ledger.committed_fraction(&all, Window::SevenDay, now) - 0.25).abs() < 1e-9,
+        "and so is an `all` ask, in the other direction: {}",
+        ledger.committed_fraction(&all, Window::SevenDay, now)
+    );
+
+    // The one pair this ledger can prove apart without the manager's group
+    // membership: two account sets naming nobody in common.
+    let mut named = Ledger::new();
+    named.record_scoped(
+        live(0xC33, 0.20),
+        borrower,
+        tcr_peer_wire::LendScope::Accounts(vec!["alice".to_string()]),
+    );
+    assert_eq!(
+        named.committed_fraction(
+            &tcr_peer_wire::LendScope::Accounts(vec!["bob".to_string()]),
+            Window::SevenDay,
+            now
+        ),
+        0.0,
+        "`account:bob` draws from nothing `account:alice` holds, so nothing is promised"
+    );
+    assert!(
+        (named.committed_fraction(
+            &tcr_peer_wire::LendScope::Accounts(vec!["bob".to_string(), "alice".to_string()]),
+            Window::SevenDay,
+            now
+        ) - 0.20)
+            .abs()
+            < 1e-9,
+        "and a set that names alice as well does overlap"
     );
 }
 

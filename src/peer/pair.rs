@@ -244,6 +244,12 @@ pub fn mint_invite_as(
     }
     let label = sanitize_label(label).map_err(|refusal| anyhow!("peer invite: {refusal}"))?;
 
+    // Locked like every other read-modify-write of this file (see
+    // `accept_enrolment`'s doc comment): unlocked, this mint's own save can
+    // clobber a concurrent `revoke_invite`'s save (or the reverse), a lost
+    // update that either resurrects a revoked invite or drops a row
+    // `accept_enrolment` just pinned under its own lock.
+    let _lock = crate::peer::config::FileLock::acquire(store.path())?;
     let mut file = read_or_default(store.path())?;
     let Some(addr) = file.listen else {
         bail!(
@@ -287,7 +293,13 @@ pub fn mint_invite_as(
 }
 
 /// Revoke one outstanding invite by id.
+///
+/// Locked, the same shape as [`accept_enrolment`] and [`mint_invite_as`]:
+/// unlocked, a revoke that reads before and saves after a concurrent mint or
+/// enrolment silently loses the other write, either bringing the revoked
+/// invite back or dropping a row that enrolment just pinned.
 pub fn revoke_invite(store: &PeerStore, id: u64) -> Result<bool> {
+    let _lock = crate::peer::config::FileLock::acquire(store.path())?;
     let mut file = read_or_default(store.path())?;
     let before = file.pending_invites.len();
     file.pending_invites.retain(|invite| invite.id != id);

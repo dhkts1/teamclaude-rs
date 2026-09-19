@@ -1123,9 +1123,16 @@ fn every_wire_type_serializes_only_allowlisted_keys() {
                 lease_id: 1,
                 access_token: tcr_peer_wire::HandoffToken::new("sk-not-a-real-token".to_string()),
                 expires_at_ms: 20,
+                utilization: Some(0.4),
             })
             .expect("a Control serializes"),
-            &["type", "leaseId", "accessToken", "expiresAtMs"],
+            &[
+                "type",
+                "leaseId",
+                "accessToken",
+                "expiresAtMs",
+                "utilization",
+            ],
         ),
         (
             "Control::UsageHint",

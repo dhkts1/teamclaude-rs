@@ -736,9 +736,13 @@ pub struct CarriedResponse {
 /// by the time this function's hunk could be reached. Both take a carry the
 /// same way, through [`carry_once`]. What is written above is still true of
 /// this function and is no longer true of the module.
-pub async fn retry_through_peer(request: CarriedRequest<'_>) -> Option<CarriedResponse> {
-    let url = reqwest::Url::parse(request.url).ok()?;
-    let host = url.host_str()?.to_string();
+pub async fn retry_through_peer(request: CarriedRequest<'_>) -> ViaCarry {
+    let Ok(url) = reqwest::Url::parse(request.url) else {
+        return ViaCarry::NotTaken;
+    };
+    let Some(host) = url.host_str().map(str::to_string) else {
+        return ViaCarry::NotTaken;
+    };
     let port = url.port_or_known_default().unwrap_or(PEER_EGRESS_PORT);
     if !host_allowed(&host, port) {
         tracing::debug!(
@@ -746,10 +750,10 @@ pub async fn retry_through_peer(request: CarriedRequest<'_>) -> Option<CarriedRe
             port,
             "peer egress: this upstream is not an origin the mesh carries; no peer was asked"
         );
-        return None;
+        return ViaCarry::NotTaken;
     }
     if !request.peers_path.exists() {
-        return None;
+        return ViaCarry::NotTaken;
     }
 
     let file = match crate::peer::config::read_or_default(request.peers_path) {
@@ -759,7 +763,7 @@ pub async fn retry_through_peer(request: CarriedRequest<'_>) -> Option<CarriedRe
                 error = %err,
                 "peer egress: the peers file would not parse, so no peer was asked"
             );
-            return None;
+            return ViaCarry::NotTaken;
         }
     };
     let setting = via_setting(&file);
@@ -775,7 +779,7 @@ pub async fn retry_through_peer(request: CarriedRequest<'_>) -> Option<CarriedRe
             "peer egress: `via off`, this Mac never routes out through a peer, so nothing \
              was read or dialled"
         );
-        return None;
+        return ViaCarry::NotTaken;
     }
     let last_seen = last_seen_from_state(request.peers_path);
     let candidates = resolve_via(&setting, &candidates_from(&file, &last_seen));
@@ -784,7 +788,7 @@ pub async fn retry_through_peer(request: CarriedRequest<'_>) -> Option<CarriedRe
             via = %setting.to_spec(),
             "peer egress: no trusted Mac to ask, so this request keeps today's answer"
         );
-        return None;
+        return ViaCarry::NotTaken;
     }
 
     let key = match NodeKey::load_or_mint(&node_key_dir(request.peers_path)) {
@@ -794,7 +798,7 @@ pub async fn retry_through_peer(request: CarriedRequest<'_>) -> Option<CarriedRe
                 error = %err,
                 "peer egress: this node has no keypair to open a carry with"
             );
-            return None;
+            return ViaCarry::NotTaken;
         }
     };
 
@@ -813,12 +817,47 @@ pub async fn retry_through_peer(request: CarriedRequest<'_>) -> Option<CarriedRe
         )
         .await
         {
-            Ok(carried) => return Some(carried),
+            Ok(carried) => return ViaCarry::Carried(Box::new(carried)),
             Err(CarryMiss::NotTaken) => continue,
-            Err(CarryMiss::Failed) => return None,
+            // **THE GATEWAY TOOK IT.** This used to be `None`, the same word
+            // this function answers for `via off` and for a Mac with no
+            // address, and the caller reads `None` as "no carry happened": it
+            // slept and retried the same account, or rotated to the next one,
+            // and the request that the splice may already have put on the wire
+            // was sent a second time. The pinned sibling has mapped this miss
+            // to a named gap since the exit lock landed; this is the same fact
+            // on the machine's own `via` path.
+            Err(CarryMiss::Failed) => {
+                return ViaCarry::TakenAndFailed(format!(
+                    "{} took this request through its own route and the carry then failed.",
+                    candidate.row.node.display()
+                ))
+            }
         }
     }
-    None
+    ViaCarry::NotTaken
+}
+
+/// What one pass down the `via` ladder came to.
+///
+/// **Three outcomes and not two, for [`crate::peer::serve::Borrowed`]'s
+/// reason**: the fact the caller needs is not "did an answer come back" but
+/// "did this request leave the box". [`Self::NotTaken`] is every route not
+/// taken, no peers file, `via off`, no Mac that answered, a host this mesh does
+/// not carry, and the caller falls through to exactly the answer it would have
+/// given before this function existed. [`Self::TakenAndFailed`] is the one that
+/// costs money: a gateway accepted the carry and the splice or the response
+/// head then failed, so the request may have reached the origin and this Mac
+/// cannot tell. Sending it again is how one POST is billed twice.
+pub enum ViaCarry {
+    /// A Mac carried it, and this is the answer. Boxed because it is much the
+    /// largest of the three and every caller matches on the enum.
+    Carried(Box<CarriedResponse>),
+    /// Nothing left this Mac. The caller keeps today's answer.
+    NotTaken,
+    /// A gateway took the carry and it failed anyway, with the named gap. The
+    /// request is never sent again, by this Mac or another.
+    TakenAndFailed(String),
 }
 
 /// Why one offered carry produced no response.
@@ -1127,7 +1166,7 @@ impl PinnedEgressError {
 /// for an attempt that got past connect before failing, for the same reason: a
 /// client that retries could pay for the request twice. The gap's own sentence
 /// is carried inside so an operator still reads which Mac and which account.
-fn delivered_unknown_response(gap: &str) -> axum::response::Response {
+pub fn delivered_unknown_response(gap: &str) -> axum::response::Response {
     tracing::warn!(
         status = 502,
         error.r#type = "proxy_error",
@@ -1168,7 +1207,13 @@ fn delivered_unknown_response(gap: &str) -> axum::response::Response {
 pub enum PinnedEgress {
     /// Take the direct path, exactly as this handler did before the exit lock
     /// existed.
-    TakeTheDirectPath,
+    ///
+    /// `paced` is whether the outbound throttle has ALREADY been spent for this
+    /// account on this request. A pin that could not be honoured had been paced
+    /// here and was then paced again by the direct path below, so the one
+    /// account whose traffic the operator most wanted shaped waited on the
+    /// bucket twice per request. One client request spends one slot.
+    TakeTheDirectPath { paced: bool },
     /// This request is answered: carried by the pinned Mac, or refused by name.
     Answered(axum::response::Response),
 }
@@ -1258,12 +1303,12 @@ pub async fn pinned_egress(attempt: PinnedAttempt<'_>) -> PinnedEgress {
     // because serde refuses it at config load; the operator finds out when the
     // file is read, not one request at a time.
     let Some(pin) = attempt.manager.account_egress(attempt.account_idx) else {
-        return PinnedEgress::TakeTheDirectPath;
+        return PinnedEgress::TakeTheDirectPath { paced: false };
     };
     let Some(peer) = pin.egress.peer() else {
         // The common case, and it costs one config read: no file, no key, no
         // dial, nothing else on this path runs for an unpinned account.
-        return PinnedEgress::TakeTheDirectPath;
+        return PinnedEgress::TakeTheDirectPath { paced: false };
     };
     let account = attempt
         .manager
@@ -1301,7 +1346,8 @@ pub async fn pinned_egress(attempt: PinnedAttempt<'_>) -> PinnedEgress {
                     tool_uses: attempt.tool_uses,
                     tool_results: attempt.tool_results,
                 },
-            );
+            )
+            .await;
             PinnedEgress::Answered(carried.response)
         }
         Err(err) if pin.strict => PinnedEgress::Answered(err.into_response()),
@@ -1337,7 +1383,7 @@ pub async fn pinned_egress(attempt: PinnedAttempt<'_>) -> PinnedEgress {
                 "account egress: this account is locked to leave from a peer that did not \
                  carry it; sending it from this Mac instead"
             );
-            PinnedEgress::TakeTheDirectPath
+            PinnedEgress::TakeTheDirectPath { paced: true }
         }
     }
 }
@@ -1534,18 +1580,70 @@ pub struct CarriedRecord<'a> {
 /// rotating, waiting inline and re-picking are the second, and none of them
 /// can apply to a response already on its way to the client.
 ///
-/// A 401, a 403 and a 529 arm no hold on the direct path either, so nothing is
+/// A 403 and a 529 arm no hold on the direct path either, so nothing is
 /// recorded for them beyond a line saying a carried response carried that
 /// status: the direct path answers those by rotating, which is exactly the
 /// half that does not exist here.
-fn record_the_hold_the_ladder_would(
+///
+/// # The two arms this used to be missing, and what they cost
+///
+/// It recorded the 429 hold and nothing else, so two facts about the account
+/// that the direct path records never happened on a carry.
+///
+/// A carried **401** neither forced a refresh nor condemned a token-only
+/// account. The direct path (`src/proxy.rs`) does both: an account with no
+/// refresh token has a dead credential only a re-login cures, and every other
+/// one gets one forced refresh and is retried on the fresh token. A pinned
+/// account whose token had expired therefore 401'd every request, forever,
+/// while `tcr status` reported it healthy.
+///
+/// And no carried status ever ran `clear_rate_limited`, which the direct path
+/// runs on every non-429: an account Throttled by ONE carried 429 never came
+/// back to Active, so it dropped out of keep-warm and out of `handoff_bearer`
+/// for good. That is the arm that matters most here, because this path is the
+/// only one a pinned account's requests take.
+///
+/// The recovery is a fact about the ACCOUNT, which is why it belongs here. The
+/// rotation, the inline wait and the re-pick are facts about a REQUEST that is
+/// already on its way back to the client, and none of them are recorded.
+async fn record_the_hold_the_ladder_would(
     manager: &crate::manager::Manager,
     idx: usize,
     status: u16,
     headers: &HeaderMap,
 ) {
+    // Any non-429 is live proof a rate-limit hold no longer binds. The same
+    // line, in the same place in the order, as the direct path's.
     if status != 429 {
-        if matches!(status, 401 | 403 | 529) {
+        manager.clear_rate_limited(idx);
+    }
+    if status == 401 {
+        // A 401 on an account with NO refresh token is not churn: nothing can
+        // revive that credential but a re-login, and `Error` is the truthful
+        // state. With one, a single forced refresh is what the direct path
+        // spends before it decides anything, and its result is the same fact
+        // whichever route the request left by. What is NOT copied is the
+        // retry: this answer is already going back to the client.
+        if manager.has_refresh_token(idx) {
+            let refreshed = manager.ensure_fresh_force(idx).await;
+            tracing::warn!(
+                account_index = idx,
+                refreshed,
+                "account egress: a carried request was rejected, so this account's token \
+                 was refreshed the way a directly-served rejection refreshes it"
+            );
+        } else {
+            tracing::error!(
+                account_index = idx,
+                "account egress: a carried request was rejected on an account with no \
+                 refresh token; the credential is rejected and a re-login is needed"
+            );
+            manager.mark_error(idx);
+        }
+        return;
+    }
+    if status != 429 {
+        if matches!(status, 403 | 529) {
             tracing::warn!(
                 status,
                 account_index = idx,
@@ -1557,17 +1655,36 @@ fn record_the_hold_the_ladder_would(
         return;
     }
     let rejections = crate::quota::quota_rejections(headers);
-    let retry_after = crate::proxy::parse_retry_after(headers).unwrap_or(60);
+    let retry_after_raw = crate::proxy::parse_retry_after(headers);
+    let retry_after = retry_after_raw.unwrap_or(60);
     if rejections.is_empty() {
-        // No unified rejection: a transient limit. The direct path may wait
-        // inline and retry the SAME account here; this one cannot, the answer
-        // is already going back, so what is left of that arm is the park.
-        manager.mark_rate_limited(idx, retry_after.clamp(1, 300));
+        // No unified rejection: a transient limit, and the hold is the one the
+        // direct path's own classifier computes. It used to be
+        // `retry_after.unwrap_or(60)`, which parked an account for a MINUTE on
+        // a 429 that named no `retry-after` while the direct path parks 15 to
+        // 20 seconds for the same answer: the fabricated 60 is the exact
+        // number `classify_transient_429` exists to have stopped using.
+        //
+        // `MAX_SAME_ACCOUNT_429` as the retry count, because that is the only
+        // honest one here: the inline wait is not available to a path whose
+        // answer is already going back, so this asks the classifier for the
+        // park it would have chosen once the inline budget was spent.
+        let hold = match crate::proxy::classify_transient_429(
+            retry_after_raw,
+            crate::proxy::MAX_SAME_ACCOUNT_429,
+            (time::OffsetDateTime::now_utc().nanosecond() as i64)
+                % (crate::proxy::NO_GUIDANCE_JITTER_MAX_SECS + 1),
+        ) {
+            crate::proxy::Transient429::Park(secs)
+            | crate::proxy::Transient429::InlineWait(secs) => secs,
+        };
+        manager.mark_rate_limited(idx, hold);
         tracing::info!(
             account_index = idx,
             retry_after,
+            hold,
             "account egress: a carried request was rate limited, so the account is held \
-             for what the origin asked"
+             exactly as long as a directly-served one holds it"
         );
         return;
     }
@@ -1595,7 +1712,7 @@ fn record_the_hold_the_ladder_would(
     );
 }
 
-pub fn record_carried(manager: &crate::manager::Manager, record: CarriedRecord<'_>) {
+pub async fn record_carried(manager: &crate::manager::Manager, record: CarriedRecord<'_>) {
     let served_at = time::OffsetDateTime::now_utc();
     manager.update_quota(record.account_idx, record.upstream_headers);
     record_the_hold_the_ladder_would(
@@ -1603,7 +1720,8 @@ pub fn record_carried(manager: &crate::manager::Manager, record: CarriedRecord<'
         record.account_idx,
         record.status,
         record.upstream_headers,
-    );
+    )
+    .await;
     manager.record_served(
         record.account_idx,
         served_at,

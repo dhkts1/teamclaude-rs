@@ -1089,12 +1089,28 @@ pub fn peer_graph(
         // path drawn on the graph and the same path drawn on the tab cannot
         // report different figures.
         for path in peer_paths(row, last_seen_ms, state, now_ms) {
-            let through = matches!(path.kind, PathKind::Via).then(|| path.endpoint.clone());
+            // `path.endpoint` is now the WIRE id on a Via/Reverse path (the
+            // fix `PeerStatusRow`'s own endpoint needed, so the panel can
+            // resolve it against `id`). This graph's node ids are all the
+            // DISPLAY form instead (`me`, `peer`, above), and nothing here
+            // re-resolves `through` against `nodes`, so carrying the wire id
+            // through unchanged would put one id space in `to` and a
+            // different one in `through` for the same Mac. Parsed back to
+            // display for this edge alone; a parse failure (an id this build
+            // cannot read) falls back to the wire form rather than losing
+            // the field.
+            let endpoint = if matches!(path.kind, PathKind::Via | PathKind::Reverse) {
+                tcr_peer_wire::PeerId::parse(&path.endpoint)
+                    .map_or_else(|_| path.endpoint.clone(), |id| id.display())
+            } else {
+                path.endpoint.clone()
+            };
+            let through = matches!(path.kind, PathKind::Via).then(|| endpoint.clone());
             edges.push(GraphEdge {
                 from: me.clone(),
                 to: peer.clone(),
                 detail: GraphEdgeDetail::Path {
-                    endpoint: path.endpoint,
+                    endpoint,
                     path_kind: path.kind,
                     through,
                     rtt_ms: path.rtt_ms,
@@ -1185,10 +1201,15 @@ fn peer_paths(
     row.endpoints
         .iter()
         .map(|endpoint| {
+            // The wire id, not `display()`: `PeerStatusRow::id` (the key the
+            // panel resolves names by, `mergingLive` and `peerNames` both key
+            // on it) is the wire form, and a `Via`/`Reverse` endpoint that
+            // carried the display form instead could never be looked up in
+            // that map, so the tab drew the raw id where a name belonged.
             let (address, kind) = match endpoint.locator {
                 Locator::Direct { addr } => (addr.to_string(), PathKind::Direct),
-                Locator::Via { node } => (node.display(), PathKind::Via),
-                Locator::Reverse { node } => (node.display(), PathKind::Reverse),
+                Locator::Via { node } => (node.to_wire(), PathKind::Via),
+                Locator::Reverse { node } => (node.to_wire(), PathKind::Reverse),
             };
             let traffic = state
                 .path_traffic

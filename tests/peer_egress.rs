@@ -1629,8 +1629,8 @@ async fn a_gateway_that_does_not_answer_leaves_todays_503() {
     })
     .await;
     assert!(
-        carried.is_none(),
-        "a Mac that does not answer must leave the request with today's answer"
+        matches!(carried, egress::ViaCarry::NotTaken),
+        "a Mac that does not answer took nothing, so the request keeps today's answer"
     );
     assert!(
         !collector.matching("did not take the carry").is_empty(),
@@ -2296,7 +2296,10 @@ async fn via_off_costs_no_dial_and_no_wait() {
     let elapsed = started.elapsed();
     accepting.abort();
 
-    assert!(carried.is_none(), "`off` means no carry");
+    assert!(
+        matches!(carried, egress::ViaCarry::NotTaken),
+        "`off` means no carry"
+    );
     assert_eq!(
         dialled.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -2373,7 +2376,10 @@ async fn the_operators_timeout_is_what_a_silent_gateway_is_given() {
     let elapsed = started.elapsed();
     held.abort();
 
-    assert!(carried.is_none(), "a silent Mac carries nothing");
+    assert!(
+        matches!(carried, egress::ViaCarry::NotTaken),
+        "a silent Mac carries nothing"
+    );
     assert!(
         elapsed < std::time::Duration::from_secs(2),
         "the operator's 300ms must bound this, not the 5s constant: {elapsed:?}"
@@ -2471,9 +2477,34 @@ async fn a_lender_that_takes_the_carry_and_never_answers_still_releases_the_requ
     origin_task.abort();
     gateway_task.abort();
 
+    // **THE ITEM-1 GATE.** This assertion used to read `carried.is_none()`,
+    // which is the same word this path answers for `via off` and for a Mac with
+    // no address: the caller read it as "no carry happened", slept, and sent
+    // the request again on the same account. The gateway TOOK this one, and
+    // what failed afterwards is a splice that may already have put it on the
+    // wire.
+    let egress::ViaCarry::TakenAndFailed(gap) = &carried else {
+        panic!(
+            "a carry the gateway took and then dropped is not the same fact as a Mac that              never took it: this request may already have been served"
+        );
+    };
     assert!(
-        carried.is_none(),
-        "a carry that never produced an answer must fall back to today's answer"
+        gap.contains("took this request"),
+        "the gap names what happened, and it reaches the client's 502: {gap}"
+    );
+    let answer = egress::delivered_unknown_response(gap);
+    assert_eq!(
+        answer.status().as_u16(),
+        502,
+        "a request that may already have run is answered, never retried"
+    );
+    assert_eq!(
+        answer
+            .headers()
+            .get("x-should-retry")
+            .and_then(|value| value.to_str().ok()),
+        Some("false"),
+        "a client that retries this pays for the request twice"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(3),
@@ -2580,8 +2611,8 @@ fn five_concurrent_carries_at_a_four_carry_budget_refuse_the_fifth() {
 /// methods.
 ///
 /// Watched red by deleting the `push_log` call from `record_carried`.
-#[test]
-fn a_carried_request_lands_in_the_ledger() {
+#[tokio::test]
+async fn a_carried_request_lands_in_the_ledger() {
     let manager = fleet_of("http://127.0.0.1:1", &["alice@example.com"]);
     let before = manager
         .snapshot(time::OffsetDateTime::now_utc())
@@ -2604,7 +2635,8 @@ fn a_carried_request_lands_in_the_ledger() {
             tool_results: &[],
             upstream_headers: &axum::http::HeaderMap::new(),
         },
-    );
+    )
+    .await;
 
     let snapshot = manager.snapshot(time::OffsetDateTime::now_utc());
     assert_eq!(
@@ -2643,8 +2675,8 @@ fn a_carried_request_lands_in_the_ledger() {
 /// Watched red by deleting the `manager.update_quota` call from
 /// `record_carried` (`src/peer/egress.rs`): the window stays `None`, i.e. "we
 /// have never seen this account's quota", and the assertion below names it.
-#[test]
-fn a_carried_requests_spend_reaches_the_quota_window() {
+#[tokio::test]
+async fn a_carried_requests_spend_reaches_the_quota_window() {
     let manager = fleet_of("http://127.0.0.1:1", &["alice@example.com"]);
     let now = time::OffsetDateTime::now_utc();
     assert_eq!(
@@ -2680,7 +2712,8 @@ fn a_carried_requests_spend_reaches_the_quota_window() {
             tool_results: &[],
             upstream_headers: &upstream_headers,
         },
-    );
+    )
+    .await;
 
     assert_eq!(
         manager.window_utilizations(tcr_peer_wire::Window::FiveHour, now),
@@ -2714,8 +2747,8 @@ fn a_carried_requests_spend_reaches_the_quota_window() {
 /// Watched red by deleting the `record_the_hold_the_ladder_would` call from
 /// `record_carried`: the account reads `Active` and serves the next request
 /// straight into the same rejection.
-#[test]
-fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
+#[tokio::test]
+async fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
     let manager = fleet_of("http://127.0.0.1:1", &["alice@example.com"]);
     assert_ne!(
         manager.account_status(0),
@@ -2750,7 +2783,8 @@ fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
             tool_results: &[],
             upstream_headers: &upstream_headers,
         },
-    );
+    )
+    .await;
 
     assert_eq!(
         manager.account_status(0),
@@ -2761,6 +2795,164 @@ fn a_carried_rejection_holds_the_account_the_way_a_direct_one_does() {
     assert!(
         !manager.hold_expired(0, teamclaude_rs::now_ms()),
         "and the hold is still running: it was armed for what the origin asked"
+    );
+}
+
+/// **A carried response runs the same recovery the direct path runs.**
+///
+/// The review's finding: `record_the_hold_the_ladder_would` recorded the 429
+/// hold and nothing else, and no carried status ever ran `clear_rate_limited`.
+/// The direct path runs it on every non-429 (`src/proxy.rs`, "any non-429 is
+/// live proof a rate-limit hold no longer binds"), and a pinned account's
+/// requests all leave this way, so an account Throttled by ONE carried 429
+/// never came back to Active: it dropped out of selection, out of keep-warm and
+/// out of `handoff_bearer` for good, while the very next carried 200 proved it
+/// was serving.
+///
+/// Watch it fail by deleting the `clear_rate_limited` call from
+/// `record_the_hold_the_ladder_would`: the account is still Throttled after a
+/// carried 200.
+#[tokio::test]
+async fn a_carried_success_clears_the_hold_a_carried_rejection_armed() {
+    let manager = fleet_of("http://127.0.0.1:1", &["alice@example.com"]);
+    manager.mark_rate_limited(0, 300);
+    assert_eq!(
+        manager.account_status(0),
+        Some(teamclaude_rs::manager::AccountStatus::Throttled),
+        "the fixture starts held, or the assertion below is about nothing"
+    );
+
+    egress::record_carried(
+        &manager,
+        egress::CarriedRecord {
+            account_idx: 0,
+            account: Some("alice@example.com".to_string()),
+            session_key: None,
+            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            wire_session_id: None,
+            model: None,
+            method: "POST".to_string(),
+            path: "/v1/messages".to_string(),
+            status: 200,
+            tool_uses: &[],
+            tool_results: &[],
+            upstream_headers: &axum::http::HeaderMap::new(),
+        },
+    )
+    .await;
+
+    assert_ne!(
+        manager.account_status(0),
+        Some(teamclaude_rs::manager::AccountStatus::Throttled),
+        "a carried 200 is live proof the hold no longer binds, exactly as a direct one is"
+    );
+}
+
+/// **A carried 401 on a token-only account condemns it, the way the direct path
+/// does.**
+///
+/// The direct path's first 401 arm: an account with no refresh token has a
+/// credential nothing but a re-login can revive, so it is marked `Error` rather
+/// than left Active to be selected, 401'd and rotated away from on every
+/// request while `tcr status` reports it healthy. A carried 401 recorded none
+/// of that.
+///
+/// Watch it fail by deleting the `status == 401` arm from
+/// `record_the_hold_the_ladder_would`: the account stays Active.
+#[tokio::test]
+async fn a_carried_401_on_a_token_only_account_marks_it_error() {
+    let manager = fleet_with(
+        "http://127.0.0.1:1",
+        vec![Account {
+            name: "alice@example.com".to_string(),
+            account_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            access_token: "at-0".to_string(),
+            // A `tcr login --token` account: inference only, and no refresh
+            // that could ever revive a rejected credential.
+            refresh_token: None,
+            ..fake_account()
+        }],
+    );
+
+    egress::record_carried(
+        &manager,
+        egress::CarriedRecord {
+            account_idx: 0,
+            account: Some("alice@example.com".to_string()),
+            session_key: None,
+            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            wire_session_id: None,
+            model: None,
+            method: "POST".to_string(),
+            path: "/v1/messages".to_string(),
+            status: 401,
+            tool_uses: &[],
+            tool_results: &[],
+            upstream_headers: &axum::http::HeaderMap::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        manager.account_status(0),
+        Some(teamclaude_rs::manager::AccountStatus::Error),
+        "a rejected credential with no refresh is dead whichever route the request left by"
+    );
+}
+
+/// **A carried 429 with no guidance parks for what the direct path parks, not a
+/// minute.**
+///
+/// `retry_after.unwrap_or(60)` fabricated a sixty-second hold for a 429 that
+/// named no `retry-after`, which is the exact number
+/// `classify_transient_429` exists to have stopped using: the direct path parks
+/// `NO_GUIDANCE_HOLD_SECS` plus up to five seconds of jitter, 15 to 20 seconds,
+/// so the fleet un-parks staggered instead of going dark for a minute. A pinned
+/// account's traffic all leaves this way, so the old number was the one an
+/// operator actually felt.
+///
+/// The instrument is the hold's own deadline, probed 25 seconds out: past every
+/// value the direct path can choose and well inside the fabricated 60.
+///
+/// Watch it fail by restoring `manager.mark_rate_limited(idx,
+/// retry_after.clamp(1, 300))`: the hold is 60 seconds and is still running.
+#[tokio::test]
+async fn a_carried_transient_429_parks_for_what_the_direct_path_parks() {
+    let manager = fleet_of("http://127.0.0.1:1", &["alice@example.com"]);
+
+    // A 429 with NO unified rejection and NO `retry-after`: the transient shape.
+    egress::record_carried(
+        &manager,
+        egress::CarriedRecord {
+            account_idx: 0,
+            account: Some("alice@example.com".to_string()),
+            session_key: None,
+            session_kind: teamclaude_rs::stats::SessionKind::Stable,
+            wire_session_id: None,
+            model: None,
+            method: "POST".to_string(),
+            path: "/v1/messages".to_string(),
+            status: 429,
+            tool_uses: &[],
+            tool_results: &[],
+            upstream_headers: &axum::http::HeaderMap::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        manager.account_status(0),
+        Some(teamclaude_rs::manager::AccountStatus::Throttled),
+        "a 429 still holds the account: this is about how long, not whether"
+    );
+    assert!(
+        !manager.hold_expired(0, teamclaude_rs::now_ms() + 14_000),
+        "and the hold is a real one: still running 14 seconds out"
+    );
+    assert!(
+        manager.hold_expired(0, teamclaude_rs::now_ms() + 25_000),
+        "a transient 429 with no guidance parks 15 to 20 seconds, the way the direct \
+         path parks it, and not the fabricated minute"
     );
 }
 
@@ -3206,7 +3398,7 @@ async fn a_pinned_request_leaves_through_its_peer_on_every_request() {
     for request in 1..=3 {
         match egress::pinned_egress(attempt(&manager, &axum::http::Method::POST, &peers)).await {
             egress::PinnedEgress::Answered(_) => {}
-            egress::PinnedEgress::TakeTheDirectPath => panic!(
+            egress::PinnedEgress::TakeTheDirectPath { .. } => panic!(
                 "request {request}: a locked account must never be told to take the direct path \
                  while its Mac is answering"
             ),
@@ -3410,8 +3602,11 @@ async fn a_down_peer_falls_back_to_this_mac_with_one_line_when_it_is_not_strict(
     );
     let answer = egress::pinned_egress(attempt(&manager, &axum::http::Method::POST, &peers)).await;
     assert!(
-        matches!(answer, egress::PinnedEgress::TakeTheDirectPath),
-        "without `egressStrict` a pin that cannot be honoured is a preference, not a refusal"
+        matches!(
+            answer,
+            egress::PinnedEgress::TakeTheDirectPath { paced: true }
+        ),
+        "without `egressStrict` a pin that cannot be honoured is a preference, not a refusal,          and it says the pacing slot is already spent: this request waited on the account's          own bucket inside the exit lock, and `src/proxy.rs` reads this flag rather than          waiting on it a second time"
     );
 
     let lines = collector.matching("locked to leave from a peer that did not carry it");

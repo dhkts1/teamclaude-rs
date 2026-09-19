@@ -619,7 +619,32 @@ fn handed_meters() -> &'static Mutex<HashMap<u128, HandedMeter>> {
 /// be a lender contradicting itself.
 fn register_handed_meter(lease_id: u128, sink: tokio::sync::mpsc::UnboundedSender<Control>) {
     if let Ok(mut meters) = handed_meters().lock() {
-        meters.insert(lease_id, HandedMeter { sink, last: None });
+        // THE BASELINE SURVIVES the channel being replaced. A lease whose
+        // session is re-established, or which is re-asked for inside its own
+        // life, is the same lease against the same window, and a meter reset to
+        // `None` here makes the next answer free: the first reading is not a
+        // rise, so it charges nothing at all. Only the sink is new.
+        let last = meters.get(&lease_id).and_then(|meter| meter.last);
+        meters.insert(lease_id, HandedMeter { sink, last });
+    }
+}
+
+/// Take the owner's own utilization, off a [`Control::Handoff`], as the figure
+/// this lease's next answer is measured against.
+///
+/// **Monotone: `max`, never a replacement.** With `max_inflight` above one, two
+/// answers can land out of order, and a baseline moved BACKWARDS by the older
+/// of them turns the next answer's rise into a second charge for quota already
+/// billed. A window that genuinely reset reads as a fall, which is the owner's
+/// windfall exactly as [`Ledger::debit`] says, and never a credit here.
+fn note_handed_baseline(lease_id: u128, utilization: f64) {
+    if !utilization.is_finite() {
+        return;
+    }
+    if let Ok(mut meters) = handed_meters().lock() {
+        if let Some(meter) = meters.get_mut(&lease_id) {
+            meter.last = Some(meter.last.map_or(utilization, |last| last.max(utilization)));
+        }
     }
 }
 
@@ -652,7 +677,12 @@ fn report_handed_spend(lease_id: u128, utilization: Option<f64>) {
     let Some(meter) = meters.get_mut(&lease_id) else {
         return;
     };
-    let before = meter.last.replace(utilization);
+    let before = meter.last;
+    // `max`, not `replace`, for [`note_handed_baseline`]'s reason: with
+    // `max_inflight` above one the answers arrive in whatever order the network
+    // hands them over, and a baseline pushed backwards by the older one bills
+    // the same quota twice on the next answer.
+    meter.last = Some(before.map_or(utilization, |last| last.max(utilization)));
     let Some(hint) = usage_hint(lease_id, before, Some(utilization)) else {
         return;
     };
@@ -685,7 +715,6 @@ fn reported_utilization(head: &[(String, String)], window: Window) -> Option<f64
 }
 
 /// Whether the owner should push a [`Control::Handoff`] for this lease right
-/// now, and what it carries./// Whether the owner should push a [`Control::Handoff`] for this lease right
 /// now, and what it carries.
 ///
 /// The three refusals are the whole of "only, and stops at":
@@ -703,7 +732,7 @@ fn reported_utilization(head: &[(String, String)], window: Window) -> Option<f64
 pub fn handoff_for(
     mode: crate::peer::config::LendMode,
     lease: &Lease,
-    bearer: Option<(String, i64)>,
+    bearer: Option<crate::manager::HandedCredential>,
     now_ms: i64,
 ) -> Option<Control> {
     use crate::peer::config::LendMode;
@@ -713,7 +742,11 @@ pub fn handoff_for(
     if lease_has_ended(lease, now_ms) {
         return None;
     }
-    let (access_token, expires_at_ms) = bearer?;
+    let crate::manager::HandedCredential {
+        access_token,
+        expires_at_ms,
+        utilization,
+    } = bearer?;
     // A bearer that has already expired is not a handoff, it is a frame that
     // costs the borrower a request to discover is useless. The lease's own
     // expiry is checked above and they are different clocks: a live lease can
@@ -726,6 +759,13 @@ pub fn handoff_for(
         lease_id: lease.lease_id,
         access_token: tcr_peer_wire::HandoffToken::new(access_token),
         expires_at_ms,
+        // THE BASELINE, and the reason this frame carries a figure at all. The
+        // borrower can only see the owner's window through the rate-limit
+        // headers on its own answers, so a rise needs a reading from BEFORE the
+        // first of them; without one the first answer on every lease was free,
+        // and a borrower that re-asked per request was never charged for
+        // anything. See [`HandedMeter`] and [`usage_hint`].
+        utilization: Some(utilization),
     })
 }
 
@@ -846,8 +886,48 @@ pub fn usage_hint(lease_id: u128, before: Option<f64>, after: Option<f64>) -> Op
     }
     Some(Control::UsageHint {
         lease_id,
-        spent: rise,
+        // THE FLOOR. The utilization header moves in steps, so a request whose
+        // cost is smaller than one step reports a rise of zero on the answer
+        // that paid for it and the whole of it later, on some other lease's
+        // answer or on none at all. The serve path charges [`MIN_DEBIT`] for
+        // exactly this case (`Ledger::debit`), and a hand lease that did not
+        // was a lease a small-request borrower could hold open indefinitely.
+        //
+        // It floors a rise that is already POSITIVE and never invents one: an
+        // answer that moved nothing is still free, which is what keeps "it can
+        // only raise `spent`" honest rather than turning every request into a
+        // charge.
+        spent: rise.max(MIN_DEBIT),
     })
+}
+
+/// The baseline a [`Control::Handoff`] brings, or the line an operator has to
+/// read instead.
+///
+/// # A handoff with no baseline is refused, and the lender is NAMED
+///
+/// The figure is what a borrowed answer's spend is a rise above
+/// ([`usage_hint`]), so a bearer that arrives without one is a bearer whose
+/// every answer this Mac would take for free: the owner's ledger would show a
+/// lease that was never spent and its ceiling would never bind. Only a build
+/// OLDER than this one leaves it out, which is why the refusal names the Mac to
+/// update rather than reporting a protocol error nobody can act on. The lease
+/// itself stands and the borrow falls back to the lender's own serve path.
+///
+/// A function returning the line, rather than a `warn!` inline, so a test can
+/// assert that the peer is named: "refused" and "refused in a way the operator
+/// can act on" are different claims and the second one needs a value.
+pub fn handed_baseline(lender: &PeerId, utilization: Option<f64>) -> Result<f64, String> {
+    match utilization {
+        Some(utilization) if utilization.is_finite() => Ok(utilization),
+        _ => Err(format!(
+            "peer lease: {} handed this Mac a bearer without the utilization its spend would \
+             be measured against, which is what a build older than this one sends, so the \
+             bearer is refused and this borrow stays on that Mac's own path until it is \
+             updated",
+            lender.display()
+        )),
+    }
 }
 
 /// How long before a handed bearer expires the owner pushes the next one.
@@ -988,6 +1068,36 @@ pub async fn serve_on_handed_bearer(
 /// scope".
 fn scope_key(scope: &LendScope) -> String {
     scope.to_string()
+}
+
+/// Could a lease on `held` be spending accounts a lease on `wanted` would also
+/// draw from?
+///
+/// # It answers with what the LEDGER knows, and errs towards subtracting
+///
+/// This ledger holds scopes as the operator wrote them and no membership at
+/// all: groups hot-reload, which is the whole reason [`LendScope::Group`] is a
+/// name and not a frozen list, so "does `group:work` contain account `a`" is a
+/// question only the manager can answer and only at the instant it is asked.
+///
+/// So three answers are derivable here and the fourth is a choice.
+/// [`LendScope::All`] overlaps everything. Two [`LendScope::Accounts`] sets
+/// overlap when they name an account in common. Identical scopes overlap.
+/// Anything involving a GROUP against a different scope is not derivable, and
+/// it answers "overlapping": the cost of subtracting room that is really
+/// somebody else's is a lease smaller than it could have been, and the cost of
+/// not subtracting is the owner promising the same headroom twice, which is the
+/// failure this function exists for.
+fn scopes_overlap(wanted: &LendScope, held: &LendScope) -> bool {
+    match (wanted, held) {
+        (LendScope::All, _) | (_, LendScope::All) => true,
+        (LendScope::Accounts(wanted), LendScope::Accounts(held)) => {
+            wanted.iter().any(|label| held.contains(label))
+        }
+        // A group against anything but an identical group: not derivable here,
+        // so it counts. See this function's own doc.
+        _ => true,
+    }
 }
 
 /// The lender's ledger: every lease it has granted, with absolute deadlines.
@@ -1552,6 +1662,25 @@ impl Ledger {
         let lendable = (self.headroom_for(&scope, ask.window).unwrap_or(0.0)
             - self.committed_fraction(&scope, ask.window, now_ms))
         .max(0.0);
+        // A HAND GRANT IS CLAMPED AGAIN, by what the accounts whose bearer can
+        // leave this Mac have left. The two figures were measured over two
+        // different sets of accounts: `handoff_bearer` skips a held account and
+        // a strictly pinned one, `lendable_fraction` skipped neither, so a
+        // scope whose usable accounts were all held or pinned funded a lease
+        // with no bearer at all and every request on it fell back to the
+        // lender's own path. It is a clamp rather than a replacement of the
+        // note above, because the noted headroom is what `may_relay` decides
+        // SERVE relays against too and lowering it there would refuse them for
+        // a hand lease's reason.
+        //
+        // Read off the grant the ledger itself picked, never re-derived: this
+        // is the same `granted` the mode, the scope and the end come off.
+        let lendable = match granted.as_ref().map(|grant| grant.mode) {
+            Some(crate::peer::config::LendMode::Hand) => fleet
+                .lendable_by_hand(&scope, ask.window)
+                .map_or(lendable, |handable| lendable.min(handable)),
+            _ => lendable,
+        };
 
         let lease_id = match random_id() {
             Ok(id) => id,
@@ -2040,16 +2169,23 @@ impl Ledger {
     /// This is the figure the comments in this file used to call
     /// `lent_fraction`, which never existed under that name.
     pub fn committed_fraction(&self, scope: &LendScope, window: Window, now_ms: i64) -> f64 {
-        let key = scope_key(scope);
         self.leases
             .iter()
             .filter(|lease| lease.expires_at_ms > now_ms)
             .filter(|lease| lease.window == window)
             .filter(|lease| {
-                self.scopes
+                // EVERY LEASE OVER ACCOUNTS THIS SCOPE ALSO DRAWS FROM, not
+                // only the ones whose scope string matches. This compared
+                // `scope_key`s, so an `all` lease and a `group:work` lease over
+                // the same accounts never subtracted from each other and the
+                // same room was promised twice, while `headroom_for` combines
+                // the two figures with `scoped.min(all)` and therefore treats
+                // them as one pool. See [`scopes_overlap`].
+                let held = self
+                    .scopes
                     .get(&lease.lease_id)
-                    .map_or_else(|| scope_key(&LendScope::All), scope_key)
-                    == key
+                    .map_or(&LendScope::All, |scope| scope);
+                scopes_overlap(scope, held)
             })
             .map(|lease| match lease.unit {
                 LeaseUnit::Fraction(fraction) => (fraction - lease.spent).max(0.0),
@@ -2241,6 +2377,16 @@ async fn read_handed_bearers(
     let (hints, mut hints_rx) = tokio::sync::mpsc::unbounded_channel();
     register_handed_meter(lease.lease_id, hints);
 
+    // THE FRAME READER, and it is what makes the `select!` below safe at all.
+    // `serve::recv_control` is not cancel safe: a hint arriving while a Handoff
+    // is half read dropped that read with bytes already taken off the socket,
+    // and the next read then met the tail of one frame as a length prefix, so
+    // the Noise stream desynced and this borrower forgot its bearer for the
+    // rest of the lease. `noise::FrameReader` holds the part-read bytes in the
+    // loop's own state instead of in the cancelled future, which is the failure
+    // its own doc describes.
+    let mut frames = crate::peer::noise::FrameReader::new();
+
     let remaining = lease_ends_at_ms(&lease).saturating_sub(crate::now_ms());
     if remaining > 0 {
         let until_the_lease_ends =
@@ -2268,7 +2414,12 @@ async fn read_handed_bearers(
                         }
                         continue;
                     }
-                    frame = serve::recv_control(&mut stream, &mut session) => frame,
+                    bytes = frames.recv_encrypted(&mut stream, &mut session.transport) => {
+                        bytes.and_then(|bytes| {
+                            serde_json::from_slice::<Control>(&bytes)
+                                .context("peer lease: a frame on this lease's session did not parse")
+                        })
+                    }
                 };
                 let frame: Control = match frame {
                     Ok(frame) => frame,
@@ -2287,6 +2438,7 @@ async fn read_handed_bearers(
                         lease_id,
                         access_token,
                         expires_at_ms,
+                        utilization,
                     } => {
                         if lease_id != lease.lease_id {
                             // A bearer for a lease this session did not mint is
@@ -2300,6 +2452,16 @@ async fn read_handed_bearers(
                             );
                             continue;
                         }
+                        // A handoff with no baseline is refused and the lender
+                        // is named: see [`handed_baseline`], which owns the
+                        // whole of that rule and the line.
+                        let baseline = match handed_baseline(&lender, utilization) {
+                            Ok(baseline) => baseline,
+                            Err(line) => {
+                                tracing::warn!("{line}");
+                                continue;
+                            }
+                        };
                         match handed_tokens().lock() {
                             Ok(mut held) => {
                                 held.put(
@@ -2307,6 +2469,11 @@ async fn read_handed_bearers(
                                     access_token.reveal().to_string(),
                                     expires_at_ms,
                                 );
+                                // The baseline the next answer is measured
+                                // against, taken monotonically: a renewal
+                                // carries the owner's window as it stands now,
+                                // and a later frame can only move it forward.
+                                note_handed_baseline(lease_id, baseline);
                                 // The deadline and the lease, never the token:
                                 // this line is the one an operator reads while
                                 // a hand-mode borrow is running.
@@ -2694,6 +2861,25 @@ pub fn lenders_in_ask_order(store: &PeerStore) -> Vec<PeerRow> {
     rows
 }
 
+/// Did this failure happen BEFORE anything left this Mac?
+///
+/// The one question that separates "ask the next lender" from "tell the client
+/// the outcome is unknown", asked on the hand-mode path where the request is
+/// sent by this Mac's own `reqwest` client rather than over a peer stream.
+///
+/// The error arrives as an [`anyhow::Error`] with context wrapped round it, so
+/// the chain is walked for the `reqwest::Error` underneath rather than the
+/// string being matched: a connect failure and a resolver failure are the two
+/// shapes where no byte was sent, and they are exactly the two `src/proxy.rs`
+/// separates out on the direct path with the same two predicates. Anything
+/// else, a reply that never arrived, a body that died mid-stream, may have run
+/// upstream and is never offered to another lender.
+pub fn nothing_left_this_mac(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|cause| cause.is_connect() || crate::proxy::is_offline_error(cause))
+}
+
 /// The answer a borrower gives its client when a borrowed request was
 /// delivered and its outcome is unknowable.
 ///
@@ -2793,16 +2979,33 @@ impl FallbackProvider for PeerLeaseProvider {
                     match self.serve_handed(ask, &lease).await {
                         Ok(Some(response)) => return Some(response),
                         Ok(None) => {}
+                        // A CONNECT failure is the one error here that is not
+                        // a delivery. `reqwest` reports "the socket never
+                        // opened" and "the reply never arrived" as the same
+                        // type, and this arm read both as delivered, so a
+                        // lender whose handed bearer pointed at an upstream
+                        // this Mac could not even reach ended the ladder with
+                        // a no-retry 502 over a request that had not left the
+                        // box. The direct path separates the two with the same
+                        // predicate (`src/proxy.rs`, `is_connect` plus the
+                        // resolver check), and this is that predicate.
+                        Err(err) if nothing_left_this_mac(&err) => {
+                            tracing::warn!(
+                                peer = %row.node.display(),
+                                error = %err,
+                                "peer lease: the hand-mode request never reached an \
+                                 upstream, so nothing was served and the next lender may \
+                                 be asked"
+                            );
+                        }
                         Err(err) => {
                             // NOT `continue`. A hand-mode request leaves from
                             // THIS Mac, on the owner's bearer, so an error
                             // here is a request that may already be running
-                            // upstream: `reqwest` reports a connect failure
-                            // and a reply that never arrived the same way.
-                            // Offering the same body to the next lender is
-                            // how one POST is executed twice, which is the
-                            // defect `Borrowed::DeliveredUnknown` exists for
-                            // on the serve path.
+                            // upstream. Offering the same body to the next
+                            // lender is how one POST is executed twice, which
+                            // is the defect `Borrowed::DeliveredUnknown`
+                            // exists for on the serve path.
                             tracing::warn!(
                                 peer = %row.node.display(),
                                 error = %err,
@@ -2996,4 +3199,295 @@ pub fn lender_rows(store: &PeerStore) -> Vec<PeerRow> {
         .into_iter()
         .filter(|row| row.allow.allow_disclose && row.has_endpoint())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lease on the seven-day window, live well past `now`.
+    fn live_lease(lease_id: u128, now_ms: i64) -> Lease {
+        Lease {
+            lease_id,
+            window: Window::SevenDay,
+            unit: LeaseUnit::Fraction(0.20),
+            granted_at_ms: now_ms,
+            expires_at_ms: now_ms + 300_000,
+            spent: 0.0,
+            max_inflight: 2,
+            until: None,
+        }
+    }
+
+    /// **A rise smaller than the utilization header's own step still costs
+    /// `MIN_DEBIT`.**
+    ///
+    /// The header moves in steps, so a request cheaper than one step reports a
+    /// rise of zero on the answer that paid for it and the whole of it later,
+    /// on some other answer or on none at all. The serve path charges
+    /// `MIN_DEBIT` for exactly this (`Ledger::debit`) and the hand path charged
+    /// nothing, which is a lease a small-request borrower could hold open for
+    /// as long as it liked.
+    ///
+    /// Watch it fail by returning `spent: rise` from `usage_hint`: the tiny
+    /// rise is reported as itself, well under the floor.
+    #[test]
+    fn a_positive_rise_under_the_floor_is_charged_the_floor() {
+        let tiny = MIN_DEBIT / 10.0;
+        let Some(Control::UsageHint { spent, .. }) = usage_hint(7, Some(0.40), Some(0.40 + tiny))
+        else {
+            panic!("a risen window reports a hint");
+        };
+        assert!(
+            (spent - MIN_DEBIT).abs() < f64::EPSILON,
+            "a rise of {tiny} is charged the floor, and this charged {spent}"
+        );
+
+        let Some(Control::UsageHint { spent, .. }) = usage_hint(7, Some(0.40), Some(0.47)) else {
+            panic!("a risen window reports a hint");
+        };
+        assert!(
+            (spent - 0.07).abs() < 1e-9,
+            "a rise above the floor is still itself, and this charged {spent}"
+        );
+
+        assert!(
+            usage_hint(7, Some(0.40), Some(0.40)).is_none(),
+            "an answer that moved nothing is still free: the floor lifts a positive rise and \
+             never invents one"
+        );
+        assert!(
+            usage_hint(7, Some(0.40), Some(0.10)).is_none(),
+            "and a window that reset under the request is the owner's windfall, never a credit"
+        );
+    }
+
+    /// **The meter's baseline only ever moves forward, and it survives the
+    /// session being re-registered.**
+    ///
+    /// Two failures in one: with `max_inflight` above one the answers arrive in
+    /// whatever order the network hands them over, and a baseline pushed
+    /// BACKWARDS by the older of them bills the same quota twice on the next
+    /// answer; and a lease re-asked for inside its own life used to reset the
+    /// meter to `None`, which made the next answer free because one reading is
+    /// not a rise.
+    ///
+    /// Watch it fail by putting `meter.last.replace(utilization)` back in
+    /// `report_handed_spend`: the out-of-order pair leaves the baseline at 0.40
+    /// and the third answer is charged 0.10 instead of 0.03. And by seeding
+    /// `HandedMeter { last: None }` in `register_handed_meter`: the re-ask
+    /// leaves nothing to measure against and the answer after it is free.
+    #[test]
+    fn the_baseline_moves_forward_only_and_survives_a_re_ask() {
+        let lease_id = 0xBA5E_u128;
+        let (sink, mut hints) = tokio::sync::mpsc::unbounded_channel();
+        register_handed_meter(lease_id, sink);
+        note_handed_baseline(lease_id, 0.30);
+
+        // Out of order: the later answer lands first.
+        report_handed_spend(lease_id, Some(0.50));
+        report_handed_spend(lease_id, Some(0.40));
+        report_handed_spend(lease_id, Some(0.53));
+
+        let charged: Vec<f64> = std::iter::from_fn(|| hints.try_recv().ok())
+            .map(|hint| match hint {
+                Control::UsageHint { spent, .. } => spent,
+                other => panic!("a meter reports usage and nothing else, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            charged.len(),
+            2,
+            "the answer that read BELOW the baseline reports nothing, so two of the three \
+             charge: {charged:?}"
+        );
+        assert!(
+            (charged[0] - 0.20).abs() < 1e-9,
+            "the first is measured against the handoff's own baseline: {charged:?}"
+        );
+        assert!(
+            (charged[1] - 0.03).abs() < 1e-9,
+            "and the third against 0.50, which the out-of-order 0.40 must not have pulled \
+             back down: {charged:?}"
+        );
+
+        // The re-ask: a second session for the same lease replaces the sink and
+        // keeps the figure.
+        let (sink, mut hints) = tokio::sync::mpsc::unbounded_channel();
+        register_handed_meter(lease_id, sink);
+        report_handed_spend(lease_id, Some(0.56));
+        let Some(Control::UsageHint { spent, .. }) = hints.try_recv().ok() else {
+            panic!("the first answer after a re-ask is charged, not free");
+        };
+        assert!(
+            (spent - 0.03).abs() < 1e-9,
+            "and it is charged against the baseline the meter already held: {spent}"
+        );
+        forget_handed_meter(lease_id);
+    }
+
+    /// **A usage hint landing mid-frame does not cost the borrower its
+    /// bearer.**
+    ///
+    /// The reader holds a `biased` `select!` between the hint channel and the
+    /// stream, so a hint queued while a `Handoff` is half read DROPS the read.
+    /// `serve::recv_control` is not cancel safe: the bytes it had already taken
+    /// off the socket went with the dropped future, the next read met the tail
+    /// of one frame as a length prefix, the Noise stream desynced, and this
+    /// borrower forgot its bearer for the rest of the lease.
+    /// `noise::FrameReader` keeps the part-read bytes in the loop's own state,
+    /// which is the failure its own doc describes.
+    ///
+    /// Driven against the real function over a duplex with a real Noise
+    /// session, and the frame is split by hand with the hint pushed between the
+    /// halves, because the claim is about a cancellation that only happens when
+    /// those two land in that order.
+    ///
+    /// Watch it fail by putting `frame = serve::recv_control(&mut stream, &mut
+    /// session) => frame` back in `read_handed_bearers`'s `select!`: the second
+    /// bearer never arrives and this times out on the first one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hint_landing_mid_frame_does_not_lose_the_bearer() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let lease_id = 0xF4A3_u128;
+        let now_ms = crate::now_ms();
+        let (borrower_end, mut lender_end) = tokio::io::duplex(64 * 1024);
+        let (borrower_secret, borrower_public) =
+            crate::peer::noise::generate_static().expect("a borrower keypair");
+        let (lender_secret, lender_public) =
+            crate::peer::noise::generate_static().expect("a lender keypair");
+
+        let mut borrower_end = borrower_end;
+        let dialling = tokio::spawn(async move {
+            let session = crate::peer::noise::dial_handshake(
+                &mut borrower_end,
+                &borrower_secret,
+                crate::peer::noise::Handshake::Return,
+                Some(&lender_public),
+                None,
+            )
+            .await
+            .expect("the borrower dials");
+            (borrower_end, session)
+        });
+        let mut lender =
+            crate::peer::noise::accept_handshake(
+                &mut lender_end,
+                &lender_secret,
+                crate::peer::noise::Handshake::Return,
+                &[],
+                |offered| {
+                    let key: [u8; 32] = offered.try_into().map_err(|_| {
+                        crate::peer::noise::PinRefusal::Malformed { len: offered.len() }
+                    })?;
+                    Ok(PeerId(key))
+                },
+            )
+            .await
+            .expect("the lender accepts");
+        let (borrower_end, borrower_session) = dialling.await.expect("the dial finishes");
+
+        let lender_id = PeerId(borrower_public);
+        tokio::spawn(read_handed_bearers(
+            Box::new(borrower_end),
+            borrower_session,
+            live_lease(lease_id, now_ms),
+            lender_id,
+        ));
+
+        let handoff = |token: &str| Control::Handoff {
+            lease_id,
+            access_token: tcr_peer_wire::HandoffToken::new(token.to_string()),
+            expires_at_ms: now_ms + 300_000,
+            utilization: Some(0.30),
+        };
+        let held = |token: &str| {
+            handed_tokens()
+                .lock()
+                .expect("the handed-token store")
+                .bearer(lease_id, crate::now_ms())
+                == Some(token)
+        };
+        let wait_for = |token: String| async move {
+            for _ in 0..200 {
+                if held(&token) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        };
+
+        let first = serde_json::to_vec(&handoff("fake-first-bearer")).expect("it serializes");
+        crate::peer::noise::send_encrypted(&mut lender_end, &mut lender.transport, &first)
+            .await
+            .expect("the first handoff goes out whole");
+        assert!(
+            wait_for("fake-first-bearer".to_string()).await,
+            "the whole frame arrives, which is the control: without it the split frame below \
+             would prove nothing"
+        );
+
+        // The second frame, encrypted into a buffer so it can be handed over in
+        // two pieces with a cancellation between them.
+        let second = serde_json::to_vec(&handoff("fake-second-bearer")).expect("it serializes");
+        let mut framed: Vec<u8> = Vec::new();
+        crate::peer::noise::send_encrypted(&mut framed, &mut lender.transport, &second)
+            .await
+            .expect("the second handoff encrypts");
+        let split = 3;
+        lender_end
+            .write_all(&framed[..split])
+            .await
+            .expect("the first piece goes out");
+        lender_end.flush().await.expect("and is flushed");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // THE CANCELLATION: a hint on the biased arm while the read is parked
+        // part way through the frame above.
+        report_handed_spend(lease_id, Some(0.45));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        lender_end
+            .write_all(&framed[split..])
+            .await
+            .expect("the rest goes out");
+        lender_end.flush().await.expect("and is flushed");
+
+        assert!(
+            wait_for("fake-second-bearer".to_string()).await,
+            "the renewal that straddled the cancelled read must still reach the store; the \
+             bearer held is whatever the desynced stream left behind"
+        );
+    }
+
+    /// **A handoff with no baseline is refused, and the line names the Mac to
+    /// update.**
+    ///
+    /// The field is what a build older than this one leaves out. Storing the
+    /// bearer anyway would make every answer on that lease free, so it is
+    /// refused; the borrow falls back to the lender's own serve path, which is
+    /// a working borrow and not an outage, and the only thing an operator can
+    /// act on is which Mac to update.
+    ///
+    /// Watch it fail by returning `Ok(0.0)` for `None` in `handed_baseline`.
+    #[test]
+    fn a_handoff_without_a_baseline_is_refused_by_name() {
+        let lender = PeerId([9_u8; 32]);
+        let refused = handed_baseline(&lender, None).expect_err("no baseline is a refusal");
+        assert!(
+            refused.contains(&lender.display()),
+            "the refusal names the Mac whose build is behind, and it reads: {refused}"
+        );
+        assert!(
+            handed_baseline(&lender, Some(f64::NAN)).is_err(),
+            "a figure that is not a number is no baseline either"
+        );
+        assert_eq!(
+            handed_baseline(&lender, Some(0.30)).ok(),
+            Some(0.30),
+            "and a figure that is one is taken as it stands"
+        );
+    }
 }

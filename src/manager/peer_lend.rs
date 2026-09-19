@@ -87,7 +87,8 @@ impl crate::config::Account {
 }
 
 impl Manager {
-    /// The bearer a `hand`-mode grant hands over, and when it stops working.
+    /// The bearer a `hand`-mode grant hands over, when it stops working, and
+    /// the owner's own utilization on `window` at that instant.
     ///
     /// A grant may carry the owner's SHORT-LIVED access token to
     /// the borrower so the request leaves the borrower's own machine. This is
@@ -97,50 +98,120 @@ impl Manager {
     /// the `lentTo` line use, so a hand-mode grant can never reach an account a
     /// serve-mode grant of the same scope would not have picked.
     ///
-    /// # Three refusals, and each one is a `None` rather than a worse token
+    /// # It is the account [`Self::handable_fraction`] measured, and that is
+    /// not a coincidence
+    ///
+    /// Both answers come from one call to [`Self::lend_candidates`] and are
+    /// ranked by one function, [`LendCandidate::handable_room`]. A review found
+    /// the two disagreeing: this ranked by the least room across three windows
+    /// while `lendable_fraction`, which sized the lease, folded `max` over one
+    /// and excluded neither a held account nor a pinned one, so the token a
+    /// borrower was handed was routinely not the account the fraction had been
+    /// measured on, and a scope whose usable accounts were all held or pinned
+    /// funded a lease with no bearer at all. One candidate set and one ranking
+    /// is the fix, and `window` is now a parameter because the ranking needs
+    /// it: the doc here used to name one that did not exist.
+    ///
+    /// # Every refusal is a `None` rather than a worse token
     ///
     /// No account the scope covers, no account that is usable (disabled,
-    /// errored, or held out by a 429 right now), or an account with no expiry
-    /// recorded. The last is deliberate: a bearer handed over with no deadline
-    /// is one the borrower would use until upstream 401s, and the frame's
-    /// whole contract is that the borrower knows when to stop.
-    ///
-    /// # WHICH account, and why it is not the first one
-    ///
-    /// This used to answer the first in-scope account in vector order, a
-    /// [`AccountStatus::Throttled`] one included. Two things were wrong with
-    /// that. A throttled account's bearer is a token the borrower cannot spend:
-    /// every request on it comes back 429 until the hold expires, and the
-    /// borrower cannot see the hold because the hold lives here. And vector
-    /// order is not the lease's order: the fraction was cut out of
-    /// [`Self::lendable_fraction`], which is the BEST single account's
-    /// headroom, so handing over the first account's token hands over a
-    /// different account from the one that funded the lease.
-    ///
-    /// So a held account is skipped and the one with the most room on `window`
-    /// is picked, the same reduction `lendable_fraction` folds with `max`. That
-    /// is what makes the token a borrower is handed the token of the account
-    /// the grant was measured on.
-    ///
-    /// The room is the LEAST this account has on any window it has measured,
-    /// not the room on one of them. A handed bearer leaves this Mac and serves
-    /// whatever the borrower sends for as long as it lives, so it touches
-    /// every window; an account with room on the 5-hour window and none on the
-    /// 7-day one is one 429 away for the borrower, who cannot see either
-    /// figure.
+    /// errored, or held out by a 429 right now), an account whose bearer an
+    /// exit lock forbids handing over, an account with no expiry recorded, and
+    /// an account whose `window` this Mac has never measured. The last two are
+    /// deliberate. A bearer handed over with no deadline is one the borrower
+    /// would use until upstream 401s, and the frame's whole contract is that
+    /// the borrower knows when to stop; a bearer handed over with no measured
+    /// utilization is one whose spend the borrower cannot report, because the
+    /// hint it sends back is a RISE and a rise needs the baseline this figure
+    /// is ([`crate::peer::lease::usage_hint`]).
     ///
     /// **The refresh token is never read here and never leaves this Mac.** That
     /// is the difference between lending an account for a while and giving it
     /// away, and it is why revocation is "stop renewing".
-    pub fn handoff_bearer(&self, scope: &tcr_peer_wire::LendScope) -> Option<(String, i64)> {
-        // Hot-reloaded for the same reason `lendable_fraction` reloads: a lease
-        // scoped to a group follows the group.
+    pub fn handoff_bearer(
+        &self,
+        scope: &tcr_peer_wire::LendScope,
+        window: tcr_peer_wire::Window,
+    ) -> Option<HandedCredential> {
+        let now = OffsetDateTime::now_utc();
+        Self::best_handable(self.lend_candidates(scope, window, now))
+            .and_then(LendCandidate::into_credential)
+    }
+
+    /// What a `hand`-mode lease on `scope` and `window` may be sized at: the
+    /// room on the one account whose bearer could actually go out, and `0.0`
+    /// when there is none.
+    ///
+    /// The figure and the token are the same account's, because this and
+    /// [`Self::handoff_bearer`] fold the same list with the same key. That is
+    /// what makes "a lease is funded only if a bearer exists" true by
+    /// construction rather than by a second check somebody has to remember.
+    ///
+    /// The room is the LEAST this account has on any window it has measured,
+    /// not the room on `window` alone. A handed bearer leaves this Mac and
+    /// serves whatever the borrower sends for as long as it lives, so it
+    /// touches every window; an account with room on the 5-hour window and none
+    /// on the 7-day one is one 429 away for a borrower who cannot see either
+    /// figure.
+    pub fn handable_fraction(
+        &self,
+        scope: &tcr_peer_wire::LendScope,
+        window: tcr_peer_wire::Window,
+        now: OffsetDateTime,
+    ) -> f64 {
+        Self::best_handable(self.lend_candidates(scope, window, now))
+            .map_or(0.0, |candidate| candidate.handable_room())
+    }
+
+    /// The one ranking a hand-mode lease is measured and picked by.
+    ///
+    /// `reduce` and a strict `>` rather than `max_by`, so a tie keeps the
+    /// EARLIER account: with nothing measured every candidate has the same
+    /// room, and the answer is then the vector order this module has always
+    /// had rather than its reverse.
+    fn best_handable(candidates: Vec<LendCandidate>) -> Option<LendCandidate> {
+        candidates
+            .into_iter()
+            .filter(LendCandidate::may_be_handed)
+            .reduce(|best, candidate| {
+                if candidate.handable_room() > best.handable_room() {
+                    candidate
+                } else {
+                    best
+                }
+            })
+    }
+
+    /// Every account this Mac could lend on for `scope`, with the facts both
+    /// the sizing and the bearer question need, read once.
+    ///
+    /// # One set, two questions
+    ///
+    /// The eligibility a lease of ANY mode needs is here and nowhere else: not
+    /// disabled, not [`AccountStatus::Error`], and covered by the scope. What
+    /// separates the two modes is then a property of the candidate, never a
+    /// second filter written out twice: [`LendCandidate::bearer`] is present
+    /// only for an account whose token may leave this Mac right now.
+    ///
+    /// A [`AccountStatus::Throttled`] account is still a candidate, because a
+    /// hold is a timer and a lease outlives it, so counting it keeps the
+    /// advertised serve figure from flapping; it simply carries no bearer,
+    /// because a token the borrower would meet a 429 on for a hold it cannot
+    /// see is not a token to hand over.
+    ///
+    /// The exit locks are collected under the config lock and out of it again
+    /// before the accounts lock is taken, so this holds one lock at a time and
+    /// can be no half of a deadlock, whatever order any other reader takes them
+    /// in. It is the order this module already had.
+    fn lend_candidates(
+        &self,
+        scope: &tcr_peer_wire::LendScope,
+        window: tcr_peer_wire::Window,
+        now: OffsetDateTime,
+    ) -> Vec<LendCandidate> {
+        // Hot-reloaded for the same reason the whole of this module reloads: a
+        // lease scoped to a group follows the group.
         self.reload_groups_if_changed();
-        // The exit locks first, collected under the config lock and out of it
-        // again before the accounts lock is taken: this function then holds one
-        // lock at a time and can be no half of a deadlock, whatever order any
-        // other reader takes them in.
-        //
         // By index, which is the pairing `Manager::account_egress` and
         // `Manager::access_token` already rest on: the config vector and the
         // runtime vector are appended to together and never reordered.
@@ -152,51 +223,35 @@ impl Manager {
             .iter()
             .map(crate::config::Account::egress_pin)
             .collect();
-        let now = OffsetDateTime::now_utc();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         accounts
             .iter()
             .enumerate()
             .filter(|(_, account)| !account.disabled && account.status != AccountStatus::Error)
-            // A HELD ACCOUNT IS NOT A LENDABLE BEARER. `lendable_fraction`
-            // deliberately counts a throttled account, a hold is a timer and a
-            // lease outlives it, so excluding it there would make the
-            // advertised figure flap. Here the question is the other one:
-            // which token can the borrower spend NOW. It cannot spend this
-            // one, and it cannot see the hold either, because the hold is
-            // recorded on this Mac.
-            .filter(|(_, account)| account.status != AccountStatus::Throttled)
-            // **A strictly pinned account is never handed over**, and this is
-            // the fourth refusal the review's M4 added. An exit lock is the
-            // operator saying this account's requests leave from ONE address
-            // because the address is load-bearing, an allow-listed office IP or
-            // a session an origin ties to one address. A hand-mode grant sends
-            // from the BORROWER's machine, so handing over a pinned account's
-            // bearer breaks the pin on every request, silently, on a Mac this
-            // one cannot see.
-            //
-            // Every strict pin, not only `via <other Mac>`: `strict` with a
-            // local egress is the same sentence ("out of this Mac and nowhere
-            // else"), and a handoff breaks that one too. A non-strict pin is a
-            // preference its own doc says may fall back, so it is lent like any
-            // other account and the lease's log line says which Mac served it.
-            .filter(|(index, _)| crate::config::EgressPin::may_be_handed(&pins, *index))
             .filter(|(_, account)| {
+                // An account whose own name is not a label (an email, a uuid)
+                // can never be NAMED in a scope, because a scope is written to
+                // a file and printed by a CLI in a public repository. It is
+                // still lendable under `All` and under a group it belongs to:
+                // what it cannot be is picked out by name. `scope_covers` is the
+                // one answer to this question, shared with the picker
+                // restriction and with the `lentTo` line, so a scope cannot
+                // mean one set of accounts here and another when the request
+                // arrives.
                 let label = tcr_peer_wire::sanitize_label(&account.name).unwrap_or_default();
                 crate::peer::lease::scope_covers(scope, &label, &account.groups)
             })
-            .filter_map(|(_, account)| {
-                let expires_at_ms = account.expires_at_ms?;
+            .map(|(index, account)| {
                 let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
                 let guard =
                     super::select::effective_threshold(threshold, self.control_reserve, true);
-                // The same subtraction `lendable_fraction` folds, so the
-                // account picked here is the account that figure was measured
-                // on. An unmeasured window is 0.0 room rather than skipped: a
-                // fleet nobody has probed still has to be able to hand a
-                // bearer over, and every candidate is then equal, which leaves
-                // vector order as the tie-break it always was.
-                let room = [
+                let utilization = window_utilization(&account.quota, window, now);
+                let room = utilization.map_or(0.0, |utilization| (guard - utilization).max(0.0));
+                // An account with no measured window at all is neither the
+                // best nor the worst candidate: it is unknown, and `0.0` says
+                // so in the one direction that cannot hand a borrower a token
+                // this Mac has evidence against.
+                let room_anywhere = [
                     tcr_peer_wire::Window::FiveHour,
                     tcr_peer_wire::Window::SevenDay,
                     tcr_peer_wire::Window::SevenDayOi,
@@ -205,25 +260,43 @@ impl Manager {
                 .filter_map(|window| window_utilization(&account.quota, window, now))
                 .map(|utilization| (guard - utilization).max(0.0))
                 .fold(f64::INFINITY, f64::min);
-                // An account with no measured window at all is neither the
-                // best nor the worst candidate: it is unknown, and `0.0` says
-                // so in the one direction that cannot hand a borrower a token
-                // this Mac has evidence against.
-                let room = if room.is_finite() { room } else { 0.0 };
-                Some((account.access_token.clone(), expires_at_ms, room))
-            })
-            // `reduce` and a strict `>` rather than `max_by`, so a tie keeps
-            // the EARLIER account: with nothing measured every candidate has
-            // the same room, and the answer is then the vector order this
-            // function has always had rather than its reverse.
-            .reduce(|best, candidate| {
-                if candidate.2 > best.2 {
-                    candidate
+                let room_anywhere = if room_anywhere.is_finite() {
+                    room_anywhere
                 } else {
-                    best
+                    0.0
+                };
+                // **A HELD ACCOUNT IS NOT A LENDABLE BEARER**, and neither is a
+                // strictly pinned one. An exit lock is the operator saying this
+                // account's requests leave from ONE address because the address
+                // is load-bearing, an allow-listed office IP or a session an
+                // origin ties to one address. A hand-mode grant sends from the
+                // BORROWER's machine, so handing over a pinned account's bearer
+                // breaks the pin on every request, silently, on a Mac this one
+                // cannot see. Every strict pin, not only `via <other Mac>`:
+                // `strict` with a local egress is the same sentence, and a
+                // handoff breaks that one too. A non-strict pin is a preference
+                // its own doc says may fall back, so it is lent like any other
+                // account.
+                let handable = account.status != AccountStatus::Throttled
+                    && crate::config::EgressPin::may_be_handed(&pins, index);
+                let bearer = handable
+                    .then(|| {
+                        account
+                            .expires_at_ms
+                            .map(|at| (account.access_token.clone(), at))
+                    })
+                    .flatten()
+                    // No measured utilization is no baseline, and no baseline
+                    // is a borrow the owner could never charge. See this
+                    // method's own doc.
+                    .zip(utilization);
+                LendCandidate {
+                    room,
+                    room_anywhere,
+                    bearer,
                 }
             })
-            .map(|(token, expires_at_ms, _)| (token, expires_at_ms))
+            .collect()
     }
 
     /// How much of one window this node may lend right now, as a fraction,
@@ -299,39 +372,15 @@ impl Manager {
         window: tcr_peer_wire::Window,
         now: OffsetDateTime,
     ) -> f64 {
-        // Group membership is what a `LendScope::Group` is resolved against,
-        // and it hot-reloads, so it is re-read here rather than trusted from
-        // whenever the lease was minted. A lease scoped to `work` follows the
-        // group when an account joins or leaves it, which is the behaviour
-        // asked for ("the existing `tcr group` groups, hot-reloaded
-        // like today").
-        self.reload_groups_if_changed();
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
-        accounts
-            .iter()
-            .filter(|account| !account.disabled && account.status != AccountStatus::Error)
-            .filter(|account| {
-                // An account whose own name is not a label (an email, a uuid)
-                // can never be NAMED in a scope, because a scope is written to
-                // a file and printed by a CLI in a public repository. It is
-                // still lendable under `All` and under a group it belongs to:
-                // what it cannot be is picked out by name. `scope_covers` is the
-                // one answer to this question, shared with the picker
-                // restriction and with the `lentTo` line, so a scope cannot
-                // mean one set of accounts here and another when the request
-                // arrives.
-                let label = tcr_peer_wire::sanitize_label(&account.name).unwrap_or_default();
-                crate::peer::lease::scope_covers(scope, &label, &account.groups)
-            })
-            .map(|account| {
-                let Some(utilization) = window_utilization(&account.quota, window, now) else {
-                    return 0.0;
-                };
-                let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
-                let guard =
-                    super::select::effective_threshold(threshold, self.control_reserve, true);
-                (guard - utilization).max(0.0)
-            })
+        // The SAME candidate set a hand grant's bearer comes out of, so the
+        // two answers about one scope can never be measured over two different
+        // sets of accounts. What differs is only the fold: this is the best
+        // single account's room on the window asked about, held and pinned
+        // accounts included, because a serve-mode relay leaves from THIS Mac
+        // and meets neither restriction.
+        self.lend_candidates(scope, window, now)
+            .into_iter()
+            .map(|candidate| candidate.room)
             .fold(0.0f64, f64::max)
     }
 
@@ -364,6 +413,70 @@ impl Manager {
             .map(|account| window_utilization(&account.quota, window, now))
             .collect()
     }
+}
+
+/// One account this Mac could lend on, read once and answered from twice.
+///
+/// It exists so that "how much may be lent" and "whose token goes out" cannot
+/// be measured over two different sets of accounts, which is what they were:
+/// see [`Manager::handoff_bearer`]'s own doc for the review finding.
+struct LendCandidate {
+    /// Room on the window asked about, after the guard band, `0.0` for a window
+    /// this Mac has never measured.
+    room: f64,
+    /// The LEAST room this account has on any window it has measured, which is
+    /// what a bearer that leaves this Mac actually meets. `0.0` when nothing at
+    /// all is measured.
+    room_anywhere: f64,
+    /// The credential and the owner's own utilization on the asked window, for
+    /// an account whose bearer may be handed over right now and `None` for
+    /// every account that fails one of the refusals in
+    /// [`Manager::handoff_bearer`]'s doc.
+    bearer: Option<((String, i64), f64)>,
+}
+
+impl LendCandidate {
+    /// The one figure a hand-mode lease is both sized by and picked by.
+    fn handable_room(&self) -> f64 {
+        self.room.min(self.room_anywhere)
+    }
+
+    /// Whether this account's bearer could go out at all.
+    fn may_be_handed(&self) -> bool {
+        self.bearer.is_some()
+    }
+
+    /// The frame's half of this candidate, or `None` for one that carries no
+    /// bearer.
+    fn into_credential(self) -> Option<HandedCredential> {
+        self.bearer.map(
+            |((access_token, expires_at_ms), utilization)| HandedCredential {
+                access_token,
+                expires_at_ms,
+                utilization,
+            },
+        )
+    }
+}
+
+/// Everything one `Control::Handoff` frame carries, chosen together.
+///
+/// The three travel as one value because they are one account's facts at one
+/// instant: a bearer paired with another account's expiry is a borrow that dies
+/// early, and a bearer paired with another account's utilization is a lease
+/// charged for somebody else's window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandedCredential {
+    /// The owner's short-lived access token. Never the refresh token.
+    pub access_token: String,
+    /// When that token stops working, absolute, so the borrower can stop using
+    /// it without waiting for a 401.
+    pub expires_at_ms: i64,
+    /// The owner's own utilization on the lease's window at this instant, the
+    /// baseline the borrower measures its rises against. Raw, with no guard
+    /// band applied: it is compared against what the borrower reads off its own
+    /// answers' rate-limit headers, which is the same raw figure.
+    pub utilization: f64,
 }
 
 /// The lender's own fleet is what a relayed request is charged against.
@@ -436,6 +549,22 @@ impl crate::peer::serve::WindowUtilization for Manager {
             return None;
         }
         Some(self.lendable_fraction(scope, window, now))
+    }
+
+    /// The same question for a `hand` grant, answered over the accounts whose
+    /// bearer can actually leave this Mac.
+    ///
+    /// `Some` always, and `Some(0.0)` is the load-bearing answer: it says this
+    /// fleet CAN tell hand mode from serve mode and has no bearer to hand over,
+    /// which is what makes `Ledger::grant` refuse rather than mint a funded
+    /// lease nothing can spend. The trait's default `None` is the other fact,
+    /// "this reader cannot answer", and the two must not be conflated.
+    fn lendable_by_hand(
+        &self,
+        scope: &tcr_peer_wire::LendScope,
+        window: tcr_peer_wire::Window,
+    ) -> Option<f64> {
+        Some(self.handable_fraction(scope, window, OffsetDateTime::now_utc()))
     }
 
     /// The picker restriction, answered against THIS fleet.

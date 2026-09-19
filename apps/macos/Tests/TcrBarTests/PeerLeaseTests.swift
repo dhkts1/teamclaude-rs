@@ -50,6 +50,54 @@ final class PeerLeaseTests: XCTestCase {
         XCTAssertNil(LendScope.parse(""))
     }
 
+    /// **A `scope` object this build cannot name decodes to `.unknown`,
+    /// never `.all`.**
+    ///
+    /// `PeerLendGrant`'s decoder used to fold "the key is absent" and "the
+    /// key is present but this build cannot parse it" into the same `nil`
+    /// through `(try? …) ?? .all`, so a grant narrowed to one group or
+    /// account, on a build that could not yet read a future scope shape,
+    /// silently read as `All accounts`, the one wrong answer here, because
+    /// widening is worse than an honest "cannot read this".
+    ///
+    /// Watched red: put the old `(try? c.decodeIfPresent(LendScope.self,
+    /// forKey: .scope)) ?? .all` back in `PeerLendGrant.init(from:)` and
+    /// `decoded.scope` below reads `.all`.
+    func testAnUnparseableScopeObjectDecodesAsUnknownNeverAll() throws {
+        let json = """
+            {"id":"ls-1","scope":{"tenant":"acme"},"window":"7d","fraction":0.2}
+            """
+        let decoded = try JSONDecoder().decode(PeerLendGrant.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.scope, .unknown)
+        XCTAssertNotEqual(
+            decoded.scope, .all,
+            "a scope this build cannot parse must never read as every account")
+    }
+
+    /// An ABSENT `scope` key is still `.all`, the documented default a real
+    /// producer means by omitting it. `.unknown` is only for a key that IS
+    /// there and does not parse.
+    func testAnAbsentScopeKeyIsStillAll() throws {
+        let json = """
+            {"id":"ls-1","window":"7d","fraction":0.2}
+            """
+        let decoded = try JSONDecoder().decode(PeerLendGrant.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.scope, .all)
+    }
+
+    /// **A draft holding `.unknown` refuses to save**, the same gate an
+    /// unknown window already has: saving it would send SOME `--scope`
+    /// value, and every value this build could put on argv for a scope it
+    /// never actually read is either wrong or a guess.
+    func testADraftWithAnUnknownScopeRefusesToSave() throws {
+        let json = """
+            {"id":"ls-1","scope":{"tenant":"acme"},"window":"7d","fraction":0.2}
+            """
+        let decoded = try JSONDecoder().decode(PeerLendGrant.self, from: Data(json.utf8))
+        let draft = LeaseDraft(editing: decoded, peer: "studio-mac")
+        XCTAssertNotNil(draft.refusal(now: Date()))
+    }
+
     // MARK: - Argv
 
     func testLendArgvIsTheMockupsOwnLedgerLine() {

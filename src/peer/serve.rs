@@ -427,6 +427,24 @@ pub trait WindowUtilization: Send + Sync {
     fn lendable(&self, _scope: &tcr_peer_wire::LendScope, _window: Window) -> Option<f64> {
         None
     }
+
+    /// The same figure for a `hand` grant: what may be lent out of the accounts
+    /// whose BEARER can leave this Mac, which is a different set from the one
+    /// above and often a smaller one.
+    ///
+    /// A hand lease is spent on the borrower's Mac with a token this one hands
+    /// over, so a figure measured on an account that cannot be handed over
+    /// funds a lease no bearer backs. `Ledger::grant` clamps a hand grant by
+    /// this as well, which is what makes "funded only if a bearer exists" hold.
+    ///
+    /// **`None` is "this reader cannot answer" and leaves the clamp off**, the
+    /// same direction [`Self::lendable`] takes and for the same reason: a
+    /// reader with no fleet behind it (every test one, and
+    /// [`NoFleetUtilization`]) would otherwise refuse every hand lease. The
+    /// production answer is `Manager`'s and is never `None`.
+    fn lendable_by_hand(&self, _scope: &tcr_peer_wire::LendScope, _window: Window) -> Option<f64> {
+        None
+    }
 }
 
 /// How the lender's own proxy can be made to pick inside a lease's scope.
@@ -510,16 +528,48 @@ impl WindowUtilization for NoFleetUtilization {
     }
 }
 
-/// How much request or response body fits in one frame.
+/// How much body fits in ONE frame, which is now a chunk size and no longer a
+/// ceiling on a body.
 ///
 /// [`MAX_FRAME_BYTES`] is the whole frame a `u16` prefix can describe, and a
-/// Noise transport message pays a 16-byte authentication tag inside it. So this
-/// is the ceiling on ONE body frame, and it is small: a relayed request over it
-/// is REFUSED with the two numbers named, never truncated and never split
-/// silently. Chunking is a real piece of work (a sequence number, an end
-/// marker, and a debit that survives a half-delivered body) and inventing half
-/// of it here would be the worst of the three options.
+/// Noise transport message pays a 16-byte authentication tag inside it.
+///
+/// It used to be the ceiling on a whole body, and that was the defect: every
+/// borrowed answer over 64 KiB, which any long completion is and which Claude
+/// Code's streaming answers always are, was bought on the lender's account,
+/// debited, and handed back as a 502 with no content. A body now travels as a
+/// run of frames this size terminated by an empty one ([`send_body`],
+/// [`recv_body`]), so the size a body may be is [`MAX_RELAYED_BODY_BYTES`] and
+/// this is only how much of it one frame carries.
 pub const MAX_BODY_BYTES: usize = MAX_FRAME_BYTES - 16;
+
+/// The ceiling on a whole relayed body, request or answer, across every frame
+/// it takes.
+///
+/// A bound is still needed, because the frames arrive before anything has said
+/// how many there will be and a peer that keeps sending them would otherwise
+/// grow this process's memory without limit. It is the size of a very large
+/// completion rather than the size of one frame, and a body over it is refused
+/// by name with both numbers.
+pub const MAX_RELAYED_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The SERVE stream's own flow version, which is NOT [`PROTO_VERSION`].
+///
+/// The two answer different questions and move on different clocks:
+/// [`PROTO_VERSION`] is what a node advertises in discovery and records at
+/// pairing, and bumping it to describe a change to one stream would re-date
+/// every pinned row on the mesh. This is the order of frames on a SERVE stream
+/// and nothing else.
+///
+/// **1 is the flow with no ack**: header, request, body, reply. **2 is this
+/// one**: header, request, [`ServeAck`], body, reply. The difference is not
+/// cosmetic and cannot be negotiated silently, a borrower that writes the body
+/// before the ack has already made its request unrepeatable, which is the whole
+/// defect the ack exists to fix. So a lender REFUSES any other flow by name
+/// (see [`handle_serve_on`]) rather than guessing at the order, and a borrower
+/// that reads a closed stream where the ack should be says the same thing in
+/// its log.
+pub const SERVE_FLOW: u16 = 2;
 
 /// The metadata frame of a relayed request. **The body is not in it**, it
 /// travels as the next frame, raw, because a `Vec<u8>` through JSON is three to
@@ -540,18 +590,50 @@ pub struct ServeRequest {
     /// Header names and values, **after the borrower's scrub**. Pairs rather
     /// than a map because a request may legitimately repeat a name.
     pub headers: Vec<(String, String)>,
-    /// How many bytes the body frame that follows this one carries.
+    /// How many bytes the body frames that follow this one carry in total.
     pub body_bytes: usize,
     /// The wire version the borrower speaks, so a lender can refuse a frame it
     /// would have to guess at.
     pub proto: u16,
+    /// The order of frames the borrower is going to use. See [`SERVE_FLOW`].
+    ///
+    /// `#[serde(default)]` so a frame from a build written before this field
+    /// existed parses and reads 0, which is what lets the lender refuse it BY
+    /// NAME with both numbers rather than fail to deserialize and close with a
+    /// message about JSON. 0 is never a flow this build speaks.
+    #[serde(default)]
+    pub flow: u16,
+}
+
+/// The lender's answer to "may I send you this request", and the frame that
+/// makes a borrowed request repeatable until it is sent.
+///
+/// It sits between the request frame and the body, and it is the ONLY thing
+/// that moves a borrow from "nothing has left this Mac" to "this may already
+/// have run". Before it existed the borrower wrote the body first, so a lender
+/// that refused at its header gate, or at any of `handle_serve_on`'s own gates,
+/// produced a no-retry 502 telling the client its request may have been billed
+/// when nothing had been sent anywhere.
+///
+/// A lender writes it once its gates have passed and BEFORE it sends anything
+/// upstream. A stream that closes, or goes quiet, where this frame belongs is a
+/// lender that took nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServeAck {
+    /// Send the body. This lender has taken the request.
+    Accepted,
+    /// Refused before the body, in the lease vocabulary the borrower already
+    /// reads. Nothing crossed, so the next lender may be asked.
+    Refused { refusal: LeaseRefusal },
 }
 
 /// The lender's answer to one relayed request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServeReply {
-    /// Served on the lender's own account. The body follows as the next frame.
+    /// Served on the lender's own account. The body follows as a run of frames
+    /// terminated by an empty one, and `body_bytes` is what they add up to.
     Served {
         status: u16,
         headers: Vec<(String, String)>,
@@ -560,6 +642,12 @@ pub enum ServeReply {
     /// Refused, in the lease vocabulary the borrower already reads.
     /// [`LeaseRefusal::InFlightFull`] is the one that means "retry in a moment"
     /// rather than "stop asking".
+    ///
+    /// Every refusal a lender decides BEFORE the body is a [`ServeAck`] now.
+    /// What is left here is the one that can only be known after it: a body
+    /// whose length does not match what the request frame promised, which the
+    /// lender refuses without sending anything upstream, so it is still "not
+    /// this lender" and still provably unrun.
     Refused { refusal: LeaseRefusal },
 }
 
@@ -597,12 +685,18 @@ pub fn serve_request_from(
             ask.method
         );
     }
-    if ask.body.len() > MAX_BODY_BYTES {
+    // The whole body, not one frame of it: a body is chunked over as many
+    // frames as it takes ([`send_body`]), so what is refused here is a request
+    // larger than this stream carries at all rather than one larger than a
+    // `u16` prefix. A real request over the old one-frame cap was a routine
+    // shape, and refusing it meant the mesh declined exactly the long
+    // conversations it was built for.
+    if ask.body.len() > MAX_RELAYED_BODY_BYTES {
         bail!(
-            "peer serve: this request's body is {} bytes and one frame carries {}; refused \
-             rather than truncated or silently split",
+            "peer serve: this request's body is {} bytes and a relayed request carries {}; \
+             refused rather than truncated",
             ask.body.len(),
-            MAX_BODY_BYTES
+            MAX_RELAYED_BODY_BYTES
         );
     }
 
@@ -639,7 +733,52 @@ pub fn serve_request_from(
         headers,
         body_bytes: ask.body.len(),
         proto: PROTO_VERSION,
+        flow: SERVE_FLOW,
     })
+}
+
+/// Write a body as a run of frames terminated by an empty one.
+///
+/// **The terminator is what makes this readable at all.** The reader cannot
+/// count frames, the count is not on the wire ahead of them, and it must not
+/// trust the byte total in the request or reply frame either: that figure is a
+/// promise the sender makes and the reader CHECKS, so using it to decide when
+/// to stop reading would make it unfalsifiable. An empty frame is a frame, it
+/// costs a 16-byte tag, and a body of zero bytes is exactly the terminator on
+/// its own.
+async fn send_body<S>(stream: &mut S, session: &mut noise::PeerSession, body: &[u8]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    for chunk in body.chunks(MAX_BODY_BYTES) {
+        noise::send_encrypted(stream, &mut session.transport, chunk).await?;
+    }
+    noise::send_encrypted(stream, &mut session.transport, &[]).await
+}
+
+/// Read a body written by [`send_body`].
+///
+/// Bounded by [`MAX_RELAYED_BODY_BYTES`] as it goes rather than at the end: a
+/// peer that keeps sending frames is refused when it crosses the bound, not
+/// after this process has already held the bytes.
+async fn recv_body<S>(stream: &mut S, session: &mut noise::PeerSession) -> Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut body = Vec::new();
+    loop {
+        let frame = noise::recv_encrypted(stream, &mut session.transport).await?;
+        if frame.is_empty() {
+            return Ok(body);
+        }
+        if body.len() + frame.len() > MAX_RELAYED_BODY_BYTES {
+            bail!(
+                "peer serve: this body is past {MAX_RELAYED_BODY_BYTES} bytes and is still \
+                 arriving; refused rather than held"
+            );
+        }
+        body.extend_from_slice(&frame);
+    }
 }
 
 /// Open one SERVE to a lender and return its answer.
@@ -881,7 +1020,44 @@ async fn borrow_once(
     };
     send_json(&mut stream, &mut session, &header).await?;
     send_json(&mut stream, &mut session, &request).await?;
-    noise::send_encrypted(&mut stream, &mut session.transport, &ask.body).await?;
+
+    // THE ACK, AND WHY THE BODY WAITS FOR IT. Every refusal on the lender's
+    // half happens after it has read this request frame: its header gate, its
+    // path, method, version and request-id gates, and its lease. All of them
+    // close the stream without an answer. A borrower that had already written
+    // the body could not tell any of them from a lender that took the request
+    // and died with it, so it told its client the request may have been billed
+    // and skipped every remaining lender, over a request nothing had sent
+    // anywhere. See [`ServeAck`].
+    let ack: ServeAck = match recv_json(&mut stream, &mut session).await {
+        Ok(ack) => ack,
+        Err(err) => {
+            // NOT an `Err` out of this function: "this lender answered nothing"
+            // is a fact about the lender, and the body is still here. A build
+            // older than [`SERVE_FLOW`] reads exactly like this, because it is
+            // waiting for a body frame this one will not send until it has been
+            // acknowledged, so the version is named here rather than guessed
+            // at.
+            tracing::debug!(
+                peer = %lender.display(),
+                error = %err,
+                flow = SERVE_FLOW,
+                "peer serve: the lender did not acknowledge taking this request, so it has \
+                 none of it; a lender that speaks an older SERVE flow reads the same way"
+            );
+            return Ok(Borrowed::NotThisLender);
+        }
+    };
+    if let ServeAck::Refused { refusal } = ack {
+        tracing::info!(
+            peer = %lender.display(),
+            refusal = ?refusal,
+            "peer serve: the lender refused this relayed request before its body was sent"
+        );
+        return Ok(Borrowed::NotThisLender);
+    }
+
+    send_body(&mut stream, &mut session, &ask.body).await?;
     // THE LINE THAT MAKES THIS REQUEST UNREPEATABLE. Everything above can fail
     // with nothing having left this Mac; from here on the lender holds the
     // body and may already have put it on its own account, so no later failure
@@ -908,7 +1084,7 @@ async fn borrow_once(
             headers,
             body_bytes,
         } => {
-            let body = noise::recv_encrypted(&mut stream, &mut session.transport).await?;
+            let body = recv_body(&mut stream, &mut session).await?;
             if body.len() != body_bytes {
                 bail!(
                     "peer serve: the lender promised {body_bytes} body bytes and sent {}",
@@ -1025,7 +1201,6 @@ where
     handle_serve(&session.peer, store).await?;
 
     let request: ServeRequest = recv_json(stream, session).await?;
-    let body = noise::recv_encrypted(stream, &mut session.transport).await?;
 
     if request.proto != PROTO_VERSION {
         bail!(
@@ -1034,11 +1209,19 @@ where
             PROTO_VERSION
         );
     }
-    if body.len() != request.body_bytes {
+    // THE FLOW, REFUSED BY NAME AND NEVER GUESSED AT. A borrower older than
+    // [`SERVE_FLOW`] writes its body immediately after this frame and waits for
+    // a reply, so serving it would mean reading a body nobody acknowledged and
+    // leaving that borrower to call every outcome "may have been billed". The
+    // missing field reads 0, which is not a flow, and both numbers are in the
+    // line so an operator knows which Mac to upgrade.
+    if request.flow != SERVE_FLOW {
         bail!(
-            "peer serve: the borrower promised {} body bytes and sent {}",
-            request.body_bytes,
-            body.len()
+            "peer serve: {} speaks SERVE flow {} and this build speaks {SERVE_FLOW}; refused \
+             rather than served, because the two disagree about when the body is written \
+             (upgrade tcr on that Mac)",
+            session.peer.display(),
+            request.flow
         );
     }
     // THE BACKSTOP, not the enforcement point: the borrower refuses these paths
@@ -1108,10 +1291,13 @@ where
         held.enter_relay(request.lease_id, &session.peer, request.request_id, now_ms)
     };
     if let Err(refusal) = entered {
-        let reply = ServeReply::Refused {
+        // A [`ServeAck`] and no longer a [`ServeReply`]: this is decided before
+        // the body has been asked for, so the borrower still holds it and the
+        // next lender may be asked. Same word on the wire, one frame earlier.
+        let ack = ServeAck::Refused {
             refusal: refusal.to_wire(),
         };
-        send_json(stream, session, &reply).await?;
+        send_json(stream, session, &ack).await?;
         return Ok(());
     }
 
@@ -1136,13 +1322,51 @@ where
         send_json(
             stream,
             session,
-            &ServeReply::Refused {
+            &ServeAck::Refused {
                 refusal: LeaseRefusal::Unsupported,
             },
         )
         .await?;
         return Ok(());
     }
+
+    // THE ACK: every gate this build has is past, and nothing has been sent
+    // upstream. From here on a failure really is "this may have run", which is
+    // exactly the fact the borrower needs and could not have before this frame
+    // existed. It is written BEFORE the body is asked for, so a borrower whose
+    // request was refused above still holds its body and its next lender.
+    send_json(stream, session, &ServeAck::Accepted).await?;
+
+    let body = match recv_body(stream, session).await {
+        Ok(body) if body.len() == request.body_bytes => body,
+        // A body that does not match the promise, or that stopped arriving.
+        // The slot `enter_relay` took is released the way every other refusal
+        // on this path releases it, and the borrower is told: nothing has been
+        // sent upstream, so this is still "not this lender" rather than an
+        // outcome it has to treat as unknown.
+        outcome => {
+            {
+                let mut held = ledger.lock().map_err(|_| anyhow!("ledger lock poisoned"))?;
+                held.leave_relay(request.lease_id);
+            }
+            tracing::warn!(
+                peer = %session.peer.display(),
+                promised = request.body_bytes,
+                sent = outcome.as_ref().map(Vec::len).unwrap_or_default(),
+                "peer serve: the borrower's body is not the body its frame promised, so \
+                 nothing was sent upstream"
+            );
+            send_json(
+                stream,
+                session,
+                &ServeReply::Refused {
+                    refusal: LeaseRefusal::Unsupported,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     // The owner's own utilization on this lease's window, before this node
     // makes the request on its own account. Read OUTSIDE the ledger lock: the
@@ -1243,7 +1467,7 @@ where
         },
     )
     .await?;
-    noise::send_encrypted(stream, &mut session.transport, &reply.body).await?;
+    send_body(stream, session, &reply.body).await?;
     Ok(())
 }
 
@@ -1412,15 +1636,21 @@ async fn serve_on_own_account(
             ));
         }
     };
-    if body.len() > MAX_BODY_BYTES {
+    // AN ANSWER OVER ONE FRAME IS CARRIED, NOT REFUSED. This used to return a
+    // 502 for any body over `MAX_BODY_BYTES`, which is 65 519 bytes and
+    // therefore any long completion: the lender's account bought the answer,
+    // the lease was debited for it, and the borrower got an error with no
+    // content. The reply is chunked over as many frames as it takes now
+    // ([`send_body`]), and the only bound left is the one on a whole body.
+    if body.len() > MAX_RELAYED_BODY_BYTES {
         tracing::warn!(
             bytes = body.len(),
-            cap = MAX_BODY_BYTES,
-            "peer serve: the answer is larger than one frame carries; the lease is \
+            cap = MAX_RELAYED_BODY_BYTES,
+            "peer serve: the answer is larger than a relayed body may be; the lease is \
              charged what was measured and the borrower is told rather than left waiting"
         );
         return Ok(undeliverable_answer(&format!(
-            "the answer is {} bytes and one relayed frame carries {MAX_BODY_BYTES}",
+            "the answer is {} bytes and a relayed answer carries {MAX_RELAYED_BODY_BYTES}",
             body.len()
         )));
     }
@@ -1439,6 +1669,17 @@ async fn serve_on_own_account(
 /// killed the stream, which sent the borrower to the next lender with the same
 /// body. A borrower that reads this knows its request was served and that this
 /// answer is all it gets, which is the one thing that stops it being run twice.
+///
+/// # `x-should-retry: false` is the half that reaches the client
+///
+/// The sentence above was true of the borrower and false of the SDK sitting
+/// behind it. A 502 with no header on it is retryable by default
+/// (`src/proxy.rs` sets this header on every answer it means as final, and
+/// `lease.rs`'s and `egress.rs`'s own "may have been billed" answers both carry
+/// it), so the one request this build is certain already ran and was debited
+/// was also the one the client was free to send again. The header travels the
+/// same way the rest of this answer does: the borrower rebuilds the response
+/// from these pairs, and this name is not hop-by-hop, so it survives.
 fn undeliverable_answer(why: &str) -> ServedResponse {
     let payload = serde_json::json!({
         "type": "error",
@@ -1452,7 +1693,10 @@ fn undeliverable_answer(why: &str) -> ServedResponse {
     });
     ServedResponse {
         status: 502,
-        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        headers: vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-should-retry".to_string(), "false".to_string()),
+        ],
         body: payload.to_string().into_bytes(),
     }
 }

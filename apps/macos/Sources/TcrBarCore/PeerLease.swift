@@ -35,17 +35,38 @@ public enum LendScope: Equatable, Hashable, Sendable {
     /// UUID: they land in argv, in the peers file and in a screenshot of this
     /// sheet, and this repository is public.
     case accounts([String])
+    /// A scope object the wire sent that this build cannot name (neither
+    /// `group` nor `accounts`, a future fourth variant).
+    ///
+    /// The same shape ``PeerLeaseWindow/unknown`` carries and for the same
+    /// reason: `PeerLendGrant`'s decoder used to fold this into ``all``
+    /// (`(try? …) ?? .all`), which silently WIDENED a grant the operator had
+    /// narrowed the instant this build could not parse the narrowing. The
+    /// row read "All accounts" for a lease that, on the lender's own disk,
+    /// still covered one account. It is never offered in the scope popup and
+    /// ``LeaseDraft/refusal(now:calendar:)`` refuses to save one, the same
+    /// gate `terms.window == .unknown` already gets.
+    case unknown
 
     /// The `--scope` value: `all`, `group:work`, `account:alice,bob`.
     ///
     /// Singular `account:` even for a set, because that is the spelling
     /// decision row 12 and the mockup's ledger both use
     /// (`--scope account:<label>[,<label>]`).
+    ///
+    /// `.unknown` has no argv spelling that means anything: it deliberately
+    /// does NOT return `"all"`, which would repeat the exact widening this
+    /// case exists to stop if a caller ever reached this arm. It returns a
+    /// token no CLI `--scope` grammar accepts, so a bypassed refusal fails
+    /// loudly (clap refuses the command) rather than quietly lending
+    /// everything. `LeaseDraft/refusal(now:calendar:)` is the real gate and
+    /// refuses to save one before this is ever called.
     public var argument: String {
         switch self {
         case .all: return "all"
         case .group(let name): return "group:\(name)"
         case .accounts(let labels): return "account:\(labels.joined(separator: ","))"
+        case .unknown: return "unknown-scope-refused-before-argv"
         }
     }
 
@@ -60,6 +81,7 @@ public enum LendScope: Equatable, Hashable, Sendable {
                 return "\(labels.count) accounts"
             }
             return "Account: \(only)"
+        case .unknown: return "an unknown scope"
         }
     }
 
@@ -357,11 +379,20 @@ public struct PeerLendGrant: Decodable, Equatable, Identifiable, Sendable {
         self.leaseId = try c.decodeIfPresent(String.self, forKey: .leaseId) ?? ""
         // A scope this build cannot name (an object with neither `group` nor
         // `accounts`, e.g. a future fourth variant) must not throw the whole
-        // grant away and hide a live lease; it falls back to `all`, the same
-        // default an absent key already means, and never a widening of a
-        // narrower scope this build simply failed to parse: the shape a real
-        // producer sends today is always one of the three known variants.
-        self.scope = (try? c.decodeIfPresent(LendScope.self, forKey: .scope)) ?? .all
+        // grant away and hide a live lease, but it must also not become
+        // `all`: that used to be `(try? …) ?? .all`, which cannot tell "the
+        // key was absent" from "the key was present and failed to parse",
+        // since both read as `nil` through `try?`. A real narrow scope this
+        // build simply could not name silently WIDENED to every account.
+        // Absent is `.all` (the documented default, `skip_serializing_if`
+        // on the producer's side); present but unparseable is `.unknown`,
+        // which the scope popup never offers and `LeaseDraft.refusal`
+        // refuses to save.
+        do {
+            self.scope = try c.decodeIfPresent(LendScope.self, forKey: .scope) ?? .all
+        } catch {
+            self.scope = .unknown
+        }
         self.window =
             try c.decodeIfPresent(PeerLeaseWindow.self, forKey: .window) ?? .week
         self.fraction = try c.decodeIfPresent(Double.self, forKey: .fraction) ?? 0
@@ -561,6 +592,10 @@ public struct LeaseDraft: Equatable, Identifiable, Sendable {
     /// that wrote an end already in the past would end the lease at the moment
     /// it started. Both are states the drawn controls can reach.
     public func refusal(now: Date, calendar: Calendar = .current) -> String? {
+        if scope == .unknown {
+            return "This build does not know this lease's scope, so it cannot save it without "
+                + "either narrowing or widening what it covers."
+        }
         if terms.window == .unknown {
             return "This build does not know that allowance, so it cannot say what a share "
                 + "of it would be."

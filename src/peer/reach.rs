@@ -1355,6 +1355,15 @@ fn external_socket_for(client: &NatPmp, mapping: &Mapping) -> Option<SocketAddr>
 #[derive(Debug)]
 pub struct MappingGuard {
     stop: Arc<AtomicBool>,
+    /// Cleared by the keeper thread on its way out, so a holder can tell a
+    /// keeper it stopped itself from one it is still holding.
+    ///
+    /// The keeper has a second way to end: `run_mapping_while`'s own re-read
+    /// of `peer.internet`, which is what `tcr peer internet off` reaches it
+    /// through. A holder that assumed a guard meant a running keeper would
+    /// answer [`KeeperStep::Renew`] for a thread that had already gone, and
+    /// the switch turned back on would start nothing.
+    alive: Arc<AtomicBool>,
 }
 
 impl MappingGuard {
@@ -1362,6 +1371,24 @@ impl MappingGuard {
     /// delete to start before it drops the rest of its state.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A handle on a running mapping keeper, which stops its keeper when it is
+/// dropped.
+///
+/// A trait rather than [`MappingGuard`] itself so [`keep_internet_mapping`]
+/// can be driven with a fake in a test: the production starter asks this
+/// machine's real router for a mapping, which is the one thing the suite here
+/// may never do.
+pub trait KeeperHandle {
+    /// Is the keeper behind this handle still running?
+    fn is_running(&self) -> bool;
+}
+
+impl KeeperHandle for MappingGuard {
+    fn is_running(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 }
 
@@ -1516,10 +1543,16 @@ pub fn spawn_mapping_keeper(peers_path: &Path, internal_port: u16) -> Option<Map
     };
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let alive = Arc::new(AtomicBool::new(true));
+    let thread_alive = Arc::clone(&alive);
     let peers_path = peers_path.to_path_buf();
     std::thread::Builder::new()
         .name("tcr-peer-mapping".to_string())
         .spawn(move || {
+            // Cleared however this thread leaves, including the panic path:
+            // a guard that still said "running" after its keeper died would
+            // make the switch unstartable for the life of the process.
+            let _running = RunningUntilDropped(thread_alive);
             if let Err(err) = run_mapping_while(
                 client,
                 Some(upnp_discoverer()),
@@ -1543,7 +1576,158 @@ pub fn spawn_mapping_keeper(peers_path: &Path, internal_port: u16) -> Option<Map
             err
         })
         .ok()?;
-    Some(MappingGuard { stop })
+    Some(MappingGuard { stop, alive })
+}
+
+/// Clears an "is it running" flag however the thread holding it leaves.
+struct RunningUntilDropped(Arc<AtomicBool>);
+
+impl Drop for RunningUntilDropped {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// How often a serving process re-reads `peer.internet`.
+///
+/// The same shape the beacon reads `peer.find` with, and a shorter interval
+/// because this one waits on a router round trip afterwards rather than on a
+/// multicast announce. `tcr peer internet off` is not waiting on this: the CLI
+/// deletes the mapping itself and the keeper's own poll notices in about a
+/// second. What waits on this is `on`, which nothing else can act on.
+pub const INTERNET_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What a serving process should do with its mapping keeper this wake.
+///
+/// A typed answer over the two facts, the switch and whether a keeper is
+/// running, so both can be decided without a router, a thread or a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeeperStep {
+    /// A mapping is wanted and nothing is holding one: start a keeper.
+    Start,
+    /// A mapping is wanted and a keeper holds one: it renews on its own.
+    Renew,
+    /// A mapping is not wanted and a keeper holds one: stop it, which deletes
+    /// the mapping the router granted.
+    Stop,
+    /// Nothing is wanted and nothing is running.
+    Idle,
+}
+
+/// Decide [`KeeperStep`] from the boot decision as the file states it NOW and
+/// whether a keeper is running.
+///
+/// # Why a live server has to keep asking
+///
+/// `tcr peer internet off` reached a running server (the keeper re-reads the
+/// switch between renewals, and the CLI deletes the mapping itself), and
+/// `internet on` reached nothing at all: `set_internet` writes the flag and
+/// `start_peer_mapping` had only boot callers, so the mapping came back at the
+/// next restart and not before. `docs/cli.md` said a running server honours
+/// both without one.
+pub fn keeper_step(decision: MappingBoot, running: bool) -> KeeperStep {
+    match (decision, running) {
+        (MappingBoot::Wanted { .. }, false) => KeeperStep::Start,
+        (MappingBoot::Wanted { .. }, true) => KeeperStep::Renew,
+        // A listener bound to loopback is the same answer as the switch being
+        // off: a mapping would forward a public port at a socket nothing off
+        // this Mac can reach.
+        (MappingBoot::SwitchOff | MappingBoot::LoopbackOnly, true) => KeeperStep::Stop,
+        (MappingBoot::SwitchOff | MappingBoot::LoopbackOnly, false) => KeeperStep::Idle,
+    }
+}
+
+/// What one run of [`keep_internet_mapping`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InternetWatch {
+    /// Keepers started, not counting one the caller handed in.
+    pub started: usize,
+    /// Keepers stopped because the switch went off.
+    pub stopped: usize,
+}
+
+/// Keep this process's mapping keeper in step with `peer.internet`, for as
+/// long as the process serves.
+///
+/// `held` is the keeper the caller already started at boot, or [`None`]. The
+/// loop takes ownership of it: dropping the handle is what stops a keeper, so
+/// the guard has to live here rather than beside the accept loop.
+///
+/// `start` is a parameter for the reason [`KeeperHandle`] is a trait: the
+/// production one asks this machine's real router, and a test may not.
+///
+/// `rounds` bounds the loop so a test can drive it; [`None`] is the production
+/// shape, which is forever.
+pub async fn keep_internet_mapping<H, S>(
+    peers_path: std::path::PathBuf,
+    local: SocketAddr,
+    every: Duration,
+    rounds: Option<usize>,
+    mut start: S,
+    mut held: Option<H>,
+) -> InternetWatch
+where
+    H: KeeperHandle,
+    S: FnMut() -> Option<H>,
+{
+    let mut tally = InternetWatch::default();
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick is immediate and the boot decision has already been
+    // taken by the caller, so it is spent here rather than re-deciding it.
+    ticker.tick().await;
+    let mut round = 0_usize;
+    loop {
+        if let Some(limit) = rounds {
+            if round >= limit {
+                return tally;
+            }
+        }
+        round += 1;
+        ticker.tick().await;
+
+        // A peers file that does not read for a moment is not the same fact as
+        // the switch being off, the rule `internet_is_on` states: the mapping
+        // this node holds is kept and the switch is re-read at the next wake.
+        let internet = match crate::peer::config::read_or_default(&peers_path) {
+            Ok(file) => file.internet,
+            Err(err) => {
+                tracing::warn!(
+                    path = %peers_path.display(),
+                    error = %err,
+                    "peer internet: the peers file did not read, so the mapping this node \
+                     holds is left as it is until the next wake"
+                );
+                continue;
+            }
+        };
+        let decision = mapping_boot(internet, local);
+        match keeper_step(
+            decision,
+            held.as_ref().is_some_and(KeeperHandle::is_running),
+        ) {
+            KeeperStep::Idle | KeeperStep::Renew => {}
+            KeeperStep::Start => {
+                held = start();
+                tally.started += 1;
+                tracing::info!(
+                    peer_listen = %local,
+                    "peer internet: the switch is on, so this node is asking its router for a \
+                     mapping (`tcr peer reach` reports what it gets)"
+                );
+            }
+            KeeperStep::Stop => {
+                // Dropping the handle stops the keeper, which deletes the
+                // mapping over the protocol that granted it.
+                held = None;
+                tally.stopped += 1;
+                tracing::info!(
+                    "peer internet: the switch is off, so the mapping this node holds is \
+                     deleted and no keeper runs"
+                );
+            }
+        }
+    }
 }
 
 /// Is `peer.internet` still on in the peers file at `path`?

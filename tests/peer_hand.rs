@@ -363,7 +363,13 @@ fn an_expired_handed_bearer_is_not_returned() {
 fn a_handoff_is_built_only_for_a_live_hand_grant() {
     let now_ms = 1_000_000;
     let live = lease(9, now_ms + 60_000, None);
-    let bearer = || Some((OWNER_FAKE_BEARER.to_string(), now_ms + 60_000));
+    let bearer = || {
+        Some(teamclaude_rs::manager::HandedCredential {
+            access_token: OWNER_FAKE_BEARER.to_string(),
+            expires_at_ms: now_ms + 60_000,
+            utilization: 0.4,
+        })
+    };
 
     assert!(
         handoff_for(LendMode::Serve, &live, bearer(), now_ms).is_none(),
@@ -399,8 +405,10 @@ fn a_handoff_is_built_only_for_a_live_hand_grant() {
             lease_id: 9,
             access_token: tcr_peer_wire::HandoffToken::new(OWNER_FAKE_BEARER.to_string()),
             expires_at_ms: now_ms + 60_000,
+            utilization: Some(0.4),
         },
-        "the frame carries the lease, the short-lived bearer and its deadline, and nothing else"
+        "the frame carries the lease, the short-lived bearer, its deadline and the owner's own \
+         utilization, and nothing else"
     );
 }
 
@@ -427,6 +435,7 @@ fn a_formatted_handoff_never_carries_the_bearer() {
         lease_id: 9,
         access_token: tcr_peer_wire::HandoffToken::new(OWNER_FAKE_BEARER.to_string()),
         expires_at_ms: 2_000_000,
+        utilization: Some(0.4),
     };
     let logged = format!("peer control: {frame:?} is not answered by this build");
 
@@ -552,9 +561,9 @@ fn a_held_account_is_not_handed_over_and_the_roomiest_one_is() {
     held.update_quota(1, &busier);
     held.mark_rate_limited(0, 600);
     assert_eq!(
-        held.handoff_bearer(&tcr_peer_wire::LendScope::All)
+        held.handoff_bearer(&tcr_peer_wire::LendScope::All, Window::FiveHour)
             .expect("an account that is not held is still lent")
-            .0,
+            .access_token,
         "fake-second-bearer-not-a-credential",
         "a held account's bearer is one the borrower cannot spend, and it cannot see the \
          hold either"
@@ -576,9 +585,9 @@ fn a_held_account_is_not_handed_over_and_the_roomiest_one_is() {
     uneven.update_quota(1, &fresh);
     assert_eq!(
         uneven
-            .handoff_bearer(&tcr_peer_wire::LendScope::All)
+            .handoff_bearer(&tcr_peer_wire::LendScope::All, Window::FiveHour)
             .expect("both accounts are usable, so one of them is handed over")
-            .0,
+            .access_token,
         "fake-second-bearer-not-a-credential",
         "the account handed over is the one with the room the lease was measured against, \
          not whichever one is first in the vector"
@@ -637,21 +646,188 @@ fn a_strictly_pinned_account_is_never_handed_over() {
     // The pinned account is FIRST, so a handoff that ignored the pin would
     // answer with it: the order is the thing under test.
     let mixed = manager_with(format!("{pinned_account}, {free_account}"));
+    // A measured window on both, because a bearer with no baseline is refused
+    // for its own reason and this test is about the PIN.
+    for index in 0..2 {
+        mixed.update_quota(index, &measured_at("0.10"));
+    }
     let handed = mixed
-        .handoff_bearer(&tcr_peer_wire::LendScope::All)
+        .handoff_bearer(&tcr_peer_wire::LendScope::All, Window::FiveHour)
         .expect("an unpinned account in scope is still lent");
     assert_eq!(
-        handed.0, "fake-free-bearer-not-a-credential",
+        handed.access_token, "fake-free-bearer-not-a-credential",
         "the strictly pinned account is skipped and the unpinned one beside it is handed over"
     );
 
     let all_pinned = manager_with(pinned_account);
+    all_pinned.update_quota(0, &measured_at("0.10"));
     assert!(
         all_pinned
-            .handoff_bearer(&tcr_peer_wire::LendScope::All)
+            .handoff_bearer(&tcr_peer_wire::LendScope::All, Window::FiveHour)
             .is_none(),
         "with every account in scope pinned there is nothing to hand over, and the answer is \
          no bearer rather than a pin broken quietly"
+    );
+}
+
+/// **The figure a hand lease is funded by and the token it is served with come
+/// from one account, and a scope with no handable account funds nothing.**
+///
+/// The review's finding: `handoff_bearer` excluded held and strictly pinned
+/// accounts and ranked by the least room across three windows, while
+/// `lendable_fraction`, which sized the lease, excluded neither and folded
+/// `max` over one window. So the handed token was routinely not the account the
+/// grant had been measured on, and a scope whose usable accounts were all held
+/// or pinned minted a funded lease with no bearer at all: the borrower held a
+/// lease it could only spend the serve way, and the owner's ledger showed room
+/// promised against an account nobody could use.
+///
+/// Three legs. The figure agrees with the account picked. The fleet with
+/// nothing handable answers `0.0` and no bearer. And `Ledger::grant` refuses a
+/// hand ask against that fleet rather than minting.
+///
+/// Watch it fail by dropping the `LendMode::Hand` clamp from `Ledger::grant`:
+/// leg three mints a 0.20 lease with no bearer behind it. Or by folding `max`
+/// over the window alone in `Manager::handable_fraction`: leg one reads the
+/// held account's room, 0.85, against the free account's token.
+#[test]
+fn a_hand_lease_is_funded_only_by_an_account_whose_bearer_can_go_out() {
+    let manager_with = |accounts: &str| {
+        let config: teamclaude_rs::config::Config = serde_json::from_str(&format!(
+            r#"{{
+                "proxy": {{ "port": 0 }},
+                "upstream": "http://127.0.0.1:1",
+                "quotaProbeSeconds": 0,
+                "warmupSeconds": 0,
+                "accounts": [{accounts}]
+            }}"#
+        ))
+        .expect("the inline config parses");
+        teamclaude_rs::manager::Manager::with_live_refresher(config, None)
+    };
+    let two = r#"{
+            "name": "held@example.com",
+            "accessToken": "fake-held-bearer-not-a-credential",
+            "expiresAt": 1893456000000
+        }, {
+            "name": "free@example.com",
+            "accessToken": "fake-free-bearer-not-a-credential",
+            "expiresAt": 1893456000000
+        }"#;
+    let now = time::OffsetDateTime::now_utc();
+    let all = tcr_peer_wire::LendScope::All;
+
+    // LEG ONE: the roomiest account is held by a 429, so the answer is the
+    // other one's token AND the other one's room.
+    let mixed = manager_with(two);
+    mixed.update_quota(0, &measured_at("0.05"));
+    mixed.update_quota(1, &measured_at("0.40"));
+    mixed.mark_rate_limited(0, 600);
+    let handed = mixed
+        .handoff_bearer(&all, Window::FiveHour)
+        .expect("the account that is not held is handed over");
+    assert_eq!(
+        handed.access_token, "fake-free-bearer-not-a-credential",
+        "a held account's bearer is one the borrower cannot spend"
+    );
+    assert!(
+        (handed.utilization - 0.40).abs() < 1e-9,
+        "and the baseline on the frame is that account's own window: {}",
+        handed.utilization
+    );
+    let funded = mixed.handable_fraction(&all, Window::FiveHour, now);
+    assert!(
+        (funded - (0.95 - 0.05 - 0.40)).abs() < 1e-9,
+        "the lease is sized on the account it will be served with, which leaves \
+         0.95 - 0.05 - 0.40, and it says {funded}"
+    );
+
+    // LEG TWO: every account in scope is held, so there is nothing to hand over
+    // and nothing to fund with.
+    let all_held = manager_with(two);
+    all_held.update_quota(0, &measured_at("0.05"));
+    all_held.update_quota(1, &measured_at("0.05"));
+    all_held.mark_rate_limited(0, 600);
+    all_held.mark_rate_limited(1, 600);
+    assert!(
+        all_held.handoff_bearer(&all, Window::FiveHour).is_none(),
+        "no account in scope can have its bearer spent right now"
+    );
+    assert_eq!(
+        all_held.handable_fraction(&all, Window::FiveHour, now),
+        0.0,
+        "so a hand lease is funded by nothing, however much the fleet has left"
+    );
+    assert!(
+        all_held.lendable_fraction(&all, Window::FiveHour, now) > 0.0,
+        "while a SERVE lease still is: a hold is a timer, the request leaves from this Mac, \
+         and the advertised figure must not flap with every 429"
+    );
+
+    // LEG THREE: the ledger refuses a hand ask against that fleet.
+    let home = tempfile::tempdir().expect("a temp home");
+    let peers = home.path().join("tcr-peers.json");
+    let borrower = tcr_peer_wire::PeerId([7_u8; 32]);
+    std::fs::write(
+        &peers,
+        format!(
+            r#"{{
+          "peers": [
+            {{
+              "node": "{node}",
+              "label": "borrowing-mac",
+              "addedAt": 1,
+              "allow": {{ "inspect": true }},
+              "lend": {{
+                "mode": "hand",
+                "window": "5h",
+                "fraction": 0.2,
+                "ttlS": 300,
+                "maxInflight": 2
+              }}
+            }}
+          ]
+        }}"#,
+            node = borrower.to_wire(),
+        ),
+    )
+    .expect("write the owner's peers file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&peers, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 on the peers file");
+    }
+    let store = teamclaude_rs::peer::config::PeerStore::open(&peers).expect("the peers file reads");
+    let ask = tcr_peer_wire::LeaseRequest {
+        window: Window::FiveHour,
+        unit: LeaseUnit::Fraction(0.20),
+        ttl_s: 300,
+        max_inflight: 2,
+    };
+
+    let mut ledger = Ledger::new();
+    ledger.note_owner_headroom(Window::FiveHour, 0.50);
+    let refused = ledger.grant(&borrower, &ask, &store, all_held.as_ref());
+    assert!(
+        refused.answer.lease.is_none(),
+        "a hand ask against a fleet with no handable account mints nothing, and it minted \
+         {:?}",
+        refused.answer.lease
+    );
+    assert_eq!(
+        refused.answer.refusal,
+        Some(tcr_peer_wire::LeaseRefusal::OwnerGuard),
+        "and it is the owner's own headroom that is missing, not anything the borrower did"
+    );
+
+    let mut ledger = Ledger::new();
+    ledger.note_owner_headroom(Window::FiveHour, 0.50);
+    let granted = ledger.grant(&borrower, &ask, &store, mixed.as_ref());
+    assert!(
+        granted.answer.lease.is_some(),
+        "while the same ask against a fleet with one handable account is funded: {:?}",
+        granted.answer.refusal
     );
 }
 
@@ -775,7 +951,11 @@ fn an_expired_bearer_is_not_handed_over() {
         handoff_for(
             LendMode::Hand,
             &live,
-            Some((OWNER_FAKE_BEARER.to_string(), now_ms)),
+            Some(teamclaude_rs::manager::HandedCredential {
+                access_token: OWNER_FAKE_BEARER.to_string(),
+                expires_at_ms: now_ms,
+                utilization: 0.4,
+            }),
             now_ms
         )
         .is_none(),
@@ -785,7 +965,11 @@ fn an_expired_bearer_is_not_handed_over() {
         handoff_for(
             LendMode::Hand,
             &live,
-            Some((OWNER_FAKE_BEARER.to_string(), now_ms - 1)),
+            Some(teamclaude_rs::manager::HandedCredential {
+                access_token: OWNER_FAKE_BEARER.to_string(),
+                expires_at_ms: now_ms - 1,
+                utilization: 0.4,
+            }),
             now_ms
         )
         .is_none(),
@@ -795,7 +979,11 @@ fn an_expired_bearer_is_not_handed_over() {
         handoff_for(
             LendMode::Hand,
             &live,
-            Some((OWNER_FAKE_BEARER.to_string(), now_ms + 1)),
+            Some(teamclaude_rs::manager::HandedCredential {
+                access_token: OWNER_FAKE_BEARER.to_string(),
+                expires_at_ms: now_ms + 1,
+                utilization: 0.4,
+            }),
             now_ms
         )
         .is_some(),
@@ -891,6 +1079,28 @@ fn spent_of(ledger: &Ledger, lease_id: u128, now_ms: i64) -> f64 {
 }
 
 /// The same clock the ledger reads, so a lease minted here is live for it.
+/// What the owner's seven-day window reads in every fixture here.
+///
+/// Below the fake origin's first answer (0.40), so the first borrowed answer is
+/// a real rise rather than a fall, and named rather than repeated so the
+/// arithmetic in the spend gate stays readable.
+const OWNER_MEASURED_UTILIZATION: f64 = 0.30;
+
+/// One window measured at `utilization`, in the header form
+/// `Manager::update_quota` reads.
+///
+/// A bearer is handed over only for an account whose window this Mac has
+/// measured, because the borrower's spend is reported as a RISE above that
+/// figure, so a fixture about anything else still has to measure one.
+fn measured_at(utilization: &str) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "anthropic-ratelimit-unified-5h-utilization",
+        utilization.parse().expect("a header value"),
+    );
+    headers
+}
+
 fn crate_now_ms() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp() * 1_000
 }
@@ -998,6 +1208,21 @@ async fn owner_lending_expiring(
     ))
     .expect("the inline owner config parses");
     let manager = teamclaude_rs::manager::Manager::with_live_refresher(config, None);
+    // THE OWNER'S OWN WINDOW, measured, because a `hand` grant hands a bearer
+    // over only for an account whose window this Mac has read: the borrower
+    // reports its spend as a rise above that figure, and there is no honest
+    // baseline without it. Every lease here is on the seven-day window.
+    {
+        let mut measured = reqwest::header::HeaderMap::new();
+        measured.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            OWNER_MEASURED_UTILIZATION
+                .to_string()
+                .parse()
+                .expect("a header value"),
+        );
+        manager.update_quota(0, &measured);
+    }
 
     let key = NodeKey::load_or_mint(home.path()).expect("the owner's node key");
     let public = key.id().0;
@@ -1360,6 +1585,7 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
                 lease_id,
                 access_token,
                 expires_at_ms,
+                utilization,
             } = frame
             else {
                 panic!("a hand grant is followed by the bearer, not by {frame:?}");
@@ -1376,6 +1602,12 @@ async fn a_hand_grant_is_followed_by_the_owners_bearer_on_the_same_session() {
             assert!(
                 expires_at_ms > 0,
                 "with an absolute expiry, so the borrower can stop without waiting for a 401"
+            );
+            assert_eq!(
+                utilization,
+                Some(OWNER_MEASURED_UTILIZATION),
+                "and with the owner's own utilization on the lease's window, which is the \
+                 baseline every spend this borrower reports is a rise above"
             );
             assert_eq!(
                 owner
@@ -1533,12 +1765,18 @@ async fn a_borrowed_hand_lease_leaves_the_owners_bearer_in_this_process() {
 /// serves two requests from its own Mac against an origin whose utilization
 /// rises between them, and the OWNER's own ledger is what is asserted.
 ///
-/// Two requests and not one, because a rise needs two readings: the first
-/// answer is the baseline and reports nothing, which is the same rule
-/// `usage_hint` states.
+/// **The first answer is charged too**, which is the review's first HIGH here.
+/// A rise needs two readings and the second reading is the answer's own header,
+/// so the FIRST one has to come from somewhere else: the owner puts its own
+/// utilization on the `Handoff` frame and the borrower's meter starts there. It
+/// used to start at `None`, so every lease's first answer was free and a
+/// borrower that asked for a fresh lease per request was never debited at all.
 ///
 /// Watch it fail by deleting the `report_handed_spend` call from
-/// `serve_on_handed_bearer`: no hint is ever sent and `spent` stays at 0.0.
+/// `serve_on_handed_bearer`: no hint is ever sent and `spent` stays at 0.0. Or
+/// by seeding `HandedMeter.last` with `None` in `register_handed_meter` and
+/// dropping the `note_handed_baseline` call: the ledger then carries 0.07, the
+/// second answer's rise alone, and the first answer's 0.10 is never charged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hand_mode_borrow_reports_its_spend_to_the_owner() {
     let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
@@ -1630,6 +1868,14 @@ async fn a_hand_mode_borrow_reports_its_spend_to_the_owner() {
     }
 
     // The owner's OWN ledger, which is the only place a debit counts.
+    //
+    // BOTH answers are charged, and the first one is the point. The meter's
+    // baseline used to be `None` until an answer had already been served, so
+    // the first answer on every lease was free and a borrower that re-asked per
+    // request paid for nothing at all; this waits for the full figure rather
+    // than for "something above zero", which the first charge alone would
+    // satisfy.
+    let expected = (0.40 - OWNER_MEASURED_UTILIZATION) + 0.07;
     let mut spent = 0.0;
     for _ in 0..200 {
         spent = spent_of(
@@ -1637,15 +1883,16 @@ async fn a_hand_mode_borrow_reports_its_spend_to_the_owner() {
             lease.lease_id,
             crate_now_ms(),
         );
-        if spent > 0.0 {
+        if (spent - expected).abs() < 1e-6 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(
-        (spent - 0.07).abs() < 1e-6,
-        "the owner's ledger must carry the rise the borrower observed between its two \
-         answers (0.47 - 0.40), and it carries {spent}"
+        (spent - expected).abs() < 1e-6,
+        "the owner's ledger must carry the rise above the baseline its own handoff carried \
+         (0.40 - {OWNER_MEASURED_UTILIZATION}) plus the rise between the two answers \
+         (0.47 - 0.40), which is {expected}, and it carries {spent}"
     );
 }
 

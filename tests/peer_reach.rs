@@ -48,6 +48,16 @@ enum Behaviour {
     Refuse(u16),
     /// Read the request and never answer.
     Silent,
+    /// Answer as a cooperative router would, but only after `after`.
+    ///
+    /// Every router is this one: a mapping is asked for at boot and granted a
+    /// round trip later, and what reads the answer in between reads an absence.
+    SlowCooperative {
+        /// The external port to hand back, as [`Behaviour::Cooperative`].
+        external_port: u16,
+        /// How long this gateway thinks about it first.
+        after: Duration,
+    },
 }
 
 impl FakeGateway {
@@ -109,6 +119,13 @@ fn answer(request: &[u8], behaviour: Behaviour) -> Option<Vec<u8>> {
     let opcode = *request.get(1)?;
     let (code, external_port) = match behaviour {
         Behaviour::Silent => return None,
+        Behaviour::SlowCooperative {
+            external_port,
+            after,
+        } => {
+            std::thread::sleep(after);
+            (0, external_port)
+        }
         Behaviour::Refuse(code) => (code, 0),
         Behaviour::Cooperative { external_port } => (0, external_port),
     };
@@ -2394,5 +2411,273 @@ fn the_mapping_decision_reads_the_switch_and_the_bound_address() {
         reach::MappingBoot::LoopbackOnly,
         "and a loopback listener is a mapping that would forward a public port at a socket \
          nothing off this Mac can reach"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The switch, and the carriers, while the process is running
+// ---------------------------------------------------------------------------
+
+/// A keeper handle with no router behind it, for driving
+/// [`reach::keep_internet_mapping`] in a suite that may not ask one.
+#[derive(Debug)]
+struct FakeKeeper {
+    /// Cleared to stand for a keeper thread that ended on its own.
+    alive: Arc<AtomicBool>,
+    /// Set when this handle is dropped, which is what stops a real keeper.
+    dropped: Arc<AtomicBool>,
+}
+
+impl reach::KeeperHandle for FakeKeeper {
+    fn is_running(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for FakeKeeper {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// **The switch decides all four steps**, with no router and no file.
+///
+/// The pure half of `internet on|off` reaching a running server: a mapping
+/// wanted with nothing running is a start, wanted with a keeper running is
+/// that keeper's own renewal, and not wanted with one running is a stop. A
+/// listener bound to loopback answers the same as the switch being off,
+/// because a mapping there would forward a public port at a socket nothing off
+/// this Mac can reach.
+#[test]
+fn the_internet_switch_decides_start_renew_stop_and_idle() {
+    use reach::{keeper_step, KeeperStep, MappingBoot};
+
+    let wanted = MappingBoot::Wanted {
+        internal_port: 7_755,
+    };
+    assert_eq!(keeper_step(wanted, false), KeeperStep::Start);
+    assert_eq!(keeper_step(wanted, true), KeeperStep::Renew);
+    assert_eq!(keeper_step(MappingBoot::SwitchOff, true), KeeperStep::Stop);
+    assert_eq!(keeper_step(MappingBoot::SwitchOff, false), KeeperStep::Idle);
+    assert_eq!(
+        keeper_step(MappingBoot::LoopbackOnly, true),
+        KeeperStep::Stop
+    );
+    assert_eq!(
+        keeper_step(MappingBoot::LoopbackOnly, false),
+        KeeperStep::Idle
+    );
+}
+
+/// **`internet on` starts a keeper on a server that is already running.**
+///
+/// `internet off` reached a live server: the keeper re-reads the flag between
+/// renewals and the CLI deletes the mapping itself. `on` reached nothing at
+/// all, because the only callers of `start_peer_mapping` were boot ones, so
+/// the mapping came back at the next restart and not before, while
+/// `docs/cli.md` said a running server honours both settings without one.
+///
+/// Driven with a fake keeper handle: the production starter asks this
+/// machine's real router, which is the one thing this suite may never do. The
+/// address is in the documentation range and no socket is opened on it; what
+/// it decides here is only that this listener is not on loopback.
+#[tokio::test]
+async fn the_internet_switch_starts_a_keeper_again_on_a_running_server() {
+    use teamclaude_rs::peer::config::{save, PeerFile};
+
+    let dir = tempfile::tempdir().expect("a temp profile directory");
+    let peers_path = dir.path().join("tcr-peers.json");
+    let local: SocketAddr = "192.0.2.7:7755".parse().expect("a literal address");
+    let wake = Duration::from_millis(10);
+
+    let write_switch = |on: bool| {
+        save(
+            &peers_path,
+            &PeerFile {
+                internet: on,
+                ..PeerFile::default()
+            },
+        )
+        .expect("the peers file writes");
+    };
+    let starts = Arc::new(AtomicU32::new(0));
+    let new_keeper = |dropped: &Arc<AtomicBool>| FakeKeeper {
+        alive: Arc::new(AtomicBool::new(true)),
+        dropped: Arc::clone(dropped),
+    };
+
+    // ---- on, with a keeper running: that keeper renews itself and nothing
+    // else happens.
+    write_switch(true);
+    let running = Arc::new(AtomicBool::new(false));
+    let counted = Arc::clone(&starts);
+    let held = new_keeper(&running);
+    let renewing = reach::keep_internet_mapping(
+        peers_path.clone(),
+        local,
+        wake,
+        Some(2),
+        move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(FakeKeeper {
+                alive: Arc::new(AtomicBool::new(true)),
+                dropped: Arc::new(AtomicBool::new(false)),
+            })
+        },
+        Some(held),
+    )
+    .await;
+    assert_eq!(
+        (renewing.started, renewing.stopped),
+        (0, 0),
+        "a keeper that is already running is left to renew itself"
+    );
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        0,
+        "and no second keeper is started beside it"
+    );
+
+    // ---- off, with a keeper running: the handle is dropped, which is what
+    // stops a keeper and deletes the mapping.
+    write_switch(false);
+    let stopped_handle = Arc::new(AtomicBool::new(false));
+    let counted = Arc::clone(&starts);
+    let held = new_keeper(&stopped_handle);
+    let stopping = reach::keep_internet_mapping(
+        peers_path.clone(),
+        local,
+        wake,
+        Some(2),
+        move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(FakeKeeper {
+                alive: Arc::new(AtomicBool::new(true)),
+                dropped: Arc::new(AtomicBool::new(false)),
+            })
+        },
+        Some(held),
+    )
+    .await;
+    assert_eq!(
+        (stopping.started, stopping.stopped),
+        (0, 1),
+        "the switch going off has to stop the keeper this node is holding"
+    );
+    assert!(
+        stopped_handle.load(Ordering::SeqCst),
+        "and stopping it means dropping the handle, which is what deletes the mapping"
+    );
+
+    // ---- on again, with nothing running: a keeper is started, which is the
+    // half that reached nothing at all.
+    write_switch(true);
+    let counted = Arc::clone(&starts);
+    let restarted = Arc::new(AtomicBool::new(false));
+    let restarting = reach::keep_internet_mapping(
+        peers_path.clone(),
+        local,
+        wake,
+        Some(2),
+        move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(FakeKeeper {
+                alive: Arc::new(AtomicBool::new(true)),
+                dropped: Arc::clone(&restarted),
+            })
+        },
+        None,
+    )
+    .await;
+    assert_eq!(
+        (restarting.started, restarting.stopped),
+        (1, 0),
+        "`tcr peer internet on` has to reach a server that is already running, or the mapping \
+         comes back at the next restart and not before"
+    );
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "exactly one keeper, not one per wake"
+    );
+}
+
+/// **The reverse-carry decision is the two facts and whether carriers are
+/// parked**, with no router and no friend.
+#[test]
+fn the_reverse_carry_decision_parks_releases_or_does_nothing() {
+    use teamclaude_rs::peer::tunnel::{reverse_step, ReverseNeed, ReverseNotWanted, ReverseStep};
+
+    let dialable = ReverseNeed::NotWanted(ReverseNotWanted::HoldsMapping);
+    assert_eq!(reverse_step(ReverseNeed::Wanted, false), ReverseStep::Park);
+    assert_eq!(reverse_step(dialable, true), ReverseStep::Release);
+    assert_eq!(reverse_step(ReverseNeed::Wanted, true), ReverseStep::Idle);
+    assert_eq!(reverse_step(dialable, false), ReverseStep::Idle);
+}
+
+/// **A Mac whose router answers a second late lets its friends go.**
+///
+/// The decision was taken once, two statements after the mapping keeper thread
+/// was spawned and before its first NAT-PMP round trip could land. So
+/// `external_socket()` was `None` on every boot and a Mac its router would map
+/// perfectly well parked `MAX_PARKED_PER_PEER` carriers at every friend it
+/// had, seconds before it became dialable, and kept them there until it
+/// restarted.
+///
+/// The router here is the fake on loopback, answering after 600 ms, and a real
+/// `MappingKeeper` asks it. The IPv6 half of the decision is held at "none" on
+/// purpose: this test is about the mapping arriving late, and the machine
+/// running the suite may have a global address of its own.
+///
+/// Watch it fail: make `watch_reverse_need` ask `need_now` once before its
+/// loop instead of on every wake, and the carriers are never released.
+#[tokio::test]
+async fn reverse_carriers_are_released_when_the_router_answers_late() {
+    use teamclaude_rs::peer::tunnel;
+
+    let fake = FakeGateway::start(Behaviour::SlowCooperative {
+        external_port: 41_235,
+        after: Duration::from_millis(600),
+    });
+    let mapped: Arc<Mutex<Option<reach::Mapping>>> = Arc::new(Mutex::new(None));
+
+    let writing = Arc::clone(&mapped);
+    let gateway = fake.addr;
+    let keeper = std::thread::spawn(move || {
+        let mut keeper = reach::MappingKeeper::new(NatPmp::at(gateway), 7_755, 600);
+        let mapping = keeper.map().expect("the cooperative fake grants a mapping");
+        *writing.lock().expect("the mapping this keeper holds") = Some(mapping);
+    });
+
+    // The control: nothing is mapped yet, so the first wake has to park.
+    assert!(
+        mapped.lock().expect("the mapping cell").is_none(),
+        "positive control: this Mac must start with no mapping, or the park below is about a \
+         router that had already answered"
+    );
+
+    let reading = Arc::clone(&mapped);
+    let watched = tunnel::watch_reverse_need(
+        Duration::from_millis(50),
+        Some(60),
+        move || {
+            tunnel::reverse_carry_is_wanted(reading.lock().expect("the mapping cell").as_ref(), &[])
+        },
+        || Some(()),
+        |()| {},
+        None,
+    )
+    .await;
+
+    keeper.join().expect("the keeper thread finishes");
+    assert_eq!(
+        (watched.parked, watched.released),
+        (1, 1),
+        "a Mac that cannot be dialled parks carriers at its friends, and the moment its \
+         router answers it has to let them go: {watched:?}"
+    );
+    assert!(
+        fake.requests.load(Ordering::SeqCst) > 0,
+        "positive control: the fake router really was asked"
     );
 }

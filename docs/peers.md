@@ -259,6 +259,9 @@ Reaching it tries a few things, in order:
   UPnP is arriving) and keeps it open: the mapping is renewed every 30 minutes on a 2-hour
   lifetime, so a single missed renewal does not drop it, and it is deleted both when the
   switch goes off and at shutdown, so nothing is left holding a port open on your router.
+  Like `find`, the switch is a setting rather than an act: the running `tcr` re-reads it every
+  few seconds, so turning it on asks the router within that and turning it off deletes the
+  mapping, neither needing a restart.
   `tcr peer reach` (arriving) prints what your router agreed to.
 - **A fallback port that changes with the clock, for the dialling side only (arriving).** If
   the address this Mac last saw the peer at stops answering, both sides already know, without

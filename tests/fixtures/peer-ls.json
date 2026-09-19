@@ -170,7 +170,7 @@
   "internet": false,
   "exits": {
     "alice": {
-      "egress": "via tcr-0W3GE1R70W",
+      "egress": "via 0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
       "egressStrict": true,
       "peerDown": false
     }

@@ -1944,6 +1944,116 @@ pub fn reverse_carriers(store: &PeerStore, node: &PeerId) -> Vec<PeerRow> {
         .collect()
 }
 
+/// How often a serving process re-asks whether it can be dialled.
+///
+/// The answer moves for one reason: a router mapping this node asked for at
+/// boot and got seconds later, or lost. Five seconds, the same cadence the
+/// internet switch is re-read at, because the two facts come from the same
+/// keeper.
+pub const REVERSE_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the reverse-carry supervisor should do this wake.
+///
+/// A typed answer over the two facts, what `reach` measures now and whether
+/// carriers are parked, so both can be decided without a router or a friend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReverseStep {
+    /// Nothing can dial this Mac and no friend is holding a carrier for it:
+    /// ask them.
+    Park,
+    /// This Mac can be dialled and friends are holding carriers: let them go.
+    Release,
+    /// What is held already matches what is needed.
+    Idle,
+}
+
+/// Decide [`ReverseStep`] from the need as `reach` measures it NOW and whether
+/// carriers are parked.
+///
+/// # Why this is asked more than once
+///
+/// It used to be asked once, two statements after the mapping keeper thread
+/// was spawned and before its first NAT-PMP round trip could publish anything.
+/// So a Mac that its router would map perfectly well read `None`, decided
+/// nothing could dial it, and parked `MAX_PARKED_PER_PEER` carriers at every
+/// friend it had, seconds before it became dialable. The boot test binds
+/// loopback, where no mapping is ever asked for, so the ordering was
+/// unobserved.
+pub fn reverse_step(need: ReverseNeed, parked: bool) -> ReverseStep {
+    match (need, parked) {
+        (ReverseNeed::Wanted, false) => ReverseStep::Park,
+        (ReverseNeed::NotWanted(_), true) => ReverseStep::Release,
+        (ReverseNeed::Wanted, true) | (ReverseNeed::NotWanted(_), false) => ReverseStep::Idle,
+    }
+}
+
+/// What one run of [`watch_reverse_need`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReverseWatch {
+    /// Times carriers were asked for.
+    pub parked: usize,
+    /// Times they were released because this Mac became dialable.
+    pub released: usize,
+}
+
+/// Keep the reverse carriers in step with whether anything can dial this Mac.
+///
+/// `need_now` is asked each wake rather than once, which is the whole point:
+/// see [`reverse_step`]. `park` opens the carriers and hands back whatever
+/// stops them again; `release` takes that back and stops them.
+///
+/// `rounds` bounds the loop so a test can drive it; [`None`] is the production
+/// shape, which is forever. `held` is what `park` produced before this loop
+/// started, or [`None`].
+pub async fn watch_reverse_need<T, N, P, R>(
+    every: std::time::Duration,
+    rounds: Option<usize>,
+    need_now: N,
+    mut park: P,
+    mut release: R,
+    mut held: Option<T>,
+) -> ReverseWatch
+where
+    N: Fn() -> ReverseNeed,
+    P: FnMut() -> Option<T>,
+    R: FnMut(T),
+{
+    let mut tally = ReverseWatch::default();
+    let mut ticker = tokio::time::interval(every);
+    // `interval`'s first tick is immediate and this loop takes the BOOT answer
+    // on it: a Mac that cannot be dialled has to ask its friends at boot, not
+    // five seconds into it, and its caller no longer decides anything itself.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut round = 0_usize;
+    loop {
+        if let Some(limit) = rounds {
+            if round >= limit {
+                return tally;
+            }
+        }
+        round += 1;
+        ticker.tick().await;
+
+        match reverse_step(need_now(), held.is_some()) {
+            ReverseStep::Idle => {}
+            ReverseStep::Park => {
+                held = park();
+                tally.parked += 1;
+            }
+            ReverseStep::Release => {
+                if let Some(held) = held.take() {
+                    release(held);
+                }
+                tally.released += 1;
+                tracing::info!(
+                    "peer reverse: this Mac can be dialled now, so the friends holding a \
+                     carrier for it are let go"
+                );
+            }
+        }
+    }
+}
+
 /// What one friend's keeper loop did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReverseKeeperRun {

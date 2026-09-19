@@ -1255,6 +1255,24 @@ where
     let slot = SocketSlot::acquire(&context.admission, &addr, unauthenticated_allowance(&file))
         .map_err(|refusal| ConnectionFailure::unauthenticated(anyhow::anyhow!("{refusal}")))?;
 
+    // **One deadline for everything done while that slot is held**, measured
+    // from the moment it was taken rather than from each step's own start.
+    //
+    // A pattern that authenticates gives the slot back as soon as message 1 is
+    // in hand, so [`MESSAGE_1_TIMEOUT`] already bounds it. A KNOCK keeps the
+    // slot to the end, and the steps after message 1 each carried their own
+    // deadline and nothing added them up: five seconds to deliver message 1,
+    // then up to [`crate::peer::config::LOCK_WAIT_MS`] waiting for the state
+    // file's lock, then another five for the rest of the handshake. A knocker
+    // that spent every one of them held a sixteenth of this node's
+    // unauthenticated capacity for fifteen seconds while saying almost
+    // nothing.
+    //
+    // [`HANDSHAKE_TIMEOUT`] is the number because it is what a connection that
+    // really does authenticate is allowed, and no unauthenticated one should
+    // hold a slot longer than that.
+    let slot_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+
     // Check 3. A socket opened and left silent costs five seconds, and the
     // length prefix cannot reserve more than the largest message 1 any pattern
     // here has.
@@ -1324,9 +1342,20 @@ where
     // reaches a stream header, a gate or a handler, because the only thing it
     // can produce is a row an operator reads.
     if matches!(pattern, Handshake::Knock | Handshake::KnockPsk) {
-        let outcome = serve_knock(&mut stream, context, &addr, pattern, &message_1, &file, now)
-            .await
-            .map_err(ConnectionFailure::unauthenticated);
+        let outcome = serve_knock(
+            &mut stream,
+            context,
+            &addr,
+            pattern,
+            &message_1,
+            &file,
+            KnockClock {
+                now_ms: now,
+                slot_deadline,
+            },
+        )
+        .await
+        .map_err(ConnectionFailure::unauthenticated);
         drop(slot);
         return outcome;
     }
@@ -1450,6 +1479,26 @@ fn serve_punched(
     Box::pin(async move { serve_accepted(stream, &context, &from, bind).await })
 }
 
+/// The two clocks one knock is served against.
+///
+/// One value rather than two parameters: they are read together at every step
+/// and the wall clock alone was already the seventh argument on
+/// [`serve_knock`].
+#[derive(Debug, Clone, Copy)]
+struct KnockClock {
+    /// This node's own clock, which is what every row this knock writes is
+    /// stamped with.
+    now_ms: i64,
+    /// When the socket slot this knock is holding has to be given back,
+    /// whatever state the knock has reached.
+    ///
+    /// An instant rather than a duration because the slot was acquired before
+    /// message 1 was read: a knocker that spends four seconds delivering
+    /// message 1 gets what is left of the same budget, not a fresh one. See
+    /// the call site.
+    slot_deadline: tokio::time::Instant,
+}
+
 /// Answer one knock: bucket, queue, one ack byte, close.
 ///
 /// Every refusal returns before a byte is written. That is the whole reason the
@@ -1463,11 +1512,15 @@ async fn serve_knock<S>(
     pattern: Handshake,
     message_1: &[u8],
     file: &PeerFile,
-    now_ms: i64,
+    clock: KnockClock,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let KnockClock {
+        now_ms,
+        slot_deadline,
+    } = clock;
     // The network key decides WHICH knock pattern this node answers, and a
     // mismatch is refused inside message 1, a Mac without the key cannot
     // reach the queue, and a Mac with one cannot knock at a node that has
@@ -1556,23 +1609,39 @@ where
     // LAN host can reach, a handful of simultaneous knocks park that many of
     // the proxy's worker threads for seconds each, and what stops answering is
     // the LOCAL proxy: the thing the mesh is not allowed to cost anything.
-    let reservation_created = on_blocking_thread({
-        let state_path = context.state_path.clone();
-        let addr = addr.to_string();
-        move || {
-            let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
-            let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
-            let created = match peer_state.reserve_knock_slot(&addr, now_ms) {
-                Ok(created) => created,
-                Err(refusal) => {
-                    bail!("peer knock: {refusal}; closed after message 1 with nothing written")
-                }
-            };
-            crate::peer::state::save(&state_path, &peer_state)?;
-            Ok(created)
+    //
+    // Under `slot_deadline` as well, because waiting for that lock is the
+    // longest thing a knock does and it is the one step whose length another
+    // process decides.
+    let reservation = tokio::time::timeout_at(
+        slot_deadline,
+        on_blocking_thread({
+            let state_path = context.state_path.clone();
+            let addr = addr.to_string();
+            move || {
+                let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
+                let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
+                let created = match peer_state.reserve_knock_slot(&addr, now_ms) {
+                    Ok(created) => created,
+                    Err(refusal) => {
+                        bail!("peer knock: {refusal}; closed after message 1 with nothing written")
+                    }
+                };
+                crate::peer::state::save(&state_path, &peer_state)?;
+                Ok(created)
+            }
+        }),
+    )
+    .await;
+    let reservation_created = match reservation {
+        Ok(created) => created?,
+        Err(elapsed) => {
+            return Err(anyhow::Error::new(elapsed).context(
+                "peer knock: the pairing queue could not be reserved before this connection's \
+                 unauthenticated deadline; closed with nothing written",
+            ))
         }
-    })
-    .await?;
+    };
 
     // A wrong or missing network key, a malformed message, a dropped
     // connection, any of these must still reach NO row, exactly as before
@@ -1590,8 +1659,11 @@ where
     // connection, with no operator-visible cause. The same deadline, because
     // the remaining work is one message 2 and one small frame on a LAN, which
     // is the identical cost profile message 1 already has.
-    let outcome = match tokio::time::timeout(
-        MESSAGE_1_TIMEOUT,
+    //
+    // Whichever of the two deadlines comes first: its own five seconds for the
+    // remaining frames, and never past the moment the socket slot is due back.
+    let outcome = match tokio::time::timeout_at(
+        slot_deadline.min(tokio::time::Instant::now() + MESSAGE_1_TIMEOUT),
         finish_knock_handshake(stream, read, pattern),
     )
     .await
@@ -1636,22 +1708,47 @@ where
     // On a blocking thread, for the reason the reservation above gives: the
     // lock waits with `std::thread::sleep` and everything under it is
     // synchronous file IO, on a path no caller has authenticated.
-    let pending = on_blocking_thread({
-        let state_path = context.state_path.clone();
-        let addr = addr.to_string();
-        let instance_id = knock.instance_id;
-        let wire_version = knock.wire_version;
-        move || {
-            let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
-            let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
-            peer_state
-                .record_knock(&addr, instance_id, proposed_name, wire_version, now_ms)
-                .map_err(anyhow::Error::new)?;
-            crate::peer::state::save(&state_path, &peer_state)?;
-            Ok(peer_state.pending.len())
+    // Under `slot_deadline` for the same reason the reservation is, and with
+    // the reservation released on the way out: a knock that is cut off here
+    // has one, and leaving it behind would spend an eighth of the pairing
+    // queue on a knock that never reached a row.
+    let recorded = tokio::time::timeout_at(
+        slot_deadline,
+        on_blocking_thread({
+            let state_path = context.state_path.clone();
+            let addr = addr.to_string();
+            let instance_id = knock.instance_id;
+            let wire_version = knock.wire_version;
+            move || {
+                let _lock = crate::peer::config::FileLock::acquire(&state_path)?;
+                let mut peer_state = crate::peer::state::load(&state_path, now_ms)?;
+                peer_state
+                    .record_knock(&addr, instance_id, proposed_name, wire_version, now_ms)
+                    .map_err(anyhow::Error::new)?;
+                crate::peer::state::save(&state_path, &peer_state)?;
+                Ok(peer_state.pending.len())
+            }
+        }),
+    )
+    .await;
+    let pending = match recorded {
+        Ok(Ok(pending)) => pending,
+        Ok(Err(err)) => {
+            if reservation_created {
+                release_reserved_knock_slot(context, addr, now_ms).await;
+            }
+            return Err(err);
         }
-    })
-    .await?;
+        Err(elapsed) => {
+            if reservation_created {
+                release_reserved_knock_slot(context, addr, now_ms).await;
+            }
+            return Err(anyhow::Error::new(elapsed).context(
+                "peer knock: the pairing row could not be written before this connection's \
+                 unauthenticated deadline; the reservation is released",
+            ));
+        }
+    };
 
     // The ack is written only now: after the ban, the mute, the bucket and the
     // queue cap have all said yes.
@@ -1761,9 +1858,69 @@ async fn record_pairing_key(
     .await
 }
 
+/// What each of the peers-file writes a `Control::Hello` makes answered.
+///
+/// One value carried back off the blocking thread rather than four thread
+/// hops, and a struct rather than a tuple so the arm that reports them cannot
+/// pair a sentence with the wrong outcome.
+struct HelloWrites {
+    /// The pair's rendezvous secret.
+    rendezvous: Result<bool>,
+    /// The neighbour briefs, when the frame carried any.
+    briefs: Option<Result<usize>>,
+    /// The endpoints this peer says it listens on, plus the one it was seen
+    /// from.
+    endpoints: Result<bool>,
+    /// The address this peer says it sees us at, when it named one that parses.
+    sees_us_at: Option<Result<bool>>,
+}
+
+impl HelloWrites {
+    /// Say what did not get written, in the words each failure deserves.
+    ///
+    /// Every one is surfaced and none is fatal: the session is authenticated
+    /// and useful, and what failed is a hint the next Hello offers again. A
+    /// rendezvous secret that would not write costs this pair the derived-port
+    /// fallback after a restart, which is the reach it had before that
+    /// fallback existed; it must not cost them the session open right now.
+    fn report(self, peer: PeerId, from: SocketAddr) {
+        if let Err(err) = self.rendezvous {
+            tracing::warn!(
+                peer = %peer.display(),
+                error = %err,
+                "peer control: could not record this pair's rendezvous secret",
+            );
+        }
+        if let Some(Err(err)) = self.briefs {
+            tracing::warn!(
+                peer = %peer.display(),
+                error = %err,
+                "peer control: could not record a neighbor brief from this peer",
+            );
+        }
+        if let Err(err) = self.endpoints {
+            tracing::warn!(
+                peer = %peer.display(),
+                peer_addr = %from,
+                error = %err,
+                "peer control: could not record where this peer answers; it stays reachable \
+                 at the endpoints already on its row"
+            );
+        }
+        if let Some(Err(err)) = self.sees_us_at {
+            tracing::warn!(
+                peer = %peer.display(),
+                error = %err,
+                "peer control: could not record where this peer sees us",
+            );
+        }
+    }
+}
+
 /// Run one lock-load-save on a blocking thread and wait for it there.
 ///
-/// Every state-file write on the listener's own paths goes through this.
+/// Every state-file and peers-file write on the listener's own paths goes
+/// through this.
 /// [`crate::peer::config::FileLock::acquire`] waits for a contended lock with
 /// `std::thread::sleep` for up to [`crate::peer::config::LOCK_WAIT_MS`], and
 /// the load and the save under it are synchronous file IO: run inline on the
@@ -2298,14 +2455,21 @@ where
         );
     };
 
-    let row = crate::peer::pair::accept_enrolment(
-        &context.peers_path,
-        session.peer,
-        &enroll,
-        secret,
-        now_ms(),
-        from,
-    )?;
+    // **On a blocking thread**, the rule [`on_blocking_thread`] states: this is
+    // a locked read-modify-write of the peers file, the lock waits with
+    // `std::thread::sleep`, and an enrolment is served on a connection whose
+    // only credential is a one-use invite. Run inline it parked one of the
+    // proxy's worker threads for as long as whatever holds that lock takes,
+    // and what stops answering is the LOCAL proxy.
+    let row = on_blocking_thread({
+        let peers_path = context.peers_path.clone();
+        let peer = session.peer;
+        let secret = *secret;
+        move || {
+            crate::peer::pair::accept_enrolment(&peers_path, peer, &enroll, &secret, now_ms(), from)
+        }
+    })
+    .await?;
 
     let mut facts = NodeFacts::listening(context.node, store.file().listen);
     facts.briefs = crate::peer::discovery::neighbor_briefs(&store.file().peers, session.peer);
@@ -2446,7 +2610,9 @@ where
         let Some(frame) = crate::peer::lease::handoff_for(
             grant.mode,
             &lease,
-            serving.manager.handoff_bearer(&scope),
+            // The LEASE's window, so the baseline the frame carries and the
+            // room the grant was measured on are one window's.
+            serving.manager.handoff_bearer(&scope, lease.window),
             now,
         ) else {
             continue;
@@ -2455,6 +2621,7 @@ where
             lease_id,
             expires_at_ms,
             access_token,
+            utilization: _,
         } = &frame
         {
             let next = crate::peer::lease::HandedBearer {
@@ -2560,96 +2727,104 @@ where
             Control::Hello(incoming) => {
                 let mut learned = config::endpoints_from_hello(&incoming.addrs, now_ms());
                 learned.push(Endpoint::direct(from, now_ms(), EndpointSource::Hello));
-                // The pair's rendezvous secret, recorded on the frame that
-                // already writes this file rather than on every accepted
-                // connection: a SERVE must still open the peers file exactly
-                // once (`an_accepted_connection_opens_the_peers_file_once`,
-                // `tests/peer_lease.rs`), and a Hello is the exchange that
-                // exists to answer "where and how do we meet next time".
-                //
-                // Surfaced and never fatal: a file that would not take the
-                // secret costs this pair the derived-port fallback after a
-                // restart, which is the reach it had before the fallback
-                // existed, and it must not cost it the session open right now.
-                if let Err(err) = crate::peer::config::observe_rendezvous_secret(
-                    &context.peers_path,
-                    &session.peer,
-                    crate::peer::reach::port_secret(&session.handshake_hash),
-                ) {
-                    tracing::warn!(
-                        peer = %session.peer.display(),
-                        error = %err,
-                        "peer control: could not record this pair's rendezvous secret",
-                    );
-                }
-                // The sender goes with the briefs: `observe_neighbor_briefs`
-                // applies them only for a peer this node would brief in
-                // return (`allow.control.briefs`), which is the same flag
-                // `hello_for_peer` reads when it builds the outgoing side.
-                if let Some(briefs) = incoming.briefs.as_deref() {
-                    if let Err(err) = crate::peer::discovery::observe_neighbor_briefs(
-                        &context.peers_path,
-                        &session.peer,
-                        briefs,
-                        now_ms(),
-                    ) {
-                        tracing::warn!(
-                            peer = %session.peer.display(),
-                            error = %err,
-                            "peer control: could not record a neighbor brief from this peer",
-                        );
-                    }
-                }
-                if let Err(err) =
-                    config::observe_endpoints(&context.peers_path, &session.peer, &learned)
-                {
-                    // Surfaced and not swallowed, and not fatal to the stream:
-                    // the session is authenticated and useful, and what failed
-                    // is a routing hint the next Hello offers again.
-                    tracing::warn!(
-                        peer = %session.peer.display(),
-                        peer_addr = %from,
-                        error = %err,
-                        "peer control: could not record where this peer answers; it stays \
-                         reachable at the endpoints already on its row"
-                    );
-                }
                 // The two reflexive halves of this frame, recorded in memory
                 // and never onto the row: `from` is the address a NAT in front
                 // of that peer rewrote its packets to, which is not an address
                 // it listens on, so it is advice for a punch and never an
                 // endpoint to dial.
                 crate::peer::reach::remember_observed_peer(session.peer, from);
-                if let Some(told) = incoming.observed_you_at.as_deref() {
-                    match told.parse::<SocketAddr>() {
+                let sees_us_at = match incoming.observed_you_at.as_deref() {
+                    None => None,
+                    Some(told) => match told.parse::<SocketAddr>() {
                         Ok(addr) => {
                             crate::peer::reach::remember_observed_self(session.peer, addr);
-                            // And onto the row, so a restart still knows where
-                            // this Mac is seen. Surfaced and never fatal, the
-                            // rule the rendezvous secret beside it follows: a
-                            // file that would not take the address costs this
-                            // pair a punch target after a restart and must not
-                            // cost them the session open right now.
-                            if let Err(err) = crate::peer::config::observe_seen_address(
-                                &context.peers_path,
-                                &session.peer,
-                                addr,
-                                u64::try_from(now_ms().max(0)).unwrap_or_default(),
-                            ) {
-                                tracing::warn!(
-                                    peer = %session.peer.display(),
-                                    error = %err,
-                                    "peer control: could not record where this peer sees us",
-                                );
-                            }
+                            Some(addr)
                         }
-                        Err(err) => tracing::debug!(
-                            peer = %session.peer.display(),
-                            told = %told,
-                            error = %err,
-                            "peer control: this peer said it sees us at something that is not                              a socket address; ignoring the hint"
-                        ),
+                        Err(err) => {
+                            tracing::debug!(
+                                peer = %session.peer.display(),
+                                told = %told,
+                                error = %err,
+                                "peer control: this peer said it sees us at something that is \
+                                 not a socket address; ignoring the hint"
+                            );
+                            None
+                        }
+                    },
+                };
+
+                // **Every peers-file write this frame makes runs on a blocking
+                // thread**, which is the rule [`on_blocking_thread`] states and
+                // the one this arm did not keep. Four locked
+                // read-modify-writes of the peers file ran inline on the
+                // proxy's runtime, and `FileLock::acquire` waits for a
+                // contended lock with `std::thread::sleep`: one Hello arriving
+                // while anything else held that lock parked a worker thread for
+                // up to [`crate::peer::config::LOCK_WAIT_MS`], and what stops
+                // answering is the LOCAL proxy.
+                //
+                // One hop for all four rather than four hops: they take the
+                // same lock in turn, so splitting them would buy nothing and
+                // cost three more handoffs. Each write's own outcome comes back
+                // so the failure an operator reads is still the sentence that
+                // failure deserves.
+                let written = on_blocking_thread({
+                    let peers_path = context.peers_path.clone();
+                    let peer = session.peer;
+                    let secret = crate::peer::reach::port_secret(&session.handshake_hash);
+                    let briefs = incoming.briefs.clone();
+                    move || {
+                        Ok(HelloWrites {
+                            // The pair's rendezvous secret, recorded on the
+                            // frame that already writes this file rather than
+                            // on every accepted connection: a SERVE must still
+                            // open the peers file exactly once
+                            // (`an_accepted_connection_opens_the_peers_file_once`,
+                            // `tests/peer_lease.rs`), and a Hello is the
+                            // exchange that exists to answer "where and how do
+                            // we meet next time".
+                            rendezvous: crate::peer::config::observe_rendezvous_secret(
+                                &peers_path,
+                                &peer,
+                                secret,
+                            ),
+                            // The sender goes with the briefs:
+                            // `observe_neighbor_briefs` applies them only for a
+                            // peer this node would brief in return
+                            // (`allow.control.briefs`), which is the same flag
+                            // `hello_for_peer` reads when it builds the
+                            // outgoing side.
+                            briefs: briefs.map(|briefs| {
+                                crate::peer::discovery::observe_neighbor_briefs(
+                                    &peers_path,
+                                    &peer,
+                                    &briefs,
+                                    now_ms(),
+                                )
+                            }),
+                            endpoints: config::observe_endpoints(&peers_path, &peer, &learned),
+                            // And onto the row, so a restart still knows where
+                            // this Mac is seen.
+                            sees_us_at: sees_us_at.map(|addr| {
+                                crate::peer::config::observe_seen_address(
+                                    &peers_path,
+                                    &peer,
+                                    addr,
+                                    u64::try_from(now_ms().max(0)).unwrap_or_default(),
+                                )
+                            }),
+                        })
                     }
+                })
+                .await;
+                match written {
+                    Ok(written) => written.report(session.peer, from),
+                    Err(err) => tracing::warn!(
+                        peer = %session.peer.display(),
+                        error = %err,
+                        "peer control: what this peer told us about where it answers was not \
+                         recorded; it stays reachable at the endpoints already on its row"
+                    ),
                 }
                 let mut facts = NodeFacts::listening(context.node, store.file().listen);
                 facts.briefs =
@@ -2858,13 +3033,14 @@ where
                     } else if let Some(frame) = crate::peer::lease::handoff_for(
                         mode,
                         &minted,
-                        serving.manager.handoff_bearer(&scope),
+                        serving.manager.handoff_bearer(&scope, minted.window),
                         now_ms(),
                     ) {
                         if let Control::Handoff {
                             lease_id,
                             expires_at_ms,
                             access_token,
+                            utilization: _,
                         } = &frame
                         {
                             handed.insert(

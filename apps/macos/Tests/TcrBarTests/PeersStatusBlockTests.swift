@@ -108,12 +108,44 @@ final class PeersStatusBlockTests: XCTestCase {
         // The forwarded path, which the row draws differently: a `via` endpoint
         // is a peer id, not a socket address, and it carries no byte figure
         // because the bytes are charged to the Mac that forwards them.
+        //
+        // The WIRE form, not `tcr-0W3GE1R70W`: `PeerStatusRow.id` (studio-mac's
+        // own row, `fixtureRows()[0]`) is the wire form too, and the panel
+        // resolves a via endpoint's name by looking it up against that `id`
+        // (`peerNames`, `PeersTabV4.swift`). A display-form endpoint could
+        // never match.
         let via = measured.paths[1]
         XCTAssertEqual(via.kind, .via)
-        XCTAssertEqual(via.endpoint, "tcr-0W3GE1R70W")
+        XCTAssertEqual(via.endpoint, "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G")
         XCTAssertEqual(via.rttMs, 96)
         XCTAssertEqual(via.lossPct, 0.02)
         XCTAssertNil(via.bytesPerHour)
+    }
+
+    /// **The forwarded path resolves to the forwarder's real name against the
+    /// GOLDEN fixture**, not a hand-built id-to-name map that happens to agree
+    /// with itself.
+    ///
+    /// `PeerPathLineTests` used to hand-build both the via path's `endpoint`
+    /// and the `names` dictionary it was resolved against in the same
+    /// literal (`"tcr-92hbq5t7yv"` on both sides), which stayed green
+    /// through a fixture where `PeerStatusRow.id` and `PathStatus.endpoint`
+    /// disagree in FORM, one wire, one display, since a test built that way
+    /// never reads either one off a real payload. This builds `names` from
+    /// `rows[0]` (studio-mac's own `id`/`name`) the way
+    /// `PeersSnapshotBuilder.peerNames` does, and resolves `rows[1]`'s via
+    /// path against it.
+    func testTheForwardedPathResolvesToTheForwardersNameFromTheGoldenFixture() throws {
+        let rows = try fixtureRows()
+        let forwarder = rows[0]
+        let measured = rows[1]
+        let forwarderId = try XCTUnwrap(forwarder.id)
+        let forwarderName = try XCTUnwrap(forwarder.name)
+        let names = [forwarderId: forwarderName]
+        let via = try XCTUnwrap(measured.paths.first { $0.kind == .via })
+        XCTAssertEqual(
+            PeerFormat.pathLine(via, names: names),
+            "via \(forwarderName) · 96 ms · 2% lost")
     }
 
     /// A kind this build has never heard of draws as itself and never blanks

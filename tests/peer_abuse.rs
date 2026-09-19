@@ -2158,3 +2158,189 @@ async fn three_knocks_in_flight_from_one_address_hold_two_slots_and_the_third_ge
         "every slot is released on every exit path, or the bound becomes a lockout"
     );
 }
+
+// ===========================================================================
+// Cap: what an unauthenticated connection may hold, and for how long
+// (`listener::MAX_UNAUTHENTICATED_SOCKETS`, `listener::HANDSHAKE_TIMEOUT`)
+// ===========================================================================
+
+/// Hold the lock for `path` from another thread, from now until the returned
+/// handle is joined.
+///
+/// The contention every write on the listener's own paths meets in real use:
+/// `tcr peer accept` writing the state file, or a crashed holder that left the
+/// lockfile behind. A waiter breaks a lockfile older than
+/// `config::LOCK_STALE_MS` (two seconds), so this holds one for longer than
+/// that and lets the waiter break it: two seconds is the longest a single
+/// contended write can be made to wait, and it is the lever this file has for
+/// stretching one.
+fn hold_the_lock(path: &std::path::Path) -> std::thread::JoinHandle<()> {
+    let path = path.to_path_buf();
+    let (ready, taken) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let lock = config::FileLock::acquire(&path).expect("take the lock");
+        ready.send(()).expect("the test is still waiting");
+        // Long past `LOCK_STALE_MS`: the waiter breaks it, which is exactly
+        // the two-second wait this is here to impose.
+        std::thread::sleep(Duration::from_secs(10));
+        drop(lock);
+    });
+    taken
+        .recv()
+        .expect("the lock is taken before the test goes on");
+    handle
+}
+
+/// **A knock that is slow at every step still gives its socket slot back
+/// within one handshake.**
+///
+/// Every step under that slot used to carry its own deadline and nothing added
+/// them up: five seconds to deliver message 1, then a wait on the state file's
+/// lock, then a fresh five seconds for the rest of the knock handshake. A
+/// knocker that spent all three held a sixteenth of this node's
+/// unauthenticated capacity for longer than a connection that really does
+/// authenticate is allowed.
+///
+/// The attack, in the timings below: message 1 delivered at 4.3 s (inside its
+/// own five-second bound), the state file's lock taken just before it lands so
+/// the reservation waits the full stale bound, and then silence. Before the
+/// fix that adds up to about 11.3 s under the slot; the bound asserted here is
+/// [`plan::HANDSHAKE_TIMEOUT`] plus 800 ms of scheduling slack.
+///
+/// Watch it fail: drop `slot_deadline` from `serve_knock` and the release
+/// lands past the bound, with the elapsed time in the message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_knock_that_is_slow_at_every_step_gives_its_slot_back_within_a_handshake() {
+    let node = Node::new("slow-knock-slot");
+    let context = node.context();
+    let addr = serve(context.clone()).await;
+
+    let started = std::time::Instant::now();
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("connect to the test listener");
+
+    // Late, but inside message 1's own bound: the slot has been held for 4.3 s
+    // by the time this node has read a single frame.
+    tokio::time::sleep(Duration::from_millis(4_300)).await;
+    let holder = hold_the_lock(&node.state);
+    let message_1 = knock_message_1();
+    let mut framed = Vec::with_capacity(2 + message_1.len());
+    framed.extend_from_slice(
+        &u16::try_from(message_1.len())
+            .expect("a short frame")
+            .to_be_bytes(),
+    );
+    framed.extend_from_slice(&message_1);
+    stream.write_all(&framed).await.expect("write message 1");
+    stream.flush().await.expect("flush message 1");
+
+    // Then nothing at all, and the slot is watched until it comes back.
+    let mut released = None;
+    while started.elapsed() < Duration::from_secs(20) {
+        if with_admission(&context, |guard| guard.live_unauthenticated(LOOPBACK)) == 0 {
+            released = Some(started.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let released = released.unwrap_or_else(|| {
+        panic!(
+            "the slot was still held after {:?}, which is a sixteenth of this node's \
+             unauthenticated capacity held by a socket that said one frame",
+            started.elapsed()
+        )
+    });
+
+    // The positive control on the clock: a knock that was refused at once
+    // would satisfy the bound below while proving nothing about it.
+    assert!(
+        released >= plan::MESSAGE_1_TIMEOUT,
+        "positive control: this knock has to have been admitted and worked on, and it was \
+         released after only {released:?}"
+    );
+    assert!(
+        released <= plan::HANDSHAKE_TIMEOUT + Duration::from_millis(800),
+        "an unauthenticated knock held its slot for {released:?}, and the longest any \
+         connection may hold one is a handshake ({:?})",
+        plan::HANDSHAKE_TIMEOUT
+    );
+
+    drop(stream);
+    holder.join().expect("the lock holder finishes");
+}
+
+/// **A `Hello` arriving while the peers file is locked does not park the
+/// proxy's runtime.**
+///
+/// Every state-file write on the listener's own unauthenticated paths moved to
+/// a blocking thread, and `on_blocking_thread`'s own doc claimed all of them
+/// had. The CONTROL path had not: a `Hello` makes four locked
+/// read-modify-writes of the peers file, and `FileLock::acquire` waits for a
+/// contended lock with `std::thread::sleep`. Run inline on the proxy's
+/// runtime, one Hello per worker thread parks every one of them, and what
+/// stops answering is the LOCAL proxy: the thing the mesh is not allowed to
+/// cost anything.
+///
+/// What is measured is a task spawned onto the same runtime while those Hellos
+/// are in flight, and how long it waited to be run at all. Two workers and two
+/// Hellos, because the shape of the defect is one blocked worker per frame.
+///
+/// Watch it fail: call `observe_rendezvous_secret` inline in the `Hello` arm
+/// again and the probe waits for the lock rather than for a scheduler slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hello_arriving_while_the_peers_file_is_locked_leaves_the_runtime_free() {
+    let listening = Node::new("hello-lock-listener");
+    let caller = Node::new("hello-lock-caller");
+    let addr = serve(listening.context()).await;
+
+    let listening_store = config::PeerStore::open(&listening.peers).expect("open the store");
+    let caller_store = config::PeerStore::open(&caller.peers).expect("open the store");
+    pair::confirm(&listening_store, &caller.key.id(), "111111", None)
+        .expect("the listening node pins the caller");
+    pair::confirm(&caller_store, &listening.key.id(), "222222", Some(addr))
+        .expect("the caller pins the listening node");
+
+    let holder = hold_the_lock(&listening.peers);
+
+    // Two Hellos, released together onto a two-worker runtime.
+    let target = listening.key.id();
+    let mut hellos = Vec::new();
+    for _ in 0..2 {
+        let store = config::PeerStore::open(&caller.peers).expect("open the store");
+        hellos.push(tokio::spawn(async move {
+            teamclaude_rs::peer::serve::say_hello(&store, &target).await
+        }));
+    }
+
+    // The local proxy's stand-in: a task that does nothing but report how long
+    // it waited for a worker. Spawned from OUTSIDE the runtime, after the
+    // Hellos are in flight, because a runtime whose every worker is parked
+    // cannot run the task that would notice.
+    let handle = tokio::runtime::Handle::current();
+    let (waited, latency) = std::sync::mpsc::channel();
+    let prober = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        let spawned = std::time::Instant::now();
+        handle.spawn(async move {
+            let _ = waited.send(spawned.elapsed());
+        });
+    });
+
+    let waited_for_a_worker = latency
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the probe task ran at all");
+    assert!(
+        waited_for_a_worker < Duration::from_secs(1),
+        "a task spawned while two Hellos were in flight waited {waited_for_a_worker:?} for a \
+         worker thread; the peers-file writes a Hello makes belong on a blocking thread, or \
+         a peer that says hello while anything holds that lock stops the local proxy"
+    );
+
+    prober.join().expect("the prober finishes");
+    for hello in hellos {
+        // Answered or refused is not what this test is about: the runtime is.
+        let _ = hello.await;
+    }
+    holder.join().expect("the lock holder finishes");
+}

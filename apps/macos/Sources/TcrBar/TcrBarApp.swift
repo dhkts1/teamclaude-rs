@@ -274,7 +274,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSLog("TcrBar: %@: cancelled at the confirmation sheet", shape)
                 return
             }
-            let outcome = PeerController.join(link: url)
+            // The sheet already told the operator a key would be replaced
+            // (`hasExistingKey`); Join means it, so the command carries the
+            // flag `tcr peer join` requires to act on that.
+            let outcome = PeerController.join(link: url, replace: hasExistingKey)
             NSLog("TcrBar: %@: %@", shape, outcome)
         }
     }

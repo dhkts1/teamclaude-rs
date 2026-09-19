@@ -757,8 +757,13 @@ final class PeerController: ObservableObject {
     /// any panel exists, opening one in a chat window LAUNCHES this app. The
     /// answer is a sentence for the log, never the link: whichever way it
     /// went, the string that arrived is a credential.
-    nonisolated static func join(link: URL) -> String {
-        switch PeerCommand.join(link: link) {
+    ///
+    /// `replace` is the confirmation sheet's own answer (the operator
+    /// confirmed a Join that the sheet told them would overwrite an existing
+    /// network key): it becomes `--replace` on argv, the flag `tcr peer
+    /// join` requires before it will take that overwrite.
+    nonisolated static func join(link: URL, replace: Bool = false) -> String {
+        switch PeerCommand.join(link: link, replace: replace) {
         case .failure(let refusal):
             return PeerJoinLink.sentence(for: refusal)
         case .success(let invocation):

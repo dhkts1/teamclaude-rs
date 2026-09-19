@@ -1848,6 +1848,46 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                         );
                         return Ok(());
                     }
+                    // AN END THAT HAS ALREADY PASSED IS REFUSED, BEFORE
+                    // ANYTHING IS WRITTEN. This verb keeps the end, the mode
+                    // and the schedule an operator set per peer, which is
+                    // right; what it did with a `--until` that has already gone
+                    // by was carry it onto the new grant and print `on`. Every
+                    // request against that grant is then refused for want of a
+                    // live lending, and the only surface saying so is
+                    // `peer lend --list`'s `ended=true`. `peer lend` cannot
+                    // produce one at all (`parse_lend_end` rolls a time of day
+                    // to tomorrow and refuses a duration that is not into the
+                    // future), so this verb is the one that has to.
+                    //
+                    // Refused rather than silently cleared: the end is a
+                    // decision the operator took, and a verb that quietly
+                    // removes it lends past a deadline somebody meant.
+                    let now_s = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())
+                        .unwrap_or(0);
+                    let closed: Vec<String> = file
+                        .peers
+                        .iter()
+                        .filter(|row| {
+                            row.lend.iter().any(|existing| {
+                                existing.window == window
+                                    && existing.scope == scope
+                                    && existing.has_ended(now_s)
+                            })
+                        })
+                        .map(|row| row.node.display())
+                        .collect();
+                    if !closed.is_empty() {
+                        anyhow::bail!(
+                            "peer share: the grant this would keep the end of has already \
+                             ended on {} (scope={scope} window={}), so turning sharing on \
+                             would write a grant that lends nothing and print success. Give \
+                             it a new end first (`tcr peer lend <peer> --relend --for 2h`), \
+                             or drop the end (`tcr peer lend <peer> --for none`)",
+                            closed.join(", "),
+                            peer_window_name(window)
+                        );
+                    }
                     let mut grant = peer_lend_grant(window, a.fraction, a.ttl, a.max_inflight);
                     grant.scope = scope.clone();
                     for row in &mut file.peers {
@@ -2066,6 +2106,14 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // The network key first, because it is what a link with no join
             // key is FOR, and because setting it is what lets this Mac see the
             // office at all.
+            //
+            // A refusal here used to `bail!` the whole command, which meant a
+            // link carrying both a network key and a join key paired nothing
+            // at all when the network key alone was refused: the join token
+            // was never even read. The refusal is now reported and the
+            // command carries on to the join token below, so a link with
+            // both keys still pairs on a Mac that keeps its own network key.
+            let mut network_key_refusal: Option<String> = None;
             if let Some(network_key) = input.network_key() {
                 let _lock = teamclaude_rs::peer::config::FileLock::acquire(&path)?;
                 let mut file = teamclaude_rs::peer::config::read_or_default(&path)?;
@@ -2076,24 +2124,30 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 // already on, and the documented promise that the key is not
                 // replaced without asking was true of one command out of two.
                 if replaced && !a.replace {
-                    anyhow::bail!(
+                    network_key_refusal = Some(format!(
                         "peer join: a network key is already set on this Mac, and this link \
                          carries another. Taking it cuts this Mac off from every Mac still \
                          holding the old one, {} pinned peer(s) here. Pass --replace to mean \
                          it, or `tcr peer network-key clear` first",
                         file.peers.len()
+                    ));
+                } else {
+                    file.network_key = Some(network_key);
+                    teamclaude_rs::peer::config::save(&path, &file)?;
+                    println!(
+                        "peer join: network key {} file={}",
+                        if replaced { "replaced" } else { "set" },
+                        path.display()
                     );
                 }
-                file.network_key = Some(network_key);
-                teamclaude_rs::peer::config::save(&path, &file)?;
-                println!(
-                    "peer join: network key {} file={}",
-                    if replaced { "replaced" } else { "set" },
-                    path.display()
-                );
             }
 
             let Some(token) = input.join_token() else {
+                // No join token to fall back on: the network-key refusal, if
+                // any, is the whole outcome, so it is the error.
+                if let Some(refusal) = network_key_refusal {
+                    anyhow::bail!(refusal);
+                }
                 println!(
                     "peer join: that link carries no join key, so nothing was paired, it \
                      sets the network key and stops there. Pair from either Mac with \
@@ -2101,6 +2155,15 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 );
                 return Ok(());
             };
+            // A join token exists, so this link still pairs even though its
+            // network key was refused above: say so, in the same line shape
+            // as the "ok" line below, rather than leaving the earlier
+            // refusal looking like the whole outcome.
+            if let Some(refusal) = &network_key_refusal {
+                println!(
+                    "{refusal} (this link also carries a join key, which was still used below)"
+                );
+            }
             let label = a.label.clone().unwrap_or_else(|| "this-mac".to_string());
             teamclaude_rs::peer::pair::join(&store, token, &label).await?;
             println!("peer join: ok addr={} file={}", token.addr, path.display());
@@ -3806,6 +3869,104 @@ mod peer_grant_tests {
             row.lend.is_empty(),
             "share off clears the grants too, or a re-enabled `inspect` would resurrect a \
              ceiling the operator never re-typed"
+        );
+    }
+
+    /// **`tcr peer share on` refuses to keep an end that has already gone
+    /// by.**
+    ///
+    /// This verb keeps the end, the mode and the schedule an operator set per
+    /// peer rather than overwriting them with defaults, which is right. What it
+    /// did with an `until` that had already passed was carry it onto the new
+    /// grant and print `on`: every request against that grant is then refused
+    /// for want of a live lending, and the only surface that says so is
+    /// `peer lend --list`'s `ended=true`. `peer lend` cannot write one of those
+    /// at all, so this verb is the one that has to refuse.
+    ///
+    /// The file is re-read afterwards, because "refused" and "refused without
+    /// writing" are different claims and only the second one is safe: a
+    /// half-applied share leaves `inspect` granted with no grant behind it.
+    ///
+    /// Watch it fail by deleting the `closed` block from the `Share` arm's `On`
+    /// branch: the command answers `Ok`, the grant comes back with yesterday's
+    /// `until` and a fraction of 0.10, and the operator is told sharing is on.
+    #[tokio::test]
+    async fn peer_share_on_refuses_a_lending_window_that_has_already_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peers_path = pinned_peers_file(dir.path());
+        let now_s = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())
+            .expect("a unix timestamp after 1970");
+
+        // A grant whose lending ended an hour ago, which is what a `--until
+        // 18:00` looks like the next morning.
+        {
+            let mut file = peer::config::read_or_default(&peers_path).expect("the seeded file");
+            let mut ended =
+                peer::config::LendGrant::new(tcr_peer_wire::Window::SevenDay, 0.05, 300, 2);
+            ended.until = Some(now_s - 3_600);
+            file.peers[0].lend = vec![ended];
+            peer::config::save(&peers_path, &file).expect("the ended grant is seeded");
+        }
+
+        let share_on = |path: PathBuf| peer_cli::PeerArgs {
+            action: peer_cli::PeerAction::Share(peer_cli::PeerSwitchArgs {
+                peers: Some(path),
+                state: peer_cli::Switch::On,
+                window: peer_cli::PeerWindow::SevenDay,
+                fraction: 0.10,
+                ttl: 600,
+                max_inflight: 2,
+                scope: "all".to_string(),
+            }),
+        };
+        let refusal = run_peer(share_on(peers_path.clone()))
+            .await
+            .expect_err("an end that has passed is refused, not printed as success")
+            .to_string();
+        assert!(
+            refusal.contains("already"),
+            "the refusal says the lending has ended: {refusal}"
+        );
+        assert!(
+            refusal.contains("--relend") || refusal.contains("--for"),
+            "and it says what to type instead, or an operator reads it as a bug: {refusal}"
+        );
+
+        let row = read_back(&peers_path);
+        assert_eq!(
+            row.lend.len(),
+            1,
+            "a refusal writes nothing, so the one ended grant is still the only one"
+        );
+        assert!(
+            (row.lend[0].fraction - 0.05).abs() < f64::EPSILON,
+            "and it is untouched: the refused fraction of 0.10 is not on disk"
+        );
+        assert!(
+            !row.allow.inspect,
+            "nor is the `inspect` this verb would have granted, which would be a disclosure \
+             bought by a command that failed"
+        );
+
+        // The same verb on a grant whose end is ahead still works, which is the
+        // control: without it this test passes on a verb that refuses always.
+        {
+            let mut file = peer::config::read_or_default(&peers_path).expect("the seeded file");
+            file.peers[0].lend[0].until = Some(now_s + 3_600);
+            peer::config::save(&peers_path, &file).expect("the live grant is seeded");
+        }
+        run_peer(share_on(peers_path.clone()))
+            .await
+            .expect("an end still ahead is shared on as before");
+        let row = read_back(&peers_path);
+        assert!(
+            (row.lend[0].fraction - 0.10).abs() < f64::EPSILON,
+            "the new fraction lands"
+        );
+        assert_eq!(
+            row.lend[0].until,
+            Some(now_s + 3_600),
+            "and the operator's own end is still kept"
         );
     }
 

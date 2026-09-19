@@ -605,7 +605,10 @@ fn peers_fixture_rows() -> Vec<PeerStatusRow> {
                 last_ok_ms: Some(now_ms - 2_000),
             },
             teamclaude_rs::status::PathStatus {
-                endpoint: node(7).display(),
+                // The wire id, not `display()`: `PeerStatusRow::id` is the
+                // wire form and the panel resolves a via/reverse endpoint's
+                // name by looking `PathStatus::endpoint` up in that map.
+                endpoint: node(7).to_wire(),
                 kind: PathKind::Via,
                 rtt_ms: Some(96.0),
                 loss_pct: Some(0.02),
@@ -1288,7 +1291,11 @@ fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
         exits: [(
             "alice".to_string(),
             teamclaude_rs::status::PeerExitJson {
-                egress: format!("via {}", node(7).display()),
+                // The wire id, matching `Egress`'s own `Display` impl
+                // (`config.rs`: `write!(f, "{}{}", VIA_PREFIX, peer.to_wire())`).
+                // The fixture pinned the display form, which no code path
+                // actually emits.
+                egress: format!("via {}", node(7).to_wire()),
                 egress_strict: true,
                 peer_down: false,
                 waiting_seconds: None,
