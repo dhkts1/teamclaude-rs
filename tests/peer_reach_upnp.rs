@@ -959,6 +959,75 @@ fn natpmp_silence_falls_through_to_upnp_and_maps() {
     );
 }
 
+/// A NAT-PMP gateway address with nothing bound on it, so the probe comes back
+/// refused with an ICMP port unreachable.
+///
+/// A port is bound and then released rather than picked out of the air: a
+/// number nobody has ever bound is a number a sibling test in this binary may
+/// bind while this one runs, and then the refusal under test would be somebody
+/// else's silence.
+fn refusing_natpmp() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a port to learn a free one");
+    let addr = socket.local_addr().expect("its own address");
+    drop(socket);
+    addr
+}
+
+/// **The gate for tonight's router**: NAT-PMP REFUSED and UPnP answering, and
+/// the keeper comes back with a mapping.
+///
+/// The owner's router answers the port 5351 probe with an ICMP port
+/// unreachable, which arrives as `Connection refused`. That was returned as
+/// `ReachError::Socket`, a fault of this Mac's own socket, and the fallback
+/// asks UPnP only about an answer that means "this router may not speak
+/// NAT-PMP at all". So the one router the UPnP fallback was written for was
+/// the one router that never reached it, and the operator was told their local
+/// socket had failed.
+///
+/// The step list is what the assertion rests on rather than the mapping alone,
+/// for the reason the silence test gives: a `Mapped` here would mean the
+/// fallback never ran.
+///
+/// Watched red by narrowing `MappingKeeper::map` back to
+/// `Err(ReachError::Silent { .. })`: the keeper returns the refusal and never
+/// asks UPnP anything.
+#[test]
+fn a_refused_natpmp_probe_falls_through_to_upnp_and_maps() {
+    use teamclaude_rs::peer::reach::{MappingKeeper, MappingStep, NatPmp};
+
+    // `map_over_upnp` publishes to the process-wide register, which a sibling
+    // test asserts on.
+    let _register = hold_register();
+
+    let fake = FakeDevice::start(AddBehaviour::Confirm);
+    let refusing = refusing_natpmp();
+
+    let mut keeper = MappingKeeper::new(NatPmp::at(refusing), 41_237, 600)
+        .with_upnp(Discoverer::at(fake.ssdp_addr));
+    let mapping = keeper
+        .map()
+        .expect("the router refuses NAT-PMP and the UPnP fake answers, so something must map");
+
+    assert_eq!(
+        keeper.steps(),
+        &[MappingStep::MappedOverUpnp],
+        "a router that refuses the probe has no NAT-PMP service on it, which is the case UPnP \
+         is here for"
+    );
+    assert_eq!(
+        (mapping.internal_port, mapping.external_port),
+        (41_237, 41_237),
+        "UPnP IGD confirms the port asked for or refuses, so there is no other port it could \
+         have granted"
+    );
+    assert_eq!(
+        fake.log(),
+        vec!["discover", "add", "external-ip"],
+        "the fake has to have been discovered, asked, and asked for the address to advertise, \
+         in that order, or this mapping came from somewhere else"
+    );
+}
+
 /// **The other half of the gate**: both silent, and the verb says so.
 ///
 /// `tcr peer reach` reports NAT-PMP's own words for every outcome, and with

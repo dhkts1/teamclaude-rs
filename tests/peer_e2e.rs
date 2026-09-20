@@ -1579,7 +1579,7 @@ async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_c
 
 /// `tcr peer join --stdin`, which is the path the panel and the `tcr://` handler
 /// use: the key is piped, so it never enters an argument vector.
-fn join_with_stdin(mac: &Mac, key: &str) {
+fn join_with_stdin(mac: &Mac, key: &str) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
     command
         .args(["peer", "join", "--stdin", "--label", "borrower-mac"])
@@ -1611,12 +1611,17 @@ fn join_with_stdin(mac: &Mac, key: &str) {
         "the join must report the enrolment: {stdout}"
     );
     // The secret is a live bearer token for its ten minutes. Neither stream may
-    // echo it, and the failure paths print more than the success path.
-    let secret = key.trim_start_matches("tcr-join:v1:");
+    // echo it, and the failure paths print more than the success path. The
+    // field is taken off the END rather than by stripping a version prefix: the
+    // prefix moves between builds, and a strip that quietly matched nothing
+    // would leave this assertion comparing against the whole key, which no
+    // surface prints anyway.
+    let secret = key.rsplit(':').next().unwrap_or(key);
     assert!(
         !stdout.contains(secret) && !stderr.contains(secret),
         "the join key appeared in this command's own output"
     );
+    stdout
 }
 
 // ---------------------------------------------------------------------------
@@ -3728,4 +3733,92 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
     borrower.shutdown();
     carrier.shutdown();
     lender.shutdown();
+}
+
+/// **A key carries every address that Mac answers at, and the joiner works
+/// down the list.**
+///
+/// The real event this closes: a key minted on a Mac listening on `0.0.0.0`
+/// carried `0.0.0.0`, and the friend's `tcr peer join` dialled its own
+/// machine. The fix is a list, and a list is only worth carrying if the second
+/// address is really tried when the first one refuses, which is what this
+/// measures: the key handed to the guest below names a port nothing is
+/// listening on FIRST and the host's real one second.
+///
+/// Two processes, because the claim is about the shipped binary: the joiner's
+/// own fall-through is invisible from inside the library, and the line an
+/// operator reads (`peer join: ok addr=…`) has to name the address that
+/// answered rather than the one at the top of the key.
+///
+/// Watched red: with `connect_in_key_order` returning after its first
+/// attempt, the join exits non-zero and the failure names the dead port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_key_falls_through_to_the_second_address() {
+    let (upstream, _seen) = spawn_upstream().await;
+    let mut host = Mac::new("host", &upstream, "host-fake", "at-fake-host", false);
+    let mut guest = Mac::new("guest", &upstream, "guest-fake", "at-fake-guest", false);
+
+    step(1, "boot the two tcr processes");
+    host.boot();
+    guest.boot();
+
+    step(
+        2,
+        "the host mints a key, which carries the address it listens on",
+    );
+    let minted = host.peer_ok(&["invite", "--label", "guest-mac", "--ttl", "300"]);
+    let key = minted
+        .lines()
+        .find(|line| line.starts_with("tcr-join:"))
+        .unwrap_or_else(|| panic!("no join key on stdout: {minted}"))
+        .to_string();
+    let live = format!("127.0.0.1:{}", host.peer_port);
+    assert!(
+        key.contains(&live),
+        "the key has to carry the address the host really listens on: {key}"
+    );
+    assert!(
+        minted.contains(&format!("peer invite: chosen {live}")),
+        "the mint names each address it carried: {minted}"
+    );
+
+    step(
+        3,
+        "put a port nothing is listening on at the FRONT of the key's address list",
+    );
+    // Borrowed and released, so a connect to it is refused rather than
+    // answered by something this test did not start.
+    let dead = format!("127.0.0.1:{}", free_loopback_port());
+    let doctored = key.replacen(&live, &format!("{dead},{live}"), 1);
+    assert_ne!(doctored, key, "the fixture has to differ from the real key");
+
+    step(
+        4,
+        "the guest joins: the first address refuses, the second answers",
+    );
+    let stdout = join_with_stdin(&guest, &doctored);
+    assert!(
+        stdout.contains(&format!("peer join: ok addr={live}")),
+        "the line an operator reads must name the address that ANSWERED, not the first \
+         one in the key: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&dead),
+        "the dead address is not what this join ran over: {stdout}"
+    );
+
+    step(5, "and both Macs hold a pinned row for the other");
+    assert_eq!(
+        guest.pinned_nodes().len(),
+        1,
+        "the joiner pins the registrar it enrolled with"
+    );
+    assert_eq!(
+        host.pinned_nodes().len(),
+        1,
+        "and the registrar pins the joiner"
+    );
+
+    guest.shutdown();
+    host.shutdown();
 }

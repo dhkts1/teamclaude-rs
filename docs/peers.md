@@ -240,10 +240,15 @@ mints a one-use, ten-minute join key and rides it inside the same link, so openi
 completes pairing with this Mac, with no six-digit compare needed. Because that link is a live
 secret for as long as it is valid, send it somewhere as private as you would a password.
 
-`tcr peer invite` mints the same kind of one-use join key on its own (`tcr-join:v1:...`), for
-a Mac with no browser to open a link in; `tcr peer join --stdin` (or `--stdin` on
-`network-key join`) reads a key from standard input instead of the command line, so it never
-lands in shell history or in another process's view of this one's arguments.
+`tcr peer invite` mints the same kind of one-use join key on its own
+(`tcr-join:v2:<addr,addr,...>:...`), for a Mac with no browser to open a link in. The key
+carries every address this Mac answers at, best first, and the joining Mac works down the
+list, so the same key reaches a friend on the tailnet and a friend in the next room. A key
+from an older build carried one address, and this build still reads one of those.
+
+`tcr peer join --stdin` (or `--stdin` on `network-key join`) reads a key from standard input
+instead of the command line, so it never lands in shell history or in another process's view
+of this one's arguments.
 
 A Mac that already has a network key **refuses a link that carries a different one**, and says
 what accepting it would cut this Mac off from. Pasting a second office's key over the first is
@@ -269,6 +274,19 @@ Reaching it tries a few things, in order:
   re-reads it every few seconds, so turning it on asks the router within that and turning it
   off deletes the mapping, neither needing a restart.
   `tcr peer reach` prints what your router agreed to.
+
+  Routers turn NAT-PMP down in two ways: most say nothing at all, and some refuse the request
+  outright. Both mean the same thing, that there is no NAT-PMP service there to ask, so both
+  are followed by the UPnP attempt. A router that will not open a port over either protocol is
+  asked again more and more slowly, after 5 seconds, then 30, then 2 minutes, then every 10
+  minutes, rather than every few seconds all day; the wait goes back to 5 seconds the moment
+  anything could have changed, when you turn the switch off and on again, when this Mac moves
+  to another router, or when a request is granted. What you see in the log is one line when
+  the answer changes and nothing more until it changes again.
+
+  If neither protocol will open a port, two things still work: forward the peer listener's port
+  to this Mac by hand in your router's own settings, or put both Macs on one private network
+  (Tailscale, or any VPN they both join) and pair over that.
 - **A fallback port that changes with the clock, for the dialling side only.** If
   the address this Mac last saw the peer at stops answering, both sides already know, without
   saying so to each other, a small set of ports that are "accepted" for right now: they are
