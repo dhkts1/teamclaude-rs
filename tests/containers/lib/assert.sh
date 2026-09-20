@@ -50,35 +50,37 @@ expect() {
   fi
 }
 
-# expect_log <container> <regex> <what>
-# Passes when the container's boot log carries a line matching the regex.
-# Prints the matched line as part of the PASS, because a scenario's evidence is
-# the line, not the exit code of grep.
+# expect_log <node> <regex> <what>
+# Passes when the node's boot log carries a line matching the regex. Prints
+# the matched line as part of the PASS, because a scenario's evidence is the
+# line, not the exit code of grep. The boot log is read at /lab/$node/boot.log:
+# past `docker exec`, which is the Docker dependency a reader of this file used
+# to miss, and the parameter's own name now says what it holds.
 expect_log() {
-  container="$1"
+  node="$1"
   pattern="$2"
   what="$3"
-  line="$(docker exec "$container" grep -hE "$pattern" /scratch/boot.log 2>/dev/null | tail -1)"
+  line="$(grep -hE "$pattern" "/lab/$node/boot.log" 2>/dev/null | tail -1)"
   if [ -n "$line" ]; then
     pass "$what: $line"
   else
-    fail "$what: no line matching /$pattern/ in $container:/scratch/boot.log"
+    fail "$what: no line matching /$pattern/ in /lab/$node/boot.log"
   fi
 }
 
-# refute_log <container> <regex> <what>
+# refute_log <node> <regex> <what>
 # The inverse, for the facts that are about an absence. An absence is only
 # evidence when the log has something in it at all, so this fails a log that is
 # empty rather than reporting a clean absence from a file that never got written.
 refute_log() {
-  container="$1"
+  node="$1"
   pattern="$2"
   what="$3"
-  if ! docker exec "$container" test -s /scratch/boot.log 2>/dev/null; then
-    fail "$what: $container:/scratch/boot.log is empty, so its absence proves nothing"
+  if ! test -s "/lab/$node/boot.log"; then
+    fail "$what: /lab/$node/boot.log is empty, so its absence proves nothing"
     return
   fi
-  line="$(docker exec "$container" grep -hE "$pattern" /scratch/boot.log 2>/dev/null | tail -1)"
+  line="$(grep -hE "$pattern" "/lab/$node/boot.log" 2>/dev/null | tail -1)"
   if [ -n "$line" ]; then
     fail "$what: found $line"
   else
