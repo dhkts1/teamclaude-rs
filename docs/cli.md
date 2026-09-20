@@ -1012,6 +1012,14 @@ The key carries **every address this Mac can be reached at**, best first
 address, then the external address a port mapping published, then each address a real
 interface holds. A bind address is never one of them: a Mac listening on `0.0.0.0` used to
 mint a key reading `0.0.0.0`, which sent the friend's `tcr peer join` at its own machine.
+
+`tcr peer invite` runs as its own short-lived process, so the external address is read off the
+state file a serving process's keeper wrote, not asked of the router by this command itself
+(the same reader `tcr peer moved mint` uses). A mapping past its deadline, or one whose router
+would not name its own external address, is left out and said out loud: `peer invite: the
+router mapped a port and would not name its own external address, so this key carries what
+this Mac answers on here alone`.
+
 Under the key, one line per address says which kind it is:
 
 ```
@@ -1286,10 +1294,16 @@ dials a peer or touches the running proxy.
 | `--json` | bool | `false` | machine-readable output |
 
 It prints, in order: this Mac's global IPv6 addresses (none, if it has none); the router's
-NAT-PMP answer, meaning the gateway found, the external address, and the mapping outcome when
+answer, meaning the gateway found, the external address, and the mapping outcome when
 `--map` was passed (a refusal is an ordinary outcome, not an error); the local listen port;
 the current time-derived port slot; and, per pinned peer, that peer's derived port for this
 slot. A refusal from the router, or a peer row with no derived port yet, still exits 0.
+
+The external address is asked over NAT-PMP first and UPnP IGD when NAT-PMP refuses, the same
+order the mapping itself falls back through, and the line names which protocol answered:
+`reach: external-address: <addr> (nat-pmp)` or `reach: external-address: <addr> (upnp)`. A
+router that answers neither prints `reach: external-address: unavailable: <nat-pmp refusal>
+(nat-pmp), <upnp refusal> (upnp)`.
 
 ### `tcr peer graph <--json\|--serve>`
 

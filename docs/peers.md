@@ -560,10 +560,12 @@ proxy starts, so quit and reopen it once after that first command, before going 
    tcr peer reach
    ```
 
-   prints `reach: gateway: <addr>`, `reach: external-address: <addr>`, `reach: mapping: not
-   asked for (pass --map)` unless `--map` is given, and `reach: listen-port: <port>`, or
-   `reach: listen-port: none (the peer listener is off)`. `tcr peer reach --map` asks the
-   router directly instead of reading what a running `tcr` already holds.
+   prints `reach: gateway: <addr>`, `reach: external-address: <addr> (nat-pmp)`, `reach:
+   mapping: not asked for (pass --map)` unless `--map` is given, and `reach: listen-port:
+   <port>`, or `reach: listen-port: none (the peer listener is off)`. `tcr peer reach --map`
+   asks the router directly instead of reading what a running `tcr` already holds. A router
+   that answers only UPnP, not NAT-PMP, still gets an address here: `tcr peer reach` asks
+   UPnP too, and the line says which protocol answered, `(upnp)` instead of `(nat-pmp)`.
 
    The same command also prints the current clock-derived fallback slot: `reach: slot: <n>
    (30s each, the slot before and after also accepted)`. That slot is the port both sides

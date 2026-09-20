@@ -281,7 +281,7 @@ async fn a_two_process_join_leaves_a_pinned_row_on_both_sides() {
     registrar.write_file(&file);
 
     let store = config::PeerStore::open(&registrar.peers).expect("open the registrar's store");
-    let (invite, token) = pair::mint_invite_as(&store, &registrar.key, "laptop-2", 600, 1)
+    let (invite, token) = pair::mint_invite_as(&store, &registrar.key, "laptop-2", 600, 1, None)
         .expect("mint a one-use invite");
     assert_eq!(invite.uses_left, 1);
 
@@ -368,7 +368,7 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
         node.write_file(&file);
 
         let store = config::PeerStore::open(&node.peers).expect("open the store");
-        let (_invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1)
+        let (_invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)
             .expect("mint a one-use invite");
 
         // Two joiners with DIFFERENT static keys, which is the case that
@@ -2736,7 +2736,7 @@ fn every_pin_writer_records_the_address_it_was_reached_over() {
     file.listen = Some("127.0.0.1:9600".parse().expect("the literal parses"));
     node.write_file(&file);
     let store = config::PeerStore::open(&node.peers).expect("re-open after the listen edit");
-    let (invite, _token) = pair::mint_invite_as(&store, &node.key, "attic-nuc", 600, 1)
+    let (invite, _token) = pair::mint_invite_as(&store, &node.key, "attic-nuc", 600, 1, None)
         .expect("mint a one-use invite");
     let joiner = PeerId([0x22_u8; 32]);
     let arrived_from: SocketAddr = "192.0.2.8:51234".parse().expect("the literal parses");
@@ -3651,7 +3651,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
         node.write_file(&file);
 
         let store = config::PeerStore::open(&node.peers).expect("open the store");
-        let (invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1)
+        let (invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)
             .expect("mint a one-use invite");
 
         let joiner = PeerId([0x33; 32]);
@@ -4264,7 +4264,7 @@ fn a_mint_on_a_wide_listener_carries_no_bind_address() {
     node.write_file(&file);
     let store = config::PeerStore::open(&node.peers).expect("open the store");
 
-    match pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1) {
+    match pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None) {
         Ok((_invite, token)) => {
             assert!(
                 !token
@@ -4301,8 +4301,8 @@ fn a_mint_on_a_pinned_listener_carries_exactly_that_address() {
     node.write_file(&file);
     let store = config::PeerStore::open(&node.peers).expect("open the store");
 
-    let (_invite, token) =
-        pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1).expect("an invite is minted");
+    let (_invite, token) = pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1, None)
+        .expect("an invite is minted");
     assert_eq!(
         token.sockets().collect::<Vec<_>>(),
         vec!["127.0.0.1:9600"
