@@ -367,8 +367,8 @@ jobs:
           cargo +nightly miri test account_uuid::
           cargo +nightly miri test quota::
 
-  # netlab (phase 7 of docs/plans/lan-p2p/netlab-design.md), red-allowed. Runs
-  # every scenario tests/containers/** already proves under compose, this time
+  # netlab, red-allowed. Runs every scenario tests/containers/** already
+  # proves under compose, this time
   # one namespace lab per scenario inside a single Docker container
   # (--network none, NET_ADMIN plus SYS_ADMIN, nothing else), so the scenario
   # file is exercised under both harnesses on every pull request instead of
