@@ -23,7 +23,7 @@ import Foundation
 ///
 /// `pending` reads the peer STATE FILE and never opens a socket. `tcr peer
 /// status --json` asks the running proxy, so a proxy that is down would answer
-/// "no knocks" — a silence that looks exactly like nobody asking, on the one
+/// "no knocks": a silence that looks exactly like nobody asking, on the one
 /// surface whose whole job is to say that somebody is.
 ///
 /// # What a failed read is
@@ -125,8 +125,8 @@ public final class KnockReader: ObservableObject {
         }
     }
 
-    /// `{"pending": [...], "muted": [...], "banned": [...]}` — the document
-    /// `tcr peer pending --json` prints — down to the rows this reader is for.
+    /// `{"pending": [...], "muted": [...], "banned": [...]}`, the document
+    /// `tcr peer pending --json` prints, down to the rows this reader is for.
     ///
     /// Row at a time, for the reason ``Fleet/decode(_:)`` gives: one knock a
     /// newer `tcr` writes in a shape this build cannot read must cost that

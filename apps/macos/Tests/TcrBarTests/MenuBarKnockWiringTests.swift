@@ -6,7 +6,7 @@ import XCTest
 ///
 /// `MenuBarShell` is in the `TcrBar` executable target, which this test target
 /// does not link (`Package.swift` gives it `TcrBarCore` alone), so the claims
-/// about the status item are made against its text — the same arrangement
+/// about the status item are made against its text, the same arrangement
 /// `PeersPanelWiringTests` uses for the panel. What can be a value is a value:
 /// the sentence, the spoken description and the reader's decoding are tested
 /// directly in this target.
@@ -39,7 +39,7 @@ final class MenuBarKnockWiringTests: XCTestCase {
     ///
     /// `updateMark` used to write `button.title = ""` in the `else` of the
     /// counts preference, which would erase a knock segment on every Mac with
-    /// counts off — the default.
+    /// counts off, the default.
     func testTheKnockSegmentIsDrawnAheadOfAndIndependentlyOfTheCounts() throws {
         let shell = try source("apps/macos/Sources/TcrBar/MenuBarShell.swift")
         let title = try slice(

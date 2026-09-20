@@ -2074,7 +2074,7 @@ struct PeersTabV4: View {
         // amber is what this tab already spends on "waiting on you". A knock
         // is the only card here with a clock running against it: ten minutes,
         // and then the person on the other Mac gets nothing. The reserved hue
-        // stays reserved — `Tok.unknown` means plaintext crossing a machine
+        // stays reserved: `Tok.unknown` means plaintext crossing a machine
         // boundary, and a knock discloses nothing at all.
         return V4Card(accent: Tok.near) {
             VStack(alignment: .leading, spacing: V4.knockLineGap) {
@@ -2342,7 +2342,7 @@ struct PeersTabV4: View {
             // Derived, then MEASURED: 160 pt here against 158 pt read off the
             // rendered panel, whose wrapped lines stack a little tighter than
             // a line box each. The two points are reserved and unused, which
-            // is the safe direction — under-charging is what takes points out
+            // is the safe direction: under-charging is what takes points out
             // of the footer, and over-charging by a line's rounding does not.
             knockCardHeight: V4.lineHeight(V4.nameSize)
                 + (1 + knockDetailLines) * V4.lineHeight(V4.muteSize)

@@ -283,7 +283,7 @@ final class MenuBarShell {
     // This is the specific thing `MenuBarExtra` did for free. `FleetView`
     // measures its own row height through a `GeometryReader` preference
     // (`FleetView.swift:44-56, 178-189`), which exists precisely because a
-    // scroll view's ideal height collapses to about one row — so a shell
+    // scroll view's ideal height collapses to about one row, so a shell
     // that does not propagate the preferred size up to the popover
     // reproduces that exact bug, and it looks like a SwiftUI layout problem
     // rather than a missing line here. `--shell-probe` assertion 5 checks
@@ -312,7 +312,7 @@ final class MenuBarShell {
     // reach a cycle that never reads a preference, and none of the three
     // 0.2.43 stacks contains a TcrBar frame at all.
     //
-    // `quantized` is no longer called from this target — `settled` owns the
+    // `quantized` is no longer called from this target: `settled` owns the
     // publish path and calls it internally, and it was made internal to
     // `TcrBarCore` so that re-adding it at a `GeometryReader` emitter fails
     // to compile rather than silently reverting the fix.
@@ -486,8 +486,8 @@ final class MenuBarShell {
             title.append(asking)
         }
         // `state.countsLabel` (`TcrBarCore/StatusPoller.swift`) is `nil` for
-        // the same cases the cup's fill already carries — pending, a failed
-        // read, an all-disabled fleet — so the guard here is purely
+        // the same cases the cup's fill already carries, pending, a failed
+        // read, an all-disabled fleet, so the guard here is purely
         // `showCounts`; the state check already happened.
         guard showCounts, let label = state.countsLabel else { return title }
         if title.length > 0 {

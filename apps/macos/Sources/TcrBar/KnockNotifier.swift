@@ -16,7 +16,7 @@ import UserNotifications
 ///
 /// # The bundle identifier trap
 ///
-/// `UNUserNotificationCenter.current()` traps — not throws, not returns nil —
+/// `UNUserNotificationCenter.current()` traps, not throws, not returns nil,
 /// in a process with no bundle identifier. `--render-states`, `--render-mark`
 /// and `--shell-probe` all run the raw `swift build` binary, which has none,
 /// so the centre is built LAZILY behind that check and every one of those

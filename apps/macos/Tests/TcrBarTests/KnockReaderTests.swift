@@ -63,8 +63,8 @@ final class KnockReaderTests: XCTestCase {
             "a bare array is not this verb's document")
         XCTAssertEqual(
             KnockReader.decode(output(#"{"muted":[],"banned":[]}"#)), .failed,
-            "a document with no pending key at all — an older tcr printing something else "
-                + "entirely — read as nobody asking")
+            "a document with no pending key at all, an older tcr printing something else "
+                + "entirely, read as nobody asking")
     }
 
     /// One unreadable row costs that row and never the Mac asking beside it,

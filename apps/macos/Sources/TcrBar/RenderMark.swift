@@ -70,7 +70,7 @@ enum RenderMark {
             // and the cup, nothing else.
             ("10-dark-knock-one", .loaded(partialReadyFleet), true, false, false, nil, 1),
             // Two asking, counts and running tools on: the fullest the item
-            // ever gets, and the order it is fixed in — what wants an answer,
+            // ever gets, and the order it is fixed in: what wants an answer,
             // then what the fleet is doing.
             ("11-dark-knock-two-counts-on", .loaded(runningToolsFleet), true, true, true, nil, 2),
             ("12-light-knock-one", .loaded(partialReadyFleet), true, false, false, .aqua, 1),

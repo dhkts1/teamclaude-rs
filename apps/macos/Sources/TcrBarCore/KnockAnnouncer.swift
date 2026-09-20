@@ -51,7 +51,7 @@ public struct KnockAnnouncer: Equatable, Sendable {
     private var announced: Set<String> = []
     /// Whether any read has been folded in yet. The FIRST one is adopted, not
     /// announced, and "no read yet" is a different state from "a read that
-    /// found nobody" — which is why this is a flag and not `announced.isEmpty`.
+    /// found nobody", which is why this is a flag and not `announced.isEmpty`.
     private var adopted = false
 
     public init() {}

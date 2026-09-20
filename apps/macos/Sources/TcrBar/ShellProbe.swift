@@ -307,13 +307,13 @@ enum ShellProbe {
         //     so the gauge is right in both while the cup stays cyan in both.
         checks.append(appearanceCheck())
 
-        // 10 — `UNUserNotificationCenter.current()` TRAPS in a process with no
+        // 10. `UNUserNotificationCenter.current()` TRAPS in a process with no
         //      bundle identifier, and this binary is one: `--render-states`,
         //      `--render-mark` and this probe all run the raw `swift build`
         //      product. `KnockNotifier` builds the centre lazily behind a
         //      `Bundle.main.bundleIdentifier != nil` guard, and the only way to
-        //      know the guard is what stopped it — rather than nothing ever
-        //      having asked — is to drive a read that WOULD post and then look.
+        //      know the guard is what stopped it, rather than nothing ever
+        //      having asked, is to drive a read that WOULD post and then look.
         //
         //      Two reads: the first is adopted silently, the second carries a
         //      Mac the first did not, which is the exact shape that posts a
