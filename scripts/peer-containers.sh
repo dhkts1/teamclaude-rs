@@ -57,6 +57,14 @@ if ! command -v "$DOCKER" >/dev/null 2>&1; then
   echo "runner: FAIL: no docker on PATH (set DOCKER=/path/to/docker)" >&2
   exit 2
 fi
+# The scenarios read `tcr peer ls --json` through tests/containers/lib/peer-read.py,
+# which is stdlib python the same way the mDNS observer and the stub upstream
+# are. Refused up front, because a scenario that lost its reader half way
+# through would print FAIL lines about endpoints it never managed to read.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "runner: FAIL: no python3 on PATH, which the scenarios read the peer listing with" >&2
+  exit 2
+fi
 
 echo "== building the images (CARGO_BUILD_JOBS=$JOBS)"
 "$DOCKER" build --build-arg "CARGO_BUILD_JOBS=$JOBS" \

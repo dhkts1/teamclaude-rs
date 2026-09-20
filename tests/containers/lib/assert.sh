@@ -17,15 +17,25 @@
 ASSERT_FAILURES=0
 ASSERT_TOTAL=0
 
+# One assertion is one line, whatever it was handed.
+#
+# The evidence an assertion carries is usually a command's whole output, and a
+# refusal is the case where that output is several lines. Left alone, those
+# lines land in the log without the scenario name on them, so the one thing
+# every reader does with this harness, grep for FAIL, returns the first line of
+# the failure and hides the rest of it. The newlines become separators and
+# nothing is dropped.
+one_line() { printf '%s' "$*" | tr '\n' '~' | tr -s '~' | sed 's/~/ | /g'; }
+
 pass() {
   ASSERT_TOTAL=$((ASSERT_TOTAL + 1))
-  echo "$SCENARIO: PASS: $*"
+  printf '%s: PASS: %s\n' "$SCENARIO" "$(one_line "$@")"
 }
 
 fail() {
   ASSERT_TOTAL=$((ASSERT_TOTAL + 1))
   ASSERT_FAILURES=$((ASSERT_FAILURES + 1))
-  echo "$SCENARIO: FAIL: $*"
+  printf '%s: FAIL: %s\n' "$SCENARIO" "$(one_line "$@")"
 }
 
 # expect <condition-description> <command...>

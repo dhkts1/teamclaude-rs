@@ -23,6 +23,15 @@ GROUP = "224.0.0.251"
 PORT = 5353
 SERVICE = "_tcr-peer._tcp.local."
 WINDOW = float(sys.argv[1]) if len(sys.argv) > 1 else 10.0
+# Which interface to ask on, named by its own address.
+#
+# The default, INADDR_ANY, leaves the choice to the routing table, and a
+# container on a Docker network marked `internal: true` has no default route at
+# all: the group join then fails outright with ENODEV and the send with
+# ENETUNREACH, on a bridge that forwards multicast perfectly well. Naming the
+# address the harness assigned this container skips the routing table, which is
+# the whole of the fix.
+INTERFACE = sys.argv[2] if len(sys.argv) > 2 else "0.0.0.0"
 
 
 def encode_name(name):
@@ -59,10 +68,11 @@ query = struct.pack("!HHHHHH", 0, 0, 1, 0, 0, 0) + encode_name(SERVICE) + struct
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind(("", PORT))
+sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(INTERFACE))
 sock.setsockopt(
     socket.IPPROTO_IP,
     socket.IP_ADD_MEMBERSHIP,
-    struct.pack("4sl", socket.inet_aton(GROUP), socket.INADDR_ANY),
+    struct.pack("4s4s", socket.inet_aton(GROUP), socket.inet_aton(INTERFACE)),
 )
 sock.settimeout(1.0)
 sock.sendto(query, (GROUP, PORT))
@@ -96,5 +106,8 @@ while time.time() < deadline:
             print(f"mdns: {source}: {target}", flush=True)
             answers += 1
 
-print(f"mdns: answers={answers} window={WINDOW}s service={SERVICE}", flush=True)
+print(
+    f"mdns: answers={answers} window={WINDOW}s service={SERVICE} interface={INTERFACE}",
+    flush=True,
+)
 sys.exit(0 if answers else 1)
