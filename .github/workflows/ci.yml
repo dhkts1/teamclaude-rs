@@ -381,11 +381,40 @@ jobs:
     if: needs.changes.outputs.inert != 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 12
+    # 25: room for the toolchain install, the cache restore, the release
+    # build and both runs (native, then Docker) on the same runner. The
+    # Docker run alone measured 9m04s in run 35527760655.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
 
-      - name: Run the netlab scenarios
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # miniupnpd is the one Dockerfile.netlab:16 installs that ubuntu-latest
+      # does not carry; ip/iptables/iproute2/python3/unshare are already on
+      # the image. iptables here provides both the nft and the legacy
+      # binaries native-inner.sh's scenarios need.
+      - name: Install native netlab dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iptables miniupnpd
+
+      - name: Build tcr (release)
+        run: |
+          cores="$(nproc)"
+          export CARGO_BUILD_JOBS="$cores"
+          cargo build --release --locked --bin tcr
+
+      - name: Run the netlab scenarios (native, no Docker)
+        run: |
+          set -o pipefail
+          sudo -E scripts/peer-containers.sh --native all 2>&1 | tee "$RUNNER_TEMP/netlab-native.log"
+
+      - name: Run the netlab scenarios (Docker)
         run: |
           cores="$(nproc)"
           export CARGO_BUILD_JOBS="$cores"
@@ -396,4 +425,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: netlab-log
-          path: ${{ runner.temp }}/netlab.log
+          path: |
+            ${{ runner.temp }}/netlab.log
+            ${{ runner.temp }}/netlab-native.log
