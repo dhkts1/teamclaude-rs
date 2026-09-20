@@ -400,34 +400,24 @@ pub fn token_from_reader<R: std::io::BufRead>(mut reader: R) -> Result<JoinToken
     JoinToken::parse(&line)
 }
 
-/// Whether `addr` is in `100.64.0.0/10`, the range RFC 6598 set aside for
-/// carrier-grade NAT and the range Tailscale numbers a tailnet out of.
-///
-/// Written here rather than reused because the one other place in this tree
-/// that knows the range knows it in prose only:
-/// `crate::peer::listener::is_lan_scope_v4` deliberately does NOT count it as
-/// LAN (its doc says why, a tailnet is not this LAN), so calling that predicate
-/// would answer the opposite question. The wish to have one exported predicate
-/// is reported rather than taken, because that file is not this unit's.
-fn is_carrier_grade_nat(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v4) => {
-            let [a, b, _, _] = v4.octets();
-            a == 100 && (64..128).contains(&b)
-        }
-        IpAddr::V6(_) => false,
-    }
-}
-
 /// Whether this address is a tailnet one: a `utun` interface holding an
-/// address in [`is_carrier_grade_nat`]'s range.
+/// address in `100.64.0.0/10`, the range RFC 6598 set aside for carrier-grade
+/// NAT and the range Tailscale numbers a tailnet out of.
 ///
 /// **Both halves, and the name is the half that matters.** The range alone also
 /// covers a Mac behind a mobile hotspot, whose carrier-NAT address is reachable
 /// by nothing outside that hotspot; ranking one of those first would put the
 /// deadest address at the top of every key minted on a tethered Mac.
+///
+/// The range check is [`crate::peer::listener::is_carrier_grade_nat`], the one
+/// exported predicate `crate::peer::listener::is_lan_scope_v4` sits beside; an
+/// IPv6 address is never a tailnet one here because `is_tailnet` only ever
+/// sees the range's own /10, which is IPv4.
 fn is_tailnet(host: &HostAddress) -> bool {
-    host.interface.starts_with("utun") && is_carrier_grade_nat(host.addr)
+    let IpAddr::V4(v4) = host.addr else {
+        return false;
+    };
+    host.interface.starts_with("utun") && crate::peer::listener::is_carrier_grade_nat(v4)
 }
 
 /// Every address a friend could dial this Mac at, best first.
@@ -499,22 +489,14 @@ pub fn dial_addresses(
 /// Every address a real, operationally-up interface holds right now, with the
 /// interface's own name.
 ///
-/// The interface walk is `if-addrs`, the same crate and the same two filters
-/// `crate::status::network_fact` uses; its own walk keeps no names and is
-/// private, so the four lines are here rather than borrowed. An interface whose
-/// state this platform cannot report reads as down, which can only ever make a
-/// key carry FEWER addresses, never a dead one.
+/// The walk is [`crate::status::network_fact::interfaces`], the one place in
+/// this tree that calls `if-addrs::get_if_addrs`. An interface whose state
+/// this platform cannot report reads as down, which can only ever make a key
+/// carry FEWER addresses, never a dead one.
 fn host_addresses() -> Vec<HostAddress> {
-    let Ok(interfaces) = if_addrs::get_if_addrs() else {
-        return Vec::new();
-    };
-    interfaces
+    crate::status::network_fact::interfaces()
         .into_iter()
-        .filter(|interface| interface.is_oper_up() && !interface.is_loopback())
-        .map(|interface| HostAddress {
-            interface: interface.name.clone(),
-            addr: interface.ip(),
-        })
+        .map(|(interface, addr)| HostAddress { interface, addr })
         .collect()
 }
 
