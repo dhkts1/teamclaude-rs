@@ -1211,15 +1211,28 @@ and pairs nothing. See [peers.md](peers.md) § "When both Macs moved".
 `mint` seals for one Mac at a time, under a key derived from the secret that pair already
 shares. It refuses a Mac this one has never completed a session with since that secret existed,
 and the refusal carries the fix: the two have to talk once, over any address that works, before
-either can seal for the other. The link carries at most this Mac's listen socket and the router
-mapping a serving process holds; it never carries the address that peer last said it sees this
-Mac at, which is the address this Mac had *before* it moved.
+either can seal for the other.
+
+What the link carries is every address a friend could dial this Mac at, ranked the way an invite
+key ranks them: the tailnet address first, then the external socket a router mapping published,
+then the addresses this Mac's own interfaces hold. A listen socket bound to every interface,
+`0.0.0.0:7755`, is not itself one of them: it is what the listener is BOUND to, and a friend
+still has to reach this Mac at one particular interface. A Mac with none of the three, and no
+router mapping, gets a refusal naming `tcr peer reach` and `tcr peer internet on` rather than a
+link with nothing dialable in it. The link never carries the address that peer last said it sees
+this Mac at, which is the address this Mac had *before* it moved.
 
 `open` without `--yes` writes nothing, the same split `tcr peer id --regenerate` makes with its
 own `--yes`. What it can add is bounded: at most two addresses, on a row this Mac has already
 pinned, at the lowest confidence band there is. It never creates a row, never un-forgets a Mac,
 never touches a network key and never turns a switch on. Pasting the same link twice writes the
 file once.
+
+When `open --yes` writes nothing it says which of the four reasons applies, because they need
+different things from the person reading: the Mac is already reachable at everything the link
+says (`already-known`); the row's slots for a link are full; nothing in the link is an address
+anything can dial, so the Mac that sent it has to mint a new one; or this Mac holds no row for
+that peer at all, which means the pairing is gone and a link never brings one back.
 
 ```
 $ tcr peer moved mint 0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G

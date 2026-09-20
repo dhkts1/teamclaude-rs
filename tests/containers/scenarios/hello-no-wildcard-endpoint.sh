@@ -11,12 +11,22 @@
 #   1. up node-a1 node-a2, pair each way
 #   2. on node-a2: tcr peer hello <node-a1 id>
 #   3. on node-a1: tcr peer hello <node-a2 id>
-#   4. on both: tcr peer ls --json, and read every endpoint on every row
+#   4. on both: tcr peer ls --json, and read the row each one wrote
 #
-# Assertions, one line per endpoint on either node
-#   - its host is not 0.0.0.0 and not ::
-#   - its port is the peer's listen port, not the source port of the connection
-#     that carried the hello
+# Assertions, TWO per node, whatever its row holds
+#   - the row holds exactly one endpoint: this cast has one address per Mac, so
+#     a second entry is a second way to the same Mac and there is no second way
+#   - that endpoint is a dialable host on the peer's listen port, not 0.0.0.0,
+#     not ::, and not the source port of the connection that carried the hello
+#
+# **The count is fixed, and it has to be.** An earlier version printed one line
+# per endpoint, so the total counted the rows rather than the facts: the defect
+# it was written against put a dead ephemeral entry beside every good one, which
+# made the total larger while the tree was WORSE, and fixing the defect made the
+# same clean run print a smaller number. A scenario whose pass total moves with
+# the data cannot be read as a number by anyone, including the person deciding
+# whether a fix landed. The "exactly one" assertion is where the extra entries
+# are caught now, and it says what it counted when it fails.
 #
 # Both directions of hello, not one. The greeting writes on both sides, by two
 # different code paths: the dialling CLI records what came back, and the
@@ -70,49 +80,63 @@ say_hello() {
 say_hello node-a2 "$a1_id"
 say_hello node-a1 "$a2_id"
 
-# --- every endpoint on every row -----------------------------------------
+# --- the row each node wrote ---------------------------------------------
 # The rule, stated once: a recorded endpoint is dialable and answers on the
 # peer's listen port. A wildcard host is not dialable, and the ephemeral port a
 # hello arrived from belongs to that one connection and to nothing else.
+#
+# Two assertions per node and never one per endpoint, so the total says the same
+# thing on every run. The first counts; the second reads the one entry that
+# survived counting. A row with two entries fails the first and never reaches
+# the second, which is what a reader wants from a scenario named for an endpoint
+# that must not be there.
 check_endpoints() {
-  # $1 the node whose file this is, $2 the peer id whose row to read.
+  # $1 the node whose file this is, $2 the peer id whose row to read,
+  # $3 the address that node paired at, which is the only one it can hold.
   who="$1"
   wanted="$2"
+  expected="$3"
   listing="$SCRATCH/$who-ls.json"
   endpoints="$SCRATCH/$who-endpoints.txt"
   if ! ls_json "$who" "$listing"; then
     fail "$who: could not read its own peer listing"
+    fail "$who: and so nothing was read about the row for $wanted"
     return
   fi
   if ! python3 "$LIB/peer-read.py" endpoints "$wanted" < "$listing" > "$endpoints" 2>&1; then
     fail "$who: no pinned row for $wanted, so its endpoints prove nothing: $(cat "$endpoints")"
+    fail "$who: and so nothing was read about that row's one endpoint"
     return
   fi
-  if [ ! -s "$endpoints" ]; then
-    fail "$who: the row for $wanted holds no endpoint at all, so an absence of wildcards proves nothing"
+
+  held="$(grep -c . "$endpoints" || true)"
+  if [ "$held" = "1" ]; then
+    pass "$who holds exactly one endpoint for $wanted, which is how many ways there are to it"
+  else
+    fail "$who holds $held endpoints for $wanted where this cast has one address per Mac: $(tr '\n' ' ' < "$endpoints")"
+  fi
+
+  only="$(head -1 "$endpoints")"
+  kind="${only%% *}"
+  value="${only#* }"
+  if [ "$kind" != "direct" ]; then
+    fail "$who holds a $kind path to $value for $wanted, where a hello on one LAN writes a socket"
     return
   fi
-  while read -r kind value; do
-    case "$kind" in
-      direct) ;;
-      *)
-        pass "$who holds a $kind path to $value, which carries no socket to be wrong about"
-        continue
-        ;;
-    esac
-    host="${value%:*}"
-    port="${value##*:}"
-    if [ "$host" = "0.0.0.0" ] || [ "$host" = "[::]" ] || [ "$host" = "::" ]; then
-      fail "$who records $value for $wanted: $host is the unspecified address, which nothing can dial"
-    elif [ "$port" != "$LISTEN_PORT" ]; then
-      fail "$who records $value for $wanted: port $port is not the peer's listen port $LISTEN_PORT"
-    else
-      pass "$who records $value for $wanted: a dialable host on the listen port"
-    fi
-  done < "$endpoints"
+  host="${value%:*}"
+  port="${value##*:}"
+  if [ "$host" = "0.0.0.0" ] || [ "$host" = "[::]" ] || [ "$host" = "::" ]; then
+    fail "$who records $value for $wanted: $host is the unspecified address, which nothing can dial"
+  elif [ "$port" != "$LISTEN_PORT" ]; then
+    fail "$who records $value for $wanted: port $port is not the peer's listen port $LISTEN_PORT"
+  elif [ "$value" != "$expected" ]; then
+    fail "$who records $value for $wanted, which is not the address it paired at, $expected"
+  else
+    pass "$who records $value for $wanted: a dialable host on the listen port"
+  fi
 }
 
-check_endpoints node-a1 "$a2_id"
-check_endpoints node-a2 "$a1_id"
+check_endpoints node-a1 "$a2_id" "10.77.1.12:$LISTEN_PORT"
+check_endpoints node-a2 "$a1_id" "10.77.1.11:$LISTEN_PORT"
 
 finish

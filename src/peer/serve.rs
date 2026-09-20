@@ -2010,15 +2010,34 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
     }
 
     let now = crate::now_ms();
-    // The peer's own claimed addresses, plus the socket this dial actually
-    // reached when that is not redundant with one of them: see
+    // The peer's own claimed addresses, plus the host this dial actually
+    // reached on the port that hello announced: see
     // [`crate::peer::config::endpoints_and_connection_from_hello`] for why an
-    // unconditional push of `reached` would leave a dead ephemeral entry on
-    // the row next to the address the peer already named.
+    // unconditional push of `reached` would leave a dead entry on the row next
+    // to the address the peer already named.
     let learned =
         crate::peer::config::endpoints_and_connection_from_hello(&theirs.addrs, reached, now);
-    crate::peer::config::observe_endpoints(store.path(), peer, &learned)
-        .context("peer hello: could not record where this peer answers")?;
+    // Every outcome is said out loud at debug, because two of the three are a
+    // peer this node now holds no fresh way to reach, and a silent write path
+    // makes that look identical to a successful one.
+    match crate::peer::config::observe_endpoints(store.path(), peer, &learned)
+        .context("peer hello: could not record where this peer answers")?
+    {
+        crate::peer::config::Observed::Written { added } => tracing::debug!(
+            peer = %peer.display(),
+            added,
+            "peer hello: recorded where this peer answers",
+        ),
+        crate::peer::config::Observed::NothingDialable => tracing::debug!(
+            peer = %peer.display(),
+            "peer hello: nothing this peer named is an address anything can dial, so its row \
+             keeps the endpoints it already had",
+        ),
+        crate::peer::config::Observed::NoRow => tracing::debug!(
+            peer = %peer.display(),
+            "peer hello: this peer is no longer pinned here, so nothing was recorded for it",
+        ),
+    }
     Ok(Some(theirs))
 }
 

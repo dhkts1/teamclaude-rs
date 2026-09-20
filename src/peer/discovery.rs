@@ -675,9 +675,11 @@ pub fn observe_beacons(
         .peers;
     let mut moved: Vec<tcr_peer_wire::PeerId> = Vec::new();
     for (node, endpoint) in beacon_endpoints(scan, bindings, &pinned, now_ms) {
-        if crate::peer::config::observe_endpoints(peers_path, &node, &[endpoint])?
-            && !moved.contains(&node)
-        {
+        let wrote = matches!(
+            crate::peer::config::observe_endpoints(peers_path, &node, &[endpoint])?,
+            crate::peer::config::Observed::Written { .. }
+        );
+        if wrote && !moved.contains(&node) {
             moved.push(node);
         }
     }
@@ -920,7 +922,10 @@ pub fn observe_neighbor_briefs(
         if admissible.is_empty() {
             continue;
         }
-        if crate::peer::config::observe_endpoints(peers_path, &node, &admissible)? {
+        if matches!(
+            crate::peer::config::observe_endpoints(peers_path, &node, &admissible)?,
+            crate::peer::config::Observed::Written { .. }
+        ) {
             moved += 1;
         }
     }

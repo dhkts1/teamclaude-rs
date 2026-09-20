@@ -1117,6 +1117,214 @@ fn the_mint_verb_reads_the_held_mapping_off_the_state_file() {
     );
 }
 
+/// A sender whose listener is bound to every interface, which is the product
+/// default and the case that produced the defect.
+///
+/// The port is a documentation-range one in spirit only: it is a port, not an
+/// address, and nothing here binds it.
+const WILDCARD_LISTEN: &str = "0.0.0.0:41234";
+
+/// The Mac that moved, with whatever it says it listens on.
+///
+/// [`sender_peers`] with the listen socket spelled by the caller, so one test
+/// can ask what a wildcard bind produces without every other test moving off
+/// the pinned socket they assert on.
+fn sender_peers_listening(dir: &std::path::Path, listen: &str) -> std::path::PathBuf {
+    let friend = peer_id(0x22).to_wire();
+    let secret = counting_secret_hex();
+    let body = format!(
+        r#"{{
+  "listen": "{listen}",
+  "peers": [
+    {{
+      "node": "{friend}",
+      "label": "attic-nuc",
+      "addedAt": 1,
+      "rendezvousSecret": "{secret}"
+    }}
+  ]
+}}"#
+    );
+    let path = dir.join("tcr-peers.json");
+    write_peers(&path, &body);
+    path
+}
+
+/// **A link never carries the address the listener is BOUND to.**
+///
+/// `0.0.0.0:7755` is what the three opt-in verbs write when no listen socket
+/// was ever chosen, so it is what most Macs running this feature hold, and it
+/// is the one address no friend can ever dial: a socket configured to answer on
+/// every interface still has to be reached at one of them. A link carrying it
+/// is a link headed "here is where I am now" whose answer fails every time, and
+/// the far side spends its dial budget on it.
+///
+/// What a wildcard listener means instead is every address this Mac answers on,
+/// ranked the way an invite key ranks them, which is what this asserts: the
+/// preview names at least one address, none of them is the unspecified one, and
+/// every one of them carries the port the listener was configured with.
+///
+/// The `mint` refusal is the other honest outcome, on a Mac holding no usable
+/// interface at all, and it is accepted here for that reason and printed, so a
+/// run that took it cannot pass quietly as if it had checked the addresses.
+///
+/// Watched red: `peer moved: would add 0.0.0.0:41234` in the preview, which is
+/// what pushing `file.listen` with no dialability filter produces.
+#[test]
+fn a_minted_link_never_carries_the_address_the_listener_is_bound_to() {
+    let sender_dir = scratch("wildcard-sender");
+    let sender = sender_peers_listening(&sender_dir, WILDCARD_LISTEN);
+    let (out, err, ok) = run_moved(&sender, &["mint", &peer_id(0x22).to_wire()], None);
+
+    if !ok {
+        assert!(
+            err.contains("no address to put in a link"),
+            "the only clean way to fail here is the named refusal: {err}\n{out}"
+        );
+        println!(
+            "this Mac holds no dialable interface, so mint refused by name and the \
+             address assertions below had nothing to run against"
+        );
+        return;
+    }
+
+    let link = link_from(&out);
+    let receiver_dir = scratch("wildcard-receiver");
+    let receiver = receiver_peers(&receiver_dir, &sender_id(&sender_dir));
+    let (out, err, ok) = run_moved(&receiver, &["open", "--stdin"], Some(&link));
+    assert!(ok, "the preview exited non-zero: {err}\n{out}");
+
+    let offered: Vec<&str> = out
+        .lines()
+        .filter_map(|line| line.split_once("would add "))
+        .map(|(_, addr)| addr.trim())
+        .collect();
+    assert!(
+        !offered.is_empty(),
+        "a link this Mac minted carries no address at all, so the absence below proves \
+         nothing: {out}"
+    );
+    let port = WILDCARD_LISTEN
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .expect("the wildcard listen socket names a port");
+    for addr in &offered {
+        let parsed: SocketAddr = addr
+            .parse()
+            .unwrap_or_else(|_| panic!("the preview named something that is not a socket: {addr}"));
+        assert!(
+            !parsed.ip().is_unspecified(),
+            "the link carries the address the listener is bound to, which nothing can \
+             dial: {offered:?}"
+        );
+        assert_ne!(
+            parsed.port(),
+            0,
+            "port zero answers on nothing: {offered:?}"
+        );
+        assert_eq!(
+            parsed.port().to_string(),
+            port,
+            "an address in the link answers on a port this Mac never said it listens on: \
+             {offered:?}"
+        );
+    }
+}
+
+/// **A listener on port zero has no address to publish, and `mint` says so.**
+///
+/// The deterministic half of the case above: port `0` asks the kernel for a
+/// fresh ephemeral port at bind time and answers on none, so there is no port
+/// to pair any of this Mac's interfaces with and nothing to carry. The verb
+/// refuses with the two commands that would give it something, the way it
+/// already refuses a Mac with no listener at all.
+///
+/// Watched red: a link is minted and its preview reads `would add 0.0.0.0:0`.
+#[test]
+fn minting_on_a_listener_with_no_port_refuses_and_names_the_remedy() {
+    let sender_dir = scratch("port-zero-sender");
+    let sender = sender_peers_listening(&sender_dir, "0.0.0.0:0");
+    let (out, err, ok) = run_moved(&sender, &["mint", &peer_id(0x22).to_wire()], None);
+    assert!(
+        !ok,
+        "a Mac with nothing to publish minted a link anyway: {out}"
+    );
+    assert!(
+        err.contains("no address to put in a link"),
+        "the refusal must say what is missing: {err}\n{out}"
+    );
+    assert!(
+        err.contains("tcr peer reach") && err.contains("tcr peer internet on"),
+        "a refusal a person cannot act on is half a refusal: {err}"
+    );
+    assert!(
+        !out.contains("tcr://peer/moved"),
+        "a refused mint printed a link anyway: {out}"
+    );
+}
+
+/// **A link whose addresses are all undialable is told apart from a row that is
+/// gone.**
+///
+/// The peers file's endpoint writer answers one thing for "I refused every
+/// address in this batch" and another for "I hold no row for that peer", and
+/// for as long as it answered a single `false` this verb picked the second one:
+/// `open --yes` printed "that Mac has no row here now" over a row its own
+/// preview had just named, which sends a person looking for a pairing they
+/// never lost.
+///
+/// The link here is sealed by hand rather than minted, because `mint` refuses
+/// to make one now; the case is still reachable from any Mac running an older
+/// build, and it is a link arriving from outside this process either way.
+///
+/// The row assertion is the positive control: the row IS there after the run,
+/// which is what makes the sentence about it wrong rather than merely unlucky.
+///
+/// Watched red: `peer moved: that Mac has no row here now, so nothing was
+/// written`.
+#[test]
+fn a_link_carrying_only_undialable_addresses_says_so_and_not_that_the_row_is_gone() {
+    let sender = peer_id(0x44);
+    let link = teamclaude_rs::peer::moved::mint_link(
+        &keys_for(&counting_secret()),
+        &sender,
+        &MovedRecord {
+            v: MOVED_VERSION,
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after 1970")
+                .as_secs(),
+            eps: vec![address("0.0.0.0:41234")],
+        },
+    )
+    .expect("a record this shape seals");
+
+    let dir = scratch("undialable-receiver");
+    let receiver = receiver_peers(&dir, &sender);
+
+    let (out, err, ok) = run_moved(&receiver, &["open", "--stdin", "--yes"], Some(&link));
+    assert!(ok, "the run exited non-zero: {err}\n{out}");
+    assert!(
+        !out.contains("no row here now"),
+        "the row is right there in the file this run just read: {out}"
+    );
+    assert!(
+        out.contains("nothing can dial"),
+        "the verb must say which nothing happened, or a person reads it as a lost \
+         pairing: {out}"
+    );
+
+    let after = std::fs::read_to_string(&receiver).expect("read the peers file");
+    assert!(
+        after.contains("studio-mac"),
+        "the row this verb said nothing about is still the row that is there: {after}"
+    );
+    assert!(
+        !after.contains("0.0.0.0"),
+        "and the address nothing can dial did not land on it: {after}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The panel's argv, against this verb
 // ---------------------------------------------------------------------------
