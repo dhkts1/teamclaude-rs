@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1.7
+# The node image: one Linux `tcr`, a shell, and nothing else the scenarios do
+# not use.
+#
+# musl rather than glibc, and alpine rather than debian-slim, for image size:
+# the same tree on `rust:1-slim` over `debian:trixie-slim` measured 204 MB,
+# which is twice the budget this harness is held to. The router image is alpine
+# too, so a run pulls one base layer, not two.
+#
+# The build stage keeps the cargo registry and the target directory in BuildKit
+# cache mounts, so a rebuild after a source edit reuses every dependency object.
+# The binary is copied out inside the same RUN, because a cache mount is not
+# part of the layer and disappears the moment the RUN ends.
+#
+# CARGO_BUILD_JOBS defaults to 3 for the same reason it is 3 on the host: a
+# container build that takes every core starves whatever else the machine is
+# doing. Override with --build-arg CARGO_BUILD_JOBS=N.
+FROM rust:1-alpine AS builder
+WORKDIR /src
+ARG CARGO_BUILD_JOBS=3
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+RUN apk add --no-cache musl-dev
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY crates ./crates
+COPY src ./src
+COPY assets ./assets
+COPY scripts/install-tcrbar-from-dmg.sh ./scripts/install-tcrbar-from-dmg.sh
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    echo "cargo build jobs: ${CARGO_BUILD_JOBS}" \
+    && cargo build --release --locked --bin tcr \
+    && strip target/release/tcr \
+    && cp target/release/tcr /out-tcr
+
+FROM alpine:3.20
+# iproute2 for the route table the scenarios read back, ca-certificates for the
+# TLS the proxy does to its stub upstream. No curl: the client half of a borrow
+# runs on the host against a published loopback port, so the image does not
+# carry an HTTP client it would only use once.
+RUN apk add --no-cache ca-certificates iproute2
+COPY --from=builder /out-tcr /usr/local/bin/tcr
+COPY tests/containers/node-entrypoint.sh /usr/local/bin/node-entrypoint.sh
+# Every container HOME is scratch: nothing here ever reads a real config
+# directory, a real cache directory or a real credential.
+ENV HOME=/scratch \
+    XDG_CACHE_HOME=/scratch/.cache \
+    TCR_CLAUDE_CODE_CREDENTIALS=/scratch/no-such-credentials.json \
+    NO_COLOR=1
+RUN mkdir -p /scratch/.config /scratch/.cache
+WORKDIR /scratch
+ENTRYPOINT ["/usr/local/bin/tcr"]
+CMD ["--help"]

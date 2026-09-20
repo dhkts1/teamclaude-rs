@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1.7
+# The router image: one NAT between an inside network and an outside one.
+#
+# NAT-PMP is deliberately absent. The owner's real router refuses the 5351 probe
+# with an ICMP port unreachable, which the peer code reads as
+# `ReachError::Socket`, and that is the case worth holding a scenario over. So
+# nothing here listens on 5351 unless a scenario starts miniupnpd, and even then
+# miniupnpd runs with `enable_natpmp=no`: UPnP only, which is the shape the
+# fallback has to find.
+FROM alpine:3.20
+RUN apk add --no-cache iptables iproute2 miniupnpd
+COPY tests/containers/router-entrypoint.sh /usr/local/bin/router-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/router-entrypoint.sh"]

@@ -1,0 +1,155 @@
+# The cast every scenario draws from. A scenario brings up the services it
+# needs and no others: `docker compose -p <project> up -d node-a1 router-a`.
+#
+# Addresses are fixed, not allocated, because a scenario asserts on the exact
+# endpoint a hello or an invite key carries, and a floating address turns that
+# assertion into a pattern match. The two home networks are RFC 1918, the way a
+# home LAN is. The internet network is 198.51.100.0/24, which is documentation
+# space rather than private space, and that is load-bearing: miniupnpd refuses
+# to map when its external interface holds an RFC 1918 address ("Reserved /
+# private IP address on ext interface: Port forwarding is impossible"), so a
+# 10.x internet would make the UPnP scenario fail for a reason that has nothing
+# to do with this code.
+#
+# Both home networks are `internal: true`: no route out except through their
+# router, which is the whole point of having one.
+
+name: tcr-peers
+
+x-node: &node
+  image: tcr-harness/tcr:dev
+  entrypoint: /usr/local/bin/node-entrypoint.sh
+  cap_add: [NET_ADMIN]
+  environment:
+    UPSTREAM: http://198.51.100.20:8080
+  init: true
+
+services:
+  upstream:
+    image: python:3.12-alpine
+    command: ["python3", "/upstream-stub.py", "8080"]
+    volumes:
+      - ./upstream-stub.py:/upstream-stub.py:ro
+    networks:
+      internet:
+        ipv4_address: 198.51.100.20
+
+  router-a:
+    image: tcr-harness/router:dev
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: 1
+    environment:
+      INSIDE_SUBNET: 10.77.1.0/24
+      OUTSIDE_SUBNET: 198.51.100.0/24
+      UPNP: ${ROUTER_A_UPNP:-off}
+    networks:
+      home-a:
+        ipv4_address: 10.77.1.2
+      internet:
+        ipv4_address: 198.51.100.2
+
+  router-b:
+    image: tcr-harness/router:dev
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: 1
+    environment:
+      INSIDE_SUBNET: 10.77.2.0/24
+      OUTSIDE_SUBNET: 198.51.100.0/24
+      UPNP: ${ROUTER_B_UPNP:-off}
+    networks:
+      home-b:
+        ipv4_address: 10.77.2.2
+      internet:
+        ipv4_address: 198.51.100.3
+
+  # Home A. node-a1 is the one an invite comes from; node-a2 is its neighbour
+  # on the same LAN, which is all the discovery scenarios need.
+  node-a1:
+    <<: *node
+    environment:
+      NODE_NAME: node-a1
+      PEER_LISTEN: 0.0.0.0:7755
+      UPSTREAM: http://198.51.100.20:8080
+      DEFAULT_VIA: 10.77.1.2
+      FIND: ${NODE_A1_FIND:-off}
+      ANNOUNCE_NAME: ${NODE_A1_ANNOUNCE_NAME:-off}
+    networks:
+      home-a:
+        ipv4_address: 10.77.1.11
+
+  node-a2:
+    <<: *node
+    environment:
+      NODE_NAME: node-a2
+      PEER_LISTEN: 0.0.0.0:7755
+      UPSTREAM: http://198.51.100.20:8080
+      DEFAULT_VIA: 10.77.1.2
+      FIND: ${NODE_A2_FIND:-off}
+      ANNOUNCE_NAME: ${NODE_A2_ANNOUNCE_NAME:-off}
+    networks:
+      home-a:
+        ipv4_address: 10.77.1.12
+
+  # Home B: the friend on another network, behind a second NAT.
+  node-b1:
+    <<: *node
+    environment:
+      NODE_NAME: node-b1
+      PEER_LISTEN: 0.0.0.0:7755
+      UPSTREAM: http://198.51.100.20:8080
+      DEFAULT_VIA: 10.77.2.2
+    networks:
+      home-b:
+        ipv4_address: 10.77.2.11
+
+  # The same two Macs as node-a1 and node-b1, plus a direct overlay address
+  # each. Separate services rather than a flag, so a scenario's topology is
+  # readable from the service list alone.
+  node-a1-overlay:
+    <<: *node
+    environment:
+      NODE_NAME: node-a1
+      PEER_LISTEN: 0.0.0.0:7755
+      UPSTREAM: http://198.51.100.20:8080
+      DEFAULT_VIA: 10.77.1.2
+    networks:
+      home-a:
+        ipv4_address: 10.77.1.11
+      overlay:
+        ipv4_address: 10.99.0.11
+
+  node-b1-overlay:
+    <<: *node
+    environment:
+      NODE_NAME: node-b1
+      PEER_LISTEN: 0.0.0.0:7755
+      UPSTREAM: http://198.51.100.20:8080
+      DEFAULT_VIA: 10.77.2.2
+    networks:
+      home-b:
+        ipv4_address: 10.77.2.11
+      overlay:
+        ipv4_address: 10.99.0.12
+
+networks:
+  home-a:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.77.1.0/24
+  home-b:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.77.2.0/24
+  internet:
+    ipam:
+      config:
+        - subnet: 198.51.100.0/24
+  overlay:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.99.0.0/24
