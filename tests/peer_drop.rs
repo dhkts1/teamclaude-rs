@@ -482,3 +482,64 @@ async fn a_fake_store_on_loopback_round_trips_a_record() {
          without an error: {log:?}"
     );
 }
+
+/// A friend this node no longer pins is refused before the store is ever
+/// asked, not merely refused to write.
+///
+/// The absence of an error is not the assertion here: a `fetch_for` that
+/// called the store unconditionally and then quietly dropped the answer for
+/// a row it could not find would also return `Ok(0)`. The call log is the
+/// independent check that the store was never reached at all.
+#[tokio::test]
+async fn a_record_from_a_revoked_peer_is_refused() {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let addr = spawn_fake_store(Arc::clone(&calls));
+    let template = format!("http://{addr}/{{name}}");
+    let store = HttpsTemplateStore::new(&template, None).expect("a template store builds");
+
+    let friend = peer_id(0x44);
+    let dir = tempfile::tempdir().expect("a temp dir for the peers file");
+    let path = dir.path().join("tcr-peers.json");
+
+    // Pinned, switched on, and holding a rendezvous secret: everything a live
+    // fetch needs, so the row being gone is the only reason the fetch below
+    // finds nothing.
+    let mut file = teamclaude_rs::peer::config::PeerFile::default();
+    file.peers.push(teamclaude_rs::peer::config::PeerRow {
+        node: friend,
+        label: "revoked".to_string(),
+        endpoints: Vec::new(),
+        added_at: 0,
+        allow: teamclaude_rs::peer::config::Allow {
+            control: teamclaude_rs::peer::config::ControlGrants {
+                drop: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        lend: Vec::new(),
+        rendezvous_secret: Some(counting_secret()),
+        sees_us_at: None,
+    });
+    teamclaude_rs::peer::config::save(&path, &file).expect("the pinned row writes");
+
+    // `tcr peer forget`'s own effect: the row is gone.
+    let mut revoked = file.clone();
+    revoked.peers.clear();
+    teamclaude_rs::peer::config::save(&path, &revoked).expect("the revocation writes");
+
+    let fetched = drop::fetch_for(&store, &path, &friend, 1_758_240_000)
+        .await
+        .expect("a revoked peer is not an error, it is nothing to fetch");
+    assert_eq!(fetched, 0, "a revoked peer's drop writes nothing");
+
+    let log = calls
+        .lock()
+        .expect("the fake store's call log is never poisoned")
+        .clone();
+    assert!(
+        log.is_empty(),
+        "fetch_for must not call the store at all for a peer this node no longer pins, \
+         so the absence of an error here is not the assertion, the call count is: {log:?}"
+    );
+}

@@ -1358,6 +1358,30 @@ impl DeadDropConfig {
     pub fn is_unset(&self) -> bool {
         self == &Self::default()
     }
+
+    /// Build the configured backend, or [`crate::peer::drop::StoreRefusal::NotConfigured`].
+    ///
+    /// [`StoreConfig::Gist`] answers the same refusal as no store at all: it
+    /// does not ship here, and a backend this build cannot build is no
+    /// different from one nobody named. A template with no `{name}`
+    /// placeholder folds into the same refusal, for want of a variant of its
+    /// own: [`crate::peer::drop::StoreRefusal`] has none for a malformed
+    /// template, because the CLI verb that writes this field is the one that
+    /// should have refused it first.
+    pub fn open_store(
+        &self,
+    ) -> std::result::Result<crate::peer::drop::HttpsTemplateStore, crate::peer::drop::StoreRefusal>
+    {
+        match &self.store {
+            Some(StoreConfig::Https { url, token }) => {
+                crate::peer::drop::HttpsTemplateStore::new(url, token.as_deref())
+                    .map_err(|_| crate::peer::drop::StoreRefusal::NotConfigured)
+            }
+            Some(StoreConfig::Gist { .. }) | None => {
+                Err(crate::peer::drop::StoreRefusal::NotConfigured)
+            }
+        }
+    }
 }
 
 /// Which surface a dead drop uses, and what that surface needs.
