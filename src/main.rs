@@ -775,6 +775,12 @@ mod peer_cli {
         /// Revoke an outstanding key by id instead of minting one.
         #[arg(long)]
         pub revoke: Option<u64>,
+        /// Mint the old readable key (`tcr-join:v2:…`, addresses in plain
+        /// text) instead of the opaque `tcr-join:v3:…` this build mints by
+        /// default. For a script that greps a key out of stdout, and for a
+        /// friend still on a build old enough to only read this one.
+        #[arg(long)]
+        pub plain: bool,
     }
 
     #[derive(clap::Args)]
@@ -2263,7 +2269,16 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 "peer invite: ok id={} label={} ttl_s={} uses={}",
                 invite.id, invite.label, a.ttl, a.uses
             );
-            println!("{}", token.to_token());
+            if a.plain {
+                println!("{}", token.to_token());
+            } else {
+                println!("{}", token.to_token_v3());
+                println!(
+                    "peer invite: a Mac on 1.1.9 or older cannot read this key and will say it \
+                     is not a join key; tcr peer invite --plain mints the readable form it can \
+                     read"
+                );
+            }
             // One line per address the key carries, in the order the joiner
             // will try them, so the operator sending this key can see which
             // paths their friend actually has. The key itself is unchanged by

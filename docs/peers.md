@@ -244,11 +244,19 @@ mints a one-use, ten-minute join key and rides it inside the same link, so openi
 completes pairing with this Mac, with no six-digit compare needed. Because that link is a live
 secret for as long as it is valid, send it somewhere as private as you would a password.
 
-`tcr peer invite` mints the same kind of one-use join key on its own
-(`tcr-join:v2:<addr,addr,...>:...`), for a Mac with no browser to open a link in. The key
-carries every address this Mac answers at, best first, and the joining Mac works down the
-list, so the same key reaches a friend on the tailnet and a friend in the next room. A key
-from an older build carried one address, and this build still reads one of those.
+`tcr peer invite` mints the same kind of one-use join key on its own, for a Mac with no
+browser to open a link in. The key carries every address this Mac answers at, best first, and
+the joining Mac works down the list, so the same key reaches a friend on the tailnet and a
+friend in the next room. A key from an older build carried one address, and this build still
+reads one of those.
+
+By default the key is opaque (`tcr-join:v3:<one run of base32>...`), so a glance over a
+shoulder or a screenshot in a group chat shows nobody an address. It encodes the same three
+fields v2 did; it is not encrypted, and whoever holds either spelling can spend it. `tcr peer
+invite --plain` mints the older, readable spelling (`tcr-join:v2:<addr,addr,...>:...`), for a
+script or a friend on a build old enough to only read that one. A Mac on 1.1.9 or older
+refuses a v3 key with "this is not a join key", and no later build can edit that refusal, so
+`tcr peer invite` says so up front on the inviting side.
 
 `tcr peer join --stdin` (or `--stdin` on `network-key join`) reads a key from standard input
 instead of the command line, so it never lands in shell history or in another process's view

@@ -27,6 +27,13 @@
 //! use, a short TTL, mode 0600, the row deleted on use,
 //! [`MAX_OUTSTANDING_INVITES`], and an explicit revoke.
 //!
+//! [`JoinToken::to_token_v3`] does not change any of that. It changes what the
+//! key LOOKS like, an opaque run rather than three plain-text fields, so a
+//! glance over a shoulder learns nothing. It is still exactly as much of a
+//! bearer secret as [`JoinToken::to_token`], and whoever holds either string
+//! can spend it. Mode B, the sealed exchange in `src/peer/ask.rs`, is the one
+//! that changes what travels rather than what a string looks like.
+//!
 //! # Where the writes are
 //!
 //! [`crate::peer::config::PeerStore`] reads; it has no write path and no view
@@ -56,12 +63,14 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tcr_peer_wire::{
-    decode_key32, encode_key32, sanitize_label, Control, Enroll, PeerId, StreamHeader, StreamKind,
+    decode_bytes, decode_key32, encode_bytes, encode_key32, sanitize_label, Control, Enroll,
+    PeerId, StreamHeader, StreamKind,
 };
 
 use crate::peer::config::{
     read_or_default, save, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore, PendingInvite,
 };
+use crate::peer::dialaddrs;
 use crate::peer::id::{default_config_dir, NodeKey};
 use crate::peer::noise::{self, Handshake, KEY_BYTES};
 
@@ -208,8 +217,30 @@ pub const KEY_PREFIX: &str = "tcr-join:";
 /// The v1 key: exactly one address. Still read, never minted.
 pub const TOKEN_PREFIX: &str = "tcr-join:v1:";
 
-/// The v2 key: one or more addresses, comma-separated, best first.
+/// The v2 key: one or more addresses, comma-separated, best first, in plain
+/// text.
+///
+/// The addresses stay readable here for the reason this doc used to give on
+/// its own: an operator reading a key out loud could at least see which
+/// machine it points at. That reasoning is overruled: the owner does not want
+/// an address visible at a glance, and [`TOKEN_PREFIX_V3`] is now what
+/// `tcr peer invite` mints by default. This spelling stays, and is still
+/// minted by `--plain`, for a script that greps a key out of stdout and for a
+/// friend on a build old enough to only read this one.
 pub const TOKEN_PREFIX_V2: &str = "tcr-join:v2:";
+
+/// The v3 key: the same three fields as v2, framed and base32'd as one opaque
+/// run rather than three plain-text ones. No crypto change: it is a second
+/// spelling of the same bearer secret, not encryption, and every surface that
+/// prints one says so.
+pub const TOKEN_PREFIX_V3: &str = "tcr-join:v3:";
+
+/// The four magic bytes in front of a v3 key's version byte, a sibling of
+/// [`crate::peer::moved::MOVED_LINK_PREFIX`]'s own magic.
+const TOKEN_V3_MAGIC: [u8; 4] = *b"TCRK";
+
+/// The only v3 format version there is yet.
+const TOKEN_V3_VERSION: u8 = 1;
 
 impl JoinToken {
     /// A key for a list of addresses, best first, as a pasted key knows them.
@@ -253,24 +284,46 @@ impl JoinToken {
         )
     }
 
-    /// Parse a pasted key, v2 or v1. Refuses an unknown version rather than
-    /// guessing, because the alternative is a silent wrong-key dial.
+    /// Render the key as one opaque run: magic, version, the addresses through
+    /// [`dialaddrs::encode`], the registrar's 32 bytes, the secret's 32 bytes,
+    /// all of it through the one base32 codec this tree has.
     ///
-    /// Split from the RIGHT: an IPv6 address carries colons of its own, and the
-    /// two fields after it do not, so the two rightmost separators are the only
-    /// ones whose position is known. The address field is then split on commas,
-    /// which no address contains (an IPv6 one is bracketed).
+    /// It is exactly as much of a bearer secret as [`Self::to_token`] is. This
+    /// spelling hides an address from a glance; it does not encrypt anything,
+    /// and no surface that prints it may say otherwise.
+    pub fn to_token_v3(&self) -> String {
+        let mut body = Vec::new();
+        body.extend_from_slice(&TOKEN_V3_MAGIC);
+        body.push(TOKEN_V3_VERSION);
+        body.extend_from_slice(&dialaddrs::encode(&self.sockets().collect::<Vec<_>>()));
+        body.extend_from_slice(&self.registrar.0);
+        body.extend_from_slice(&self.secret);
+        format!("{TOKEN_PREFIX_V3}{}", encode_bytes(&body))
+    }
+
+    /// Parse a pasted key, v3, v2 or v1. Refuses an unknown version rather
+    /// than guessing, because the alternative is a silent wrong-key dial.
+    ///
+    /// v3 is checked first: it is what this build mints by default. Split from
+    /// the RIGHT for v2 and v1: an IPv6 address carries colons of its own, and
+    /// the two fields after it do not, so the two rightmost separators are the
+    /// only ones whose position is known. The address field is then split on
+    /// commas, which no address contains (an IPv6 one is bracketed).
     pub fn parse(token: &str) -> Result<Self> {
         let token = token.trim();
+        if let Some(body) = token.strip_prefix(TOKEN_PREFIX_V3) {
+            return Self::parse_v3(body);
+        }
         let (body, version) = if let Some(body) = token.strip_prefix(TOKEN_PREFIX_V2) {
             (body, KeyVersion::V2)
         } else if let Some(body) = token.strip_prefix(TOKEN_PREFIX) {
             (body, KeyVersion::V1)
         } else {
             bail!(
-                "peer join: this is not a join key (it must start with {TOKEN_PREFIX_V2:?}, or \
-                 {TOKEN_PREFIX:?} from an older build); an unknown version is refused rather \
-                 than guessed, because guessing it would be a silent dial to the wrong key"
+                "peer join: this is not a join key (it must start with {TOKEN_PREFIX_V3:?}, \
+                 {TOKEN_PREFIX_V2:?} from `--plain`, or {TOKEN_PREFIX:?} from an older build); \
+                 an unknown version is refused rather than guessed, because guessing it would \
+                 be a silent dial to the wrong key"
             );
         };
 
@@ -308,6 +361,50 @@ impl JoinToken {
         let secret = decode_key32(secret)
             .map_err(|refusal| anyhow!("{refusal}"))
             .context("peer join: the secret field is not 32 base32-encoded bytes")?;
+        Ok(Self::new(addrs, registrar, secret))
+    }
+
+    /// [`Self::parse`]'s v3 arm: unwrap the base32, check the magic and
+    /// version, then read the three fields by offset rather than by split,
+    /// which is what an opaque run buys over the comma-and-colon shape of v2.
+    fn parse_v3(body: &str) -> Result<Self> {
+        let bytes = decode_bytes(body)
+            .map_err(|refusal| anyhow!("{refusal}"))
+            .context(
+            "peer join: a v3 key is not a whole run of base32 bytes, which is what a paste cut \
+             short looks like",
+        )?;
+        let min_len = TOKEN_V3_MAGIC.len() + 1 + 1 + 32 + 32;
+        if bytes.len() < min_len {
+            bail!(
+                "peer join: this v3 key is shorter than it should be, which is what a paste cut \
+                 short looks like"
+            );
+        }
+        if bytes[..TOKEN_V3_MAGIC.len()] != TOKEN_V3_MAGIC {
+            bail!("peer join: this does not carry a v3 key's magic bytes");
+        }
+        let version = bytes[TOKEN_V3_MAGIC.len()];
+        if version != TOKEN_V3_VERSION {
+            bail!("peer join: this v3 key names format version {version}, which this build does not know");
+        }
+        let rest = &bytes[TOKEN_V3_MAGIC.len() + 1..];
+        // The address list is self-delimiting on its own count byte, so what
+        // `decode_prefix` leaves unconsumed is exactly the registrar and the
+        // secret.
+        let (addrs, rest) =
+            dialaddrs::decode_prefix(rest).map_err(|refusal| anyhow!("peer join: {refusal}"))?;
+        if rest.len() != 64 {
+            bail!(
+                "peer join: this v3 key has the wrong number of bytes left after its address \
+                 list, which is what a paste cut short or padded looks like"
+            );
+        }
+        if addrs.is_empty() {
+            bail!("peer join: this key carries no address to dial");
+        }
+        let registrar = PeerId(rest[..32].try_into().expect("checked length"));
+        let secret: [u8; 32] = rest[32..64].try_into().expect("checked length");
         Ok(Self::new(addrs, registrar, secret))
     }
 }
@@ -1923,17 +2020,34 @@ mod tests {
     }
 
     /// A version this build does not know is refused rather than guessed at.
+    ///
+    /// v4 rather than v3, since v3 is a version this build reads now: the
+    /// fixture moved the moment `JoinToken::parse` grew a v3 arm, the change
+    /// `tests/peer_noise.rs`'s sibling test moved for too.
     #[test]
     fn an_unknown_version_is_refused() {
         let key = format!(
-            "tcr-join:v3:192.0.2.10:7755:{}:{}",
+            "tcr-join:v4:192.0.2.10:7755:{}:{}",
             PeerId([3_u8; 32]).to_wire(),
             encode_key32(&[7_u8; 32])
         );
-        let refusal = JoinToken::parse(&key).expect_err("v3 is not a version this build reads");
+        let refusal = JoinToken::parse(&key).expect_err("v4 is not a version this build reads");
         assert!(
             format!("{refusal:#}").contains("not a join key"),
             "the refusal is about the VERSION and not about a field further in"
+        );
+    }
+
+    /// A v3 key whose magic bytes are missing is refused for that, not
+    /// silently read as if the magic matched.
+    #[test]
+    fn a_v3_key_with_the_wrong_magic_is_refused() {
+        let bytes = tcr_peer_wire::encode_bytes(&[0_u8; 70]);
+        let key = format!("{TOKEN_PREFIX_V3}{bytes}");
+        let refusal = JoinToken::parse(&key).expect_err("the wrong magic must be refused");
+        assert!(
+            format!("{refusal:#}").contains("magic"),
+            "the refusal names what was wrong: {refusal:#}"
         );
     }
 

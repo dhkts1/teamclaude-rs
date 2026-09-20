@@ -1375,15 +1375,17 @@ fn a_join_token_with_an_unknown_version_is_refused() {
         [7_u8; 32],
     )
     .to_token();
-    // v1 and v2 are both read now, so the fixture is the next version along:
-    // the check is that an unknown one is refused for BEING unknown.
-    let unknown = good.replace("tcr-join:v2:", "tcr-join:v3:");
+    // v1, v2 and v3 are all read now, so the fixture is the next version
+    // along: the check is that an unknown one is refused for BEING unknown.
+    // (It used to say v3 here; moved when `JoinToken::parse` grew a v3 arm,
+    // the change this test's own doc comment says to watch for.)
+    let unknown = good.replace("tcr-join:v2:", "tcr-join:v4:");
     assert_ne!(
         good, unknown,
         "the fixture has to differ from the good token"
     );
     let error = pair::JoinToken::parse(&unknown)
-        .expect_err("a v3 token must be refused rather than read as one of the two known ones");
+        .expect_err("a v4 token must be refused rather than read as one of the three known ones");
     assert!(
         format!("{error:#}").contains("not a join key"),
         "the refusal has to be about the VERSION: a token whose only fault is its version \

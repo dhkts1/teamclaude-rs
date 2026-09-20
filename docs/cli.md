@@ -1006,12 +1006,20 @@ Mints a one-line join key for a Mac with no screen to compare digits on: the hea
 | `--ttl <secs>` | int | `600` | how long the key stays usable. Short on purpose: anything that can read the peers file can use an outstanding key while it exists |
 | `--uses <n>` | int | `1` | how many Macs may join with this one key |
 | `--revoke <id>` | int | none | revoke an outstanding key by id instead of minting one |
+| `--plain` | bool | `false` | mint the older, readable key (`tcr-join:v2:…`) instead of the opaque one this build mints by default |
 
-The key carries **every address this Mac can be reached at**, best first
-(`tcr-join:v2:<addr,addr,...>:...`), and the joining Mac tries them in order: the tailnet
-address, then the external address a port mapping published, then each address a real
-interface holds. A bind address is never one of them: a Mac listening on `0.0.0.0` used to
-mint a key reading `0.0.0.0`, which sent the friend's `tcr peer join` at its own machine.
+The key carries **every address this Mac can be reached at**, best first, and the joining Mac
+tries them in order: the tailnet address, then the external address a port mapping published,
+then each address a real interface holds. A bind address is never one of them: a Mac
+listening on `0.0.0.0` used to mint a key reading `0.0.0.0`, which sent the friend's `tcr peer
+join` at its own machine.
+
+By default the key is opaque, one run of base32 (`tcr-join:v3:<...>`), so nobody reading it
+over a shoulder or in a screenshot sees an address. It encodes the same three fields the
+readable key does; it is not encrypted, and whoever holds it can still spend it. `tcr peer
+invite` also prints one line about older builds: a Mac on 1.1.9 or earlier refuses a v3 key
+by name, and `--plain` mints the key that build reads
+(`tcr-join:v2:<addr,addr,...>:...`).
 
 `tcr peer invite` runs as its own short-lived process, so the external address is read off the
 state file a serving process's keeper wrote, not asked of the router by this command itself
