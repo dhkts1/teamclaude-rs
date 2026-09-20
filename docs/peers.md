@@ -271,11 +271,17 @@ and joins with the key it carried on the spot: pinned and trusted on both sides,
 no six-digit compare, the same as a pasted key would be. Both the ask and the reply are
 opaque, so the chat carries no address in either mode.
 
-In the panel, the Peers tab's footer carries an `Invite…` button beside `Settings…` that runs
-`tcr peer invite` in one press: the sheet opens first, then shows the key in a copyable box
-under `tcr`'s own lines about which paths it carries and how long it lasts, unedited. `Settings
-> Peers > Advanced > Show…` opens the same sheet, for a headless Mac's operator working from
-that pane. Neither screen says anything about the key that `tcr` did not already print.
+In the panel, the Peers tab's footer carries an `Invite…` button beside `Settings…` that opens
+one sheet with a two-segment picker: `One paste` mints a key the way the button always has, and
+`Two pastes, sealed` mints an ask, shows it in a copyable box beside a paste field for the
+reply, and opens whatever comes back with an `Open reply` button. Both segments draw `tcr`'s own
+lines, unedited, under whichever box is showing; the sheet's own sentences are the two segment
+descriptions and one line naming the Mac that answered once a reply opens. `Settings > Peers >
+Advanced > Show…` opens the same sheet on the key segment, for a headless Mac's operator working
+from that pane. The friend's own paste field, `Settings > Peers > Paste a key or a link`, takes
+an ask too: pasting one runs `tcr peer join --stdin` and, instead of closing the way a key or a
+link does, keeps the sheet open to show the sealed reply with a `Copy reply` button, because an
+ask does not join anything by itself: the reply is what has to be sent back.
 
 A Mac that already has a network key **refuses a link that carries a different one**, and says
 what accepting it would cut this Mac off from. Pasting a second office's key over the first is

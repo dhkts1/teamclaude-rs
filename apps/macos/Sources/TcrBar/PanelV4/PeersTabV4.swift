@@ -1012,6 +1012,103 @@ final class PeerController: ObservableObject {
         }
     }
 
+    /// Mint an ask, mode B's first paste, and hand back what `tcr peer invite
+    /// --sealed` answered, classified.
+    ///
+    /// ``mintInvite(into:)``'s own body over ``PeerCommand/sealedInvite``: no
+    /// argv here is a subject either, and no re-read follows, for the same
+    /// reason that one gives.
+    func mintSealedInvite(into sink: @escaping (PeerSealedMint.Outcome) -> Void) {
+        guard !isPinned else { return }
+        let arguments = PeerCommand.sealedInvite
+        let key = arguments.joined(separator: " ")
+        guard !pending.contains(key) else { return }
+        pending.insert(key)
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.sealed(arguments: arguments, stdin: nil)
+            }.value
+            guard let self else { return }
+            self.pending.remove(key)
+            sink(outcome)
+        }
+    }
+
+    /// Open a reply this Mac was handed back, running `tcr peer invite
+    /// --reply --stdin` with it on stdin, and hand back what that answered,
+    /// classified.
+    ///
+    /// Opening a reply RUNS the join it carries immediately (`src/main.rs`'s
+    /// `a.reply` arm), so unlike ``mintSealedInvite(into:)`` this can change
+    /// what `tcr peer ls --json` reports. The sheet does not poll for that:
+    /// ``refresh()`` runs when the panel is next visible, and the sheet's own
+    /// `joined` state already names the address that answered.
+    func openReply(_ reply: String, into sink: @escaping (PeerSealedMint.Outcome) -> Void) {
+        guard !isPinned else { return }
+        let invocation = PeerCommand.openReply(reply)
+        let key = invocation.arguments.joined(separator: " ")
+        guard !pending.contains(key) else { return }
+        pending.insert(key)
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.sealed(arguments: invocation.arguments, stdin: invocation.stdin)
+            }.value
+            guard let self else { return }
+            self.pending.remove(key)
+            sink(outcome)
+        }
+    }
+
+    /// The friend's half: answer an ask this Mac was pasted, by running `tcr
+    /// peer join --stdin` with it on stdin, and hand back what that answered,
+    /// classified.
+    ///
+    /// ``PeerCommand/join(key:)`` is the same factory the key and link paths
+    /// already use: `JoinInput` on the far end decides which of the three
+    /// shapes arrived, and this Mac does not need to know before it runs the
+    /// verb. It only needs to know AFTER, because an ask answers with a reply
+    /// to show and copy, and a key or a link joins outright and closes.
+    func answerAsk(_ ask: String, into sink: @escaping (PeerSealedMint.Outcome) -> Void) {
+        guard !isPinned else { return }
+        let invocation = PeerCommand.join(key: ask)
+        let key = invocation.arguments.joined(separator: " ")
+        guard !pending.contains(key) else { return }
+        pending.insert(key)
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.sealed(arguments: invocation.arguments, stdin: invocation.stdin)
+            }.value
+            guard let self else { return }
+            self.pending.remove(key)
+            sink(outcome)
+        }
+    }
+
+    /// Blocking, always called off the main actor. `tcr`'s own exit code and
+    /// both its streams, classified by ``PeerSealedMint``, the pattern
+    /// ``invite(arguments:)`` above already uses.
+    private nonisolated static func sealed(arguments: [String], stdin: String?)
+        -> PeerSealedMint.Outcome
+    {
+        switch TcrTool.resolve() {
+        case .failure(let notFound):
+            return .couldNotRun(
+                "tcr not found (searched \(notFound.searched.count) locations). "
+                    + TcrTool.overrideRemedy)
+        case .success(let executable):
+            do {
+                let output = try TcrTool.run(
+                    executable: executable, arguments: arguments, stdin: stdin)
+                return PeerSealedMint.outcome(
+                    exitCode: output.exitCode,
+                    stdout: String(data: output.stdout, encoding: .utf8) ?? "",
+                    stderr: output.stderr)
+            } catch {
+                return .couldNotRun(error.localizedDescription)
+            }
+        }
+    }
+
     /// Put a failure this panel produced OUTSIDE a verb onto the tab, in the
     /// same place `tcr`'s own refusals land. One writer, so a message cannot
     /// be drawn in two different ways.
@@ -1306,10 +1403,18 @@ struct PeersTabV4: View {
     /// ``minting``: this sheet is about the tab, not about one row, so it has
     /// nothing to key on.
     @State private var inviting = false
+    /// Which of the sheet's two segments is picked, or neither yet:
+    /// ``PeerInviteSheet``'s own segment picker owns pressing it, this is
+    /// only where the choice lives between presses.
+    @State private var inviteMode: PeerInviteSheet.Mode = .none
     /// What the last `tcr peer invite` answered, or `nil` while the sheet is
     /// still open and nothing has answered yet: opening first and filling in
     /// is ``startMinting(_:)``'s own precedent.
     @State private var invited: PeerInviteMint.Outcome?
+    /// What the sealed exchange last answered: an ask minted, a reply
+    /// opened and joined, or a refusal. `nil` before a segment is pressed and
+    /// while the mint is still running, ``invited``'s own precedent.
+    @State private var sealedInvited: PeerSealedMint.Outcome?
     /// Whether the refusal banner is showing the raw line tcr printed. Closed
     /// on every new refusal, because the sentence is what the next one is
     /// about.
@@ -1444,7 +1549,20 @@ struct PeersTabV4: View {
         // other two are.
         .sheet(isPresented: $inviting) {
             PeerInviteSheet(
-                outcome: invited,
+                mode: $inviteMode,
+                invite: invited,
+                sealed: sealedInvited,
+                onPickKey: {
+                    guard invited == nil else { return }
+                    controller.mintInvite { invited = $0 }
+                },
+                onPickSealed: {
+                    guard sealedInvited == nil else { return }
+                    controller.mintSealedInvite { sealedInvited = $0 }
+                },
+                onOpenReply: { reply in
+                    controller.openReply(reply) { sealedInvited = $0 }
+                },
                 onClose: { inviting = false })
         }
         // Block asks once, and the question names the address rather than the
@@ -1917,15 +2035,17 @@ struct PeersTabV4: View {
                 + "whatever you already use to talk to whoever is at that Mac.")
     }
 
-    /// Open the sheet first, then fill it in, so a slow `tcr peer invite`
-    /// reads as a screen that is working rather than a button that did
-    /// nothing. ``startMinting(_:)``'s own shape, and about the tab rather
-    /// than a row.
+    /// Open the sheet first, with neither mode picked yet: the two segments
+    /// cost no process to look at, and nothing runs until one is pressed
+    /// (``PeerInviteSheet/onPickKey``, ``PeerInviteSheet/onPickSealed``).
+    /// ``startMinting(_:)``'s own precedent for opening before filling in,
+    /// and about the tab rather than a row.
     private func startInviting() {
         guard !snapshotMode else { return }
         invited = nil
+        sealedInvited = nil
+        inviteMode = .none
         inviting = true
-        controller.mintInvite { invited = $0 }
     }
 
     /// Open the sheet first, then fill it in, so a slow mint reads as a screen
@@ -2334,8 +2454,8 @@ struct PeersTabV4: View {
             PeerActionButton(
                 title: "Invite…",
                 systemImage: nil,
-                help: "Mints a key for a Mac that is not on this network. It works once and "
-                    + "lasts ten minutes.",
+                help: "Invites a Mac that is not on this network. Two ways: one string to "
+                    + "send, or two so nothing you send names an address.",
                 enabled: true,
                 action: startInviting)
             PeerActionButton(
@@ -2693,10 +2813,52 @@ struct PeerActionButton: View {
 /// who reads it can use it, once, inside its ten minutes. The reassuring
 /// sentence the moved sheet says would be false here, so this one says the
 /// opposite of it on purpose.
+/// Two modes behind the one `Invite…` button: one paste, opaque but still a
+/// bearer key, or two pastes that put no address in the chat at all and end
+/// in a join rather than a knock.
+///
+/// A pure function of two outcomes and a mode, the same shape
+/// ``PeerMovedSheet`` is of one: everything that runs a process is a closure
+/// this view calls and ``PeerController`` behind it. The picker costs no
+/// process to look at (scene `w15-sealed-pick`): nothing mints until a
+/// segment is pressed.
+///
+/// # What this sheet says itself, and what it quotes
+///
+/// Three sentences are this sheet's own: the two segment descriptions and
+/// the line under a joined reply. Everything else that says what a string
+/// carries, how long it lasts or what it grants is `tcr`'s own sentence,
+/// unquoted from `invite` or `sealed`, the rule
+/// `PeersPanelWiringTests.testTheInviteSheetQuotesTheCliRatherThanRespellingIt`
+/// and its sealed sibling both hold this file to.
+///
+/// # No six digits in mode B
+///
+/// Opening a reply runs the same `Enrol` (`IKpsk1`) handshake a pasted key
+/// already takes (`src/peer/ask.rs`'s own doc): pinned and trusted the
+/// moment it completes, with no knock and no six-digit compare. Mode A never
+/// had one either. Neither mode draws one here.
 struct PeerInviteSheet: View {
-    /// What the mint answered, or `nil` while it is still running.
-    let outcome: PeerInviteMint.Outcome?
+    enum Mode: Equatable {
+        case none
+        case key
+        case sealed
+    }
+
+    @Binding var mode: Mode
+    /// What `tcr peer invite` last answered, or `nil` before it has run.
+    let invite: PeerInviteMint.Outcome?
+    /// What the sealed exchange last answered, or `nil` before it has run.
+    let sealed: PeerSealedMint.Outcome?
+    var onPickKey: () -> Void = {}
+    var onPickSealed: () -> Void = {}
+    /// Open a reply this sheet's paste field holds. The field's own text
+    /// lives here, not in the caller: it is UI state about a box on screen,
+    /// not a fact ``PeerController`` needs to remember between presses.
+    var onOpenReply: (String) -> Void = { _ in }
     var onClose: () -> Void = {}
+
+    @State private var pastedReply = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: V4.buttonGap) {
@@ -2705,46 +2867,20 @@ struct PeerInviteSheet: View {
                 .foregroundStyle(Tok.ink)
                 .fixedSize(horizontal: false, vertical: true)
 
-            switch outcome {
-            case nil:
-                sentence("Minting one for a Mac that is not on this network.", tint: Tok.inkDim)
-            case .minted(let key, let sentences):
-                sentence(
-                    "Send it however you already talk to whoever is at that Mac. Anyone who "
-                        + "reads the message can use it once, so send it the way you would "
-                        + "send a password.", tint: Tok.inkDim)
-                keyBox(key)
-                if !sentences.isEmpty {
-                    sentence(sentences, tint: Tok.mute)
-                }
-                sentence(
-                    "Each press mints one more key. Every one of them works until it is used "
-                        + "or its own clock runs out.", tint: Tok.mute)
-            case .refused(let said):
-                // `tcr`'s own words, in place of the key box. Every invite
-                // refusal carries its own fix inside the sentence: no
-                // listener, no address to reach, the cap.
-                sentence(said, tint: Tok.near)
-            case .couldNotRun(let said):
-                sentence(said, tint: Tok.near)
+            if showsPicker {
+                picker
             }
 
-            HStack(spacing: V4.buttonGap) {
-                Spacer(minLength: 0)
-                PeerActionButton(
-                    title: "Done", systemImage: nil,
-                    help: "Closes this. The key stays good whether this is open or not."
-                ) { onClose() }
-                if case .minted(let key, _) = outcome {
-                    PeerActionButton(
-                        title: "Copy key", systemImage: nil,
-                        help: "Puts the key on the pasteboard. Nothing else goes with it."
-                    ) {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(key, forType: .string)
-                    }
-                }
+            switch mode {
+            case .none:
+                pickerHelp
+            case .key:
+                keyModeContent
+            case .sealed:
+                sealedModeContent
             }
+
+            buttons
         }
         .padding(.vertical, V4.cardPaddingV)
         .padding(.horizontal, V4.cardPaddingH)
@@ -2752,22 +2888,239 @@ struct PeerInviteSheet: View {
         .background(Tok.panel)
     }
 
-    /// The headline says which of the three screens this is, so a refusal is
-    /// never read as a key that has not arrived yet.
-    private var title: String {
-        switch outcome {
-        case nil, .minted: return "Invite a Mac"
-        case .refused: return "No key minted"
-        case .couldNotRun: return "That did not run"
+    // MARK: - The picker
+
+    /// Hidden on a refusal: there is nothing to pick between and the sentence
+    /// with the fix in it is the whole of that screen
+    /// (``PeersTabV4.swift``'s scene `w15-sealed-wrong-reply` and its
+    /// siblings).
+    private var showsPicker: Bool {
+        switch mode {
+        case .none: return true
+        case .key:
+            switch invite {
+            case .refused, .couldNotRun: return false
+            default: return true
+            }
+        case .sealed:
+            switch sealed {
+            case .refused, .couldNotRun: return false
+            default: return true
+            }
         }
     }
 
-    /// The key itself: whole, wrapped rather than cut, and selectable, so it
-    /// can be taken by hand. Never truncated: half a key pasted into a chat
-    /// is a refusal at the other end with no way to see why. VoiceOver does
-    /// not spell it out, ``PeerMovedSheet/linkBox(_:)``'s own move.
-    private func keyBox(_ key: String) -> some View {
-        Text(key)
+    private var picker: some View {
+        HStack(spacing: 0) {
+            segment("One paste", selected: mode == .key) { pick(.key) }
+            Divider().frame(height: V4.buttonGap)
+            segment("Two pastes, sealed", selected: mode == .sealed) { pick(.sealed) }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: V4.buttonRadius)
+                .stroke(Tok.cardLine, lineWidth: 0.5)
+        )
+    }
+
+    private func segment(_ label: String, selected: Bool, action: @escaping () -> Void)
+        -> some View
+    {
+        Button(action: action) {
+            Text(label)
+                .font(V4.font(V4.dimSize, selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Tok.ink : Tok.mute)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, V4.buttonInsetV)
+                .background(selected ? Tok.ink.opacity(V4.buttonFillAlpha) : Color.clear)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func pick(_ newMode: Mode) {
+        mode = newMode
+        switch newMode {
+        case .key: onPickKey()
+        case .sealed: onPickSealed()
+        case .none: break
+        }
+    }
+
+    /// Scene `w15-sealed-pick`: what each segment hides and what it does
+    /// not, before either has been pressed.
+    private var pickerHelp: some View {
+        VStack(alignment: .leading, spacing: V4.buttonGap) {
+            sentence(
+                "One string to send. Nobody reading it can see where this Mac is. Anyone "
+                    + "who holds it can still use it once, so send it the way you would "
+                    + "send a password.", tint: Tok.mute)
+            sentence(
+                "Nothing you send names an address. They send an answer back, sealed so "
+                    + "only this Mac can open it, and opening it joins you both "
+                    + "immediately.", tint: Tok.mute)
+        }
+    }
+
+    // MARK: - Mode A: one paste
+
+    @ViewBuilder private var keyModeContent: some View {
+        switch invite {
+        case nil:
+            sentence("Minting one for a Mac that is not on this network.", tint: Tok.inkDim)
+        case .minted(let key, let sentences):
+            sentence(
+                "Send it however you already talk to whoever is at that Mac. Anyone who "
+                    + "reads the message can use it once, so send it the way you would "
+                    + "send a password.", tint: Tok.inkDim)
+            box(key, accessibilityLabel: "A key for one Mac")
+            if !sentences.isEmpty {
+                sentence(sentences, tint: Tok.mute)
+            }
+            sentence(
+                "Each press mints one more key. Every one of them works until it is used "
+                    + "or its own clock runs out.", tint: Tok.mute)
+        case .refused(let said):
+            // `tcr`'s own words, in place of the key box. Every invite
+            // refusal carries its own fix inside the sentence: no listener,
+            // no address to reach, the cap.
+            sentence(said, tint: Tok.near)
+        case .couldNotRun(let said):
+            sentence(said, tint: Tok.near)
+        }
+    }
+
+    // MARK: - Mode B: two pastes, sealed
+
+    @ViewBuilder private var sealedModeContent: some View {
+        switch sealed {
+        case nil:
+            sentence("Minting one for a Mac that is not on this network.", tint: Tok.inkDim)
+        case .asked(let ask, let sentences):
+            // Scenes `w15-sealed-ask` (this box just minted) and
+            // `w15-sealed-waiting` (the same box, a person has come back to
+            // it) are the same state: nothing here changes once the ask
+            // exists, only how long a person has been looking at it.
+            sentence(
+                "Send this the way you already talk to them. It names no address and no "
+                    + "Mac, so it is worth nothing to anybody else who reads it.",
+                tint: Tok.inkDim)
+            box(ask, accessibilityLabel: "An invite for one exchange")
+            if !sentences.isEmpty {
+                sentence(sentences, tint: Tok.mute)
+            }
+            replyField
+        case .joined(let sentences):
+            sentence(
+                "Opened, and joined: the Mac that answered is trusted now, the same as a "
+                    + "pasted key, with no digits to compare.", tint: Tok.inkDim)
+            if !sentences.isEmpty {
+                sentence(sentences, tint: Tok.mute)
+            }
+        case .answered:
+            // Never produced by this sheet's own two verbs: minting an ask
+            // never answers one, and opening a reply never answers one
+            // either. The friend's side draws this case, in
+            // `PeersSettingsView.pasteKeySheet`.
+            EmptyView()
+        case .refused(let said):
+            sentence(said, tint: Tok.near)
+        case .couldNotRun(let said):
+            sentence(said, tint: Tok.near)
+        }
+    }
+
+    /// The paste field for a reply, scene `w15-sealed-waiting`'s own field.
+    /// Not a second sheet: the person is in the middle of one exchange, and a
+    /// second sheet would put the invite they still have to send behind the
+    /// thing asking them for a reply.
+    private var replyField: some View {
+        TextField("Paste what they send back", text: $pastedReply)
+            .textFieldStyle(.plain)
+            .font(V4.mono(V4.monoSize))
+            .padding(.vertical, V4.yesBlockPaddingV)
+            .padding(.horizontal, V4.yesBlockPaddingH)
+            .background(
+                RoundedRectangle(cornerRadius: V4.buttonRadius)
+                    .stroke(Tok.cardLine, lineWidth: 0.5)
+            )
+    }
+
+    /// The headline says which of the three screens this is, so a refusal is
+    /// never read as a key or a reply that has not arrived yet.
+    private var title: String {
+        switch mode {
+        case .none:
+            return "Invite a Mac"
+        case .key:
+            switch invite {
+            case nil, .minted: return "Invite a Mac"
+            case .refused: return "No key minted"
+            case .couldNotRun: return "That did not run"
+            }
+        case .sealed:
+            switch sealed {
+            case nil, .asked, .joined, .answered: return "Invite a Mac"
+            case .refused(let said):
+                // Both refusals reach this sheet as the same case: one
+                // means the reply itself never opened, the other means it
+                // opened and the dial that followed found nobody. `tcr`'s
+                // own sentence in each carries the difference; this only
+                // has to head the reader to the right fix.
+                return said.contains("nothing answered at any address")
+                    ? "They did not answer" : "That reply did not open"
+            case .couldNotRun: return "That did not run"
+            }
+        }
+    }
+
+    // MARK: - Buttons
+
+    @ViewBuilder private var buttons: some View {
+        HStack(spacing: V4.buttonGap) {
+            Spacer(minLength: 0)
+            PeerActionButton(title: "Done", systemImage: nil, help: doneHelp) { onClose() }
+            if mode == .key, case .minted(let key, _) = invite {
+                PeerActionButton(
+                    title: "Copy key", systemImage: nil,
+                    help: "Puts the key on the pasteboard. Nothing else goes with it."
+                ) { copy(key) }
+            }
+            if mode == .sealed, case .asked(let ask, _) = sealed {
+                PeerActionButton(
+                    title: "Copy", systemImage: nil,
+                    help: "Puts the invite on the pasteboard. Nothing else goes with it."
+                ) { copy(ask) }
+                PeerActionButton(
+                    title: "Open reply", systemImage: nil,
+                    help: "Opens what was pasted above. If it opens, it joins immediately.",
+                    enabled: !pastedReply.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .isEmpty
+                ) { onOpenReply(pastedReply.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            }
+        }
+    }
+
+    private var doneHelp: String {
+        switch (mode, invite, sealed) {
+        case (.key, .minted, _):
+            return "Closes this. The key stays good whether this is open or not."
+        case (.sealed, _, .asked):
+            return "Closes this. The invite stays good whether this is open or not."
+        default:
+            return "Closes this."
+        }
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// A key or an ask: whole, wrapped rather than cut, and selectable, so it
+    /// can be taken by hand. Never truncated: half a string pasted into a
+    /// chat is a refusal at the other end with no way to see why. VoiceOver
+    /// does not spell it out, ``PeerMovedSheet/linkBox(_:)``'s own move.
+    private func box(_ text: String, accessibilityLabel: String) -> some View {
+        Text(text)
             .font(V4.mono(V4.monoSize))
             .foregroundStyle(Tok.ink)
             .textSelection(.enabled)
@@ -2779,7 +3132,7 @@ struct PeerInviteSheet: View {
                 RoundedRectangle(cornerRadius: V4.buttonRadius)
                     .fill(Tok.ink.opacity(V4.buttonFillAlpha))
             )
-            .accessibilityLabel("A key for one Mac")
+            .accessibilityLabel(accessibilityLabel)
     }
 
     private func sentence(_ text: String, tint: Color) -> some View {
