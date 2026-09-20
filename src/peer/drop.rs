@@ -33,7 +33,7 @@
 //!
 //! # Nothing calls this yet
 //!
-//! This file is the crypto and the naming. There is no store client, no
+//! This file is the crypto, the naming, and a store client. There is no
 //! publisher task and no endpoint source here: those are separate changes and
 //! none of this runs at boot.
 
@@ -551,4 +551,209 @@ pub fn open(
     }
 
     Ok(record)
+}
+
+// ---------------------------------------------------------------------------
+// The store
+// ---------------------------------------------------------------------------
+
+/// How large a store's answer to `get` may be before it is refused unread.
+///
+/// A sealed record carrying [`MAX_RECORD_ENDPOINTS`] addresses is a few
+/// hundred bytes. Sixty-four KiB is two orders of headroom above that and
+/// still refuses a surface that answers with a log file instead of a record.
+pub const MAX_STORE_BODY_BYTES: usize = 64 * 1024;
+
+/// Why a store call did not succeed.
+///
+/// Four variants and not the three the design sketch carries: `TooLarge` is
+/// a distinct diagnosis from `Status`, the same reason `RecordRefusal` has
+/// seven variants rather than one, an operator reading a log needs to tell
+/// them apart. Absence is never a variant here: it is `Ok(None)`, the
+/// ordinary outcome `tcr peer reach` gives a router that declines.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreRefusal {
+    /// The call never got an answer: a DNS failure, a refused connection, a
+    /// timeout.
+    #[error("dead drop: the store could not be reached: {source}")]
+    Unreachable {
+        #[source]
+        source: reqwest::Error,
+    },
+    /// The store answered, and not with success or an absence.
+    #[error("dead drop: the store answered {status} for {name}")]
+    Status { status: u16, name: String },
+    /// No store is configured at all.
+    #[error("dead drop: no store is configured; `tcr peer drop-store set` is the switch")]
+    NotConfigured,
+    /// The store's answer to `get` passed [`MAX_STORE_BODY_BYTES`] and the
+    /// read stopped rather than holding whatever it kept sending.
+    #[error("dead drop: the store's answer for {name} passed the {ceiling}-byte ceiling")]
+    TooLarge { name: String, ceiling: usize },
+}
+
+/// A dumb public key-value surface: an opaque name in, opaque bytes out.
+///
+/// The seam is the transport and nothing above it. Naming, sealing, freshness
+/// and admissibility are the shipped code in every test; a backend swaps only
+/// what a remote store would have been. The same rule
+/// [`crate::peer::reach::PunchNet`] is written to.
+pub trait DeadDropStore {
+    /// Place `record` at `name`, replacing whatever was there.
+    fn put(
+        &self,
+        name: &DropName,
+        record: &[u8],
+    ) -> impl std::future::Future<Output = std::result::Result<(), StoreRefusal>> + Send;
+
+    /// Read what is at `name`. `Ok(None)` is "nothing there", an ordinary
+    /// outcome and not an error, the shape `reach_upnp` gives a router that
+    /// declines.
+    fn get(
+        &self,
+        name: &DropName,
+    ) -> impl std::future::Future<Output = std::result::Result<Option<Vec<u8>>, StoreRefusal>> + Send;
+}
+
+/// The backend that ships first: one URL template, `PUT` and `GET`.
+///
+/// The client is built once, at construction, and held: no later call
+/// re-checks the template and no later call builds a client.
+pub struct HttpsTemplateStore {
+    template: String,
+    token: Option<String>,
+    client: reqwest::Client,
+}
+
+impl HttpsTemplateStore {
+    /// Build one from the configured template. Refuses a template with no
+    /// `{name}` placeholder at construction, not at the first `put`.
+    ///
+    /// The client carries `no_proxy` (an ambient `HTTP_PROXY` very commonly
+    /// points at tcr itself) and turns redirects off (a store that redirects
+    /// a PUT is doing something this node did not ask for), the shape
+    /// `reach_upnp`'s client is built in and for the reasons its comments
+    /// give.
+    pub fn new(template: &str, token: Option<&str>) -> Result<Self> {
+        if !template.contains("{name}") {
+            bail!("dead drop: the store template has no {{name}} placeholder: {template}");
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("dead drop: the store's HTTP client would not build")?;
+        Ok(Self {
+            template: template.to_string(),
+            token: token.map(str::to_string),
+            client,
+        })
+    }
+
+    /// The URL for one name.
+    fn url_for(&self, name: &DropName) -> String {
+        self.template.replace("{name}", &name.to_wire())
+    }
+}
+
+impl DeadDropStore for HttpsTemplateStore {
+    fn put(
+        &self,
+        name: &DropName,
+        record: &[u8],
+    ) -> impl std::future::Future<Output = std::result::Result<(), StoreRefusal>> + Send {
+        let url = self.url_for(name);
+        let name_wire = name.to_wire();
+        let client = self.client.clone();
+        let token = self.token.clone();
+        let body = record.to_vec();
+        async move {
+            let mut request = client
+                .put(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body);
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|source| StoreRefusal::Unreachable { source })?;
+            let status = response.status();
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(StoreRefusal::Status {
+                    status: status.as_u16(),
+                    name: name_wire,
+                })
+            }
+        }
+    }
+
+    /// 200 with a body is `Ok(Some(bytes))`. 404 and 410 are `Ok(None)`:
+    /// nothing there is an ordinary outcome. Anything else is `Status`, a
+    /// redirect included, since the client turns redirects off and never
+    /// follows one.
+    ///
+    /// The body is read under [`MAX_STORE_BODY_BYTES`], twice: a
+    /// `Content-Length` above it is refused before a byte of body is read,
+    /// and the read itself stops at the ceiling, which is the half that
+    /// matters, since a promise is not a limit, the rule `reach_upnp::fetch`
+    /// states.
+    fn get(
+        &self,
+        name: &DropName,
+    ) -> impl std::future::Future<Output = std::result::Result<Option<Vec<u8>>, StoreRefusal>> + Send
+    {
+        let url = self.url_for(name);
+        let name_wire = name.to_wire();
+        let client = self.client.clone();
+        let token = self.token.clone();
+        async move {
+            let mut request = client.get(&url);
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|source| StoreRefusal::Unreachable { source })?;
+            let status = response.status();
+            if status.as_u16() == 404 || status.as_u16() == 410 {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                return Err(StoreRefusal::Status {
+                    status: status.as_u16(),
+                    name: name_wire,
+                });
+            }
+            if let Some(promised) = response.content_length() {
+                if promised > MAX_STORE_BODY_BYTES as u64 {
+                    return Err(StoreRefusal::TooLarge {
+                        name: name_wire,
+                        ceiling: MAX_STORE_BODY_BYTES,
+                    });
+                }
+            }
+            let mut collected: Vec<u8> = Vec::new();
+            let mut response = response;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|source| StoreRefusal::Unreachable { source })?
+            {
+                if collected.len() + chunk.len() > MAX_STORE_BODY_BYTES {
+                    return Err(StoreRefusal::TooLarge {
+                        name: name_wire,
+                        ceiling: MAX_STORE_BODY_BYTES,
+                    });
+                }
+                collected.extend_from_slice(&chunk);
+            }
+            Ok(Some(collected))
+        }
+    }
 }
