@@ -173,7 +173,9 @@ struct PeersSettingsPane: View {
         }
         .onDisappear { controller.stop() }
         .onChange(of: snapshot.name) { latest in fillNameIfEmpty(latest) }
-        .sheet(isPresented: $showingJoinKey) { joinKeySheet }
+        .sheet(isPresented: $showingJoinKey) {
+            PeerInviteSheet(outcome: joinKeyOutcome, onClose: { showingJoinKey = false })
+        }
         .sheet(isPresented: $pasting) { pasteKeySheet }
         .sheet(isPresented: $customizing) { defaultsSheet }
         .sheet(item: $sheetPeer) { row in macSheet(row) }
@@ -1012,58 +1014,6 @@ struct PeersSettingsPane: View {
 
     // MARK: - The two key sheets
 
-    /// Show join key. The sheet is the READOUT of a command's stdout, which is
-    /// why it has three states and not one: the invite is still running, it
-    /// printed a key, or `tcr` said why it could not mint one.
-    private var joinKeySheet: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Join key")
-                .font(.headline)
-            switch joinKeyOutcome {
-            case nil:
-                Text("Minting one, ten minutes and one use.")
-                    .font(.callout)
-                    .foregroundStyle(Tok.inkDim)
-            case .text(let key):
-                Text(key)
-                    .font(.system(.body, design: .monospaced))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Tok.ink.opacity(0.06)))
-                    .accessibilityLabel("Join key")
-                Text(
-                    "Paste it into Settings > Peers on the other Mac, under Paste a key. It "
-                        + "works once and expires in ten minutes."
-                )
-                .font(.caption)
-                .foregroundStyle(Tok.inkFaint)
-                .fixedSize(horizontal: false, vertical: true)
-            case .failed(let message):
-                // `tcr`'s own words. No silent fallback: a failed mint says so
-                // rather than closing as if it had worked.
-                Text(message)
-                    .font(.callout)
-                    .foregroundStyle(Tok.near)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(spacing: 8) {
-                Spacer(minLength: 0)
-                if case .text(let key) = joinKeyOutcome {
-                    Button("Copy") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(key, forType: .string)
-                    }
-                }
-                Button("Done") { showingJoinKey = false }
-                    .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(20)
-        .frame(width: 380)
-    }
-
     /// Paste a key, or a whole `tcr://` link.
     ///
     /// Either one is fed to `tcr peer join --stdin` on STDIN, never as an
@@ -1109,11 +1059,13 @@ struct PeersSettingsPane: View {
 
     /// Opens the sheet FIRST and fills it in when the invite answers, so a
     /// slow `tcr` reads as a sheet that is working rather than as a button
-    /// that did nothing.
+    /// that did nothing. The tab's own sheet and classifier, ``PeerInviteSheet``
+    /// and ``PeerInviteMint``, one fact in one place rather than a second
+    /// Swift spelling of what the invite verb already says.
     private func showJoinKey() {
         joinKeyOutcome = nil
         showingJoinKey = true
-        controller.capture(PeerCommand.invite) { joinKeyOutcome = $0 }
+        controller.mintInvite { joinKeyOutcome = $0 }
     }
 
     private var trimmedPastedKey: String {
@@ -1326,7 +1278,7 @@ struct PeersSettingsPane: View {
     @State private var showingJoinKey = false
     /// `nil` while the invite is in flight. Not an empty string: those are two
     /// different sheets.
-    @State private var joinKeyOutcome: PeerCapture?
+    @State private var joinKeyOutcome: PeerInviteMint.Outcome?
     @State private var pasting = false
     @State private var pastedKey = ""
     @State private var customizing = false

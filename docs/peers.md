@@ -250,6 +250,12 @@ from an older build carried one address, and this build still reads one of those
 instead of the command line, so it never lands in shell history or in another process's view
 of this one's arguments.
 
+In the panel, the Peers tab's footer carries an `Invite…` button beside `Settings…` that runs
+`tcr peer invite` in one press: the sheet opens first, then shows the key in a copyable box
+under `tcr`'s own lines about which paths it carries and how long it lasts, unedited. `Settings
+> Peers > Advanced > Show…` opens the same sheet, for a headless Mac's operator working from
+that pane. Neither screen says anything about the key that `tcr` did not already print.
+
 A Mac that already has a network key **refuses a link that carries a different one**, and says
 what accepting it would cut this Mac off from. Pasting a second office's key over the first is
 the commonest way a Mac vanishes from its own mesh, and it used to happen without a word. Pass

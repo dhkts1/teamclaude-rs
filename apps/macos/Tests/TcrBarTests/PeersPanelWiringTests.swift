@@ -68,32 +68,48 @@ final class PeersPanelWiringTests: XCTestCase {
 
     // MARK: - Show join key
 
-    /// The finding: the button fired `tcr peer invite` and threw away its
-    /// stdout, which IS the join key. Nothing appeared, on either screen.
+    /// The finding this pinned originally: the button fired `tcr peer invite`
+    /// and threw away its stdout, which IS the join key. Nothing appeared, on
+    /// either screen.
+    ///
+    /// The pairing-link build's phase 3 pointed this button at the same
+    /// sheet and classifier the Peers tab's footer uses
+    /// (`pairing-link-design.md`, "The subtraction"), so the assertion below
+    /// moved from a bespoke `PeerCapture` read to the shared `mintInvite` and
+    /// `PeerInviteSheet`, and it is the answer to the same finding: the key
+    /// still has to reach a screen, and Copy still has to work.
     func testShowJoinKeyReadsTheCommandsOutput() throws {
         let pane = try source("apps/macos/Sources/TcrBar/PeersSettingsView.swift")
         XCTAssertTrue(
-            pane.contains("controller.capture(PeerCommand.invite)"),
+            pane.contains("controller.mintInvite {"),
             "Show join key is not reading the invite's stdout any more, a fire-and-forget "
                 + "run(_:) discards the key, which is the whole output of the command")
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let sheet = try slice(
+            tab, from: "struct PeerInviteSheet: View {", to: "// MARK: - The link sheet")
         XCTAssertTrue(
-            pane.contains("NSPasteboard.general.setString(key, forType: .string)"),
-            "the join-key sheet has no Copy: the key is a string somebody has to paste on "
-                + "another Mac, and it is not selectable from a screenshot")
+            sheet.contains("NSPasteboard.general.setString(key, forType: .string)"),
+            "the shared invite sheet has no Copy: the key is a string somebody has to paste "
+                + "on another Mac, and it is not selectable from a screenshot")
     }
 
     /// Three states, so a slow or failed invite is never drawn as an empty
-    /// key. `PeerCapture` has no "ran and printed nothing" case for the same
-    /// reason.
+    /// key. Phase 3 pointed Show join key at the same sheet the footer's
+    /// Invite… button opens rather than keeping a second Swift copy of this
+    /// rule, so the assertion is against the shared sheet now.
     func testTheJoinKeySheetDrawsAFailureRatherThanAnEmptyKey() throws {
-        let pane = try source("apps/macos/Sources/TcrBar/PeersSettingsView.swift")
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let sheet = try slice(
-            pane, from: "private var joinKeySheet: some View {",
-            to: "private var pasteKeySheet: some View {")
+            tab, from: "struct PeerInviteSheet: View {", to: "// MARK: - The link sheet")
         XCTAssertTrue(
-            sheet.contains("case .failed(let message):"),
-            "the join-key sheet no longer renders tcr's own failure message, so a refused "
-                + "invite closes or waits forever and looks like a working button")
+            sheet.contains("case .couldNotRun(let said):"),
+            "the shared invite sheet no longer renders tcr's own failure message, so a "
+                + "refused invite closes or waits forever and looks like a working button")
+        let pane = try source("apps/macos/Sources/TcrBar/PeersSettingsView.swift")
+        XCTAssertFalse(
+            pane.contains("private var joinKeySheet: some View {"),
+            "the pane's own copy of the key sheet is back, which is the second spelling of "
+                + "\"works once and expires in ten minutes\" phase 3 removed")
     }
 
     // MARK: - Paste a key
