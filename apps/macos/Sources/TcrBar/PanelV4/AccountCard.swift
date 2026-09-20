@@ -238,7 +238,7 @@ struct AccountCard<Actions: View>: View {
     @ViewBuilder
     private var nameRow: some View {
         HStack(alignment: .firstTextBaseline, spacing: V4.tabGap) {
-            // NONE of these three takes `.fixedSize()` — that forces a view
+            // NONE of these three takes `.fixedSize()`: that forces a view
             // to its ideal width regardless of what the row can actually
             // give it, which is the opposite of "never truncated": measured
             // on `01g-widest-row`, it overflowed the row's whole HStack and
