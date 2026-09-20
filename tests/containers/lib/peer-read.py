@@ -13,6 +13,9 @@ make in their containers.
     labels                 every pinned row as `<node-id> <label>`
     endpoints <node-id>    that row's endpoints, one per line, as either
                            `direct <host:port>` or `<kind> <node-id>`
+    found                  every row with no `node` key, one per line, as
+                           `<address> <name>`, `no name announced` when the
+                           row announced none
 
 Exit 0 when the listing parsed, 2 when it did not, and 1 when the row asked for
 is not in it: a scenario that cannot tell "no such row" from "a row with no
@@ -47,6 +50,18 @@ def main() -> int:
     if what == "labels":
         for row in rows:
             print(f"{row.get('node', '')} {row.get('label', '')}")
+        return 0
+
+    if what == "found":
+        # A found row carries no `node` key at all: that is the type-level
+        # fact `PeerFoundRow` holds and this reader is a second check of it,
+        # not the enforcement.
+        for row in rows:
+            if "node" in row:
+                continue
+            address = row.get("address", "")
+            name = row.get("name") or "no name announced"
+            print(f"{address} {name}")
         return 0
 
     if what == "endpoints":

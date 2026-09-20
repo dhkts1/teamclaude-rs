@@ -1099,6 +1099,25 @@ fn a_flood_holds_two_rows_per_address_and_nothing_survives_the_ttl() {
     );
 }
 
+/// **The TTL covers three browses, so two missed scans cost a found row
+/// nothing.** `BROWSE_INTERVAL`'s own doc derives this relation; this test is
+/// what holds it, not the comment.
+///
+/// Watch it fail by setting `BROWSE_INTERVAL` to 30 s: three of those is 90 s,
+/// past the 60 s `FOUND_TTL_MS`, and the assertion goes red.
+#[test]
+fn found_ttl_covers_three_browses() {
+    let browse_interval_ms = i64::try_from(discovery::BROWSE_INTERVAL.as_millis())
+        .expect("BROWSE_INTERVAL fits in an i64 of milliseconds");
+    assert!(
+        discovery::FOUND_TTL_MS >= 3 * browse_interval_ms,
+        "FOUND_TTL_MS ({}) must cover three browses at BROWSE_INTERVAL ({}), or a row that \
+         missed two scans in a row leaves before a third has a chance to renew it",
+        discovery::FOUND_TTL_MS,
+        browse_interval_ms
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The weakest source of all: an address left at a dead drop
 // ---------------------------------------------------------------------------

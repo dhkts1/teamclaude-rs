@@ -908,6 +908,23 @@ async fn connect_in_key_order(token: &JoinToken) -> Result<(SocketAddr, tokio::n
 /// registrar that says nothing must produce an error rather than a hang.
 const ENROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The one sentence a dial that never connects prints, said by both call
+/// sites in this file rather than written twice: [`knock`]'s and
+/// [`dial_first_pairing`]'s. Extracted before the second clause was added,
+/// because adding a clause to two copies is how they drift.
+///
+/// The added clause names the ordinary cause: a found row leaves
+/// `tcr peer ls --json` within a minute of its last announcement (see
+/// `crate::peer::discovery::FOUND_TTL_MS`), so a Trust pressed on a row for a
+/// Mac that just slept or left the network is not a bug, it is a race an
+/// operator can read as one.
+fn could_not_reach(addr: SocketAddr) -> String {
+    format!(
+        "peer pair: could not reach {addr}: that Mac may have slept or left this network. Its \
+         row leaves this list within a minute of its last announcement."
+    )
+}
+
 /// Phase one: knock, so the operator at the other Mac sees a pairing request.
 ///
 /// This is the only way a first pairing starts: "pressing Trust
@@ -925,7 +942,7 @@ pub async fn knock(store: &PeerStore, addr: SocketAddr, proposed_name: &str) -> 
     let name = sanitize_label(proposed_name).ok();
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
-        .with_context(|| format!("peer pair: could not reach {addr}"))?;
+        .with_context(|| could_not_reach(addr))?;
     noise::send_knock(
         &mut stream,
         &tcr_peer_wire::Knock {
@@ -1095,7 +1112,7 @@ async fn dial_first_pairing(
 ) -> Result<noise::PeerSession> {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
-        .with_context(|| format!("peer pair: could not reach {addr}"))?;
+        .with_context(|| could_not_reach(addr))?;
     noise::dial_handshake_with_payload(
         &mut stream,
         secret,

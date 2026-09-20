@@ -1249,8 +1249,16 @@ fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
     // so the fixture states them: what is pinned here is the SHAPE the panel
     // decodes, and the derivation has its own tests.
     let peers = vec![
-        teamclaude_rs::status::PeerLsRow::from_row(rows[0].clone(), Some(LIVE_UNTIL_S), false),
-        teamclaude_rs::status::PeerLsRow::from_row(rows[1].clone(), Some(ENDED_UNTIL_S), true),
+        teamclaude_rs::status::PeerLsPeer::Trusted(teamclaude_rs::status::PeerLsRow::from_row(
+            rows[0].clone(),
+            Some(LIVE_UNTIL_S),
+            false,
+        )),
+        teamclaude_rs::status::PeerLsPeer::Trusted(teamclaude_rs::status::PeerLsRow::from_row(
+            rows[1].clone(),
+            Some(ENDED_UNTIL_S),
+            true,
+        )),
     ];
 
     teamclaude_rs::status::PeerLsJson {
