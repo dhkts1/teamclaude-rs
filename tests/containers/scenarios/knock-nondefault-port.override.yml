@@ -2,13 +2,11 @@
 # compose.yml, so this scenario can give node-a2 a non-default listen port
 # without touching compose.yml itself.
 #
-# compose.yml and lib/compose.sh belong to the phase-3 unit
-# (docs/plans/lan-p2p/bridge-w8-containers-phase3-4.md); node-a2's
-# PEER_LISTEN there is a literal, not a `${VAR:-default}`, so there is no way
-# to reach it from outside without editing that file. The templated form
-# NODE_A2_FIND and NODE_A2_ANNOUNCE_NAME already use
-# (`PEER_LISTEN: ${NODE_A2_PEER_LISTEN:-0.0.0.0:7755}`) would let this file go
-# away; that is the one line this scenario would ask phase 3 to add.
+# node-a2's PEER_LISTEN in compose.yml is a literal, not a `${VAR:-default}`,
+# so there is no way to reach it from outside without editing that file. The
+# templated form NODE_A2_FIND and NODE_A2_ANNOUNCE_NAME already use
+# (`PEER_LISTEN: ${NODE_A2_PEER_LISTEN:-0.0.0.0:7755}`) would let this file
+# go away.
 services:
   node-a2:
     environment:
