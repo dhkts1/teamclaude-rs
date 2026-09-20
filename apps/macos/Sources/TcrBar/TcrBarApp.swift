@@ -108,6 +108,13 @@ enum TcrBarEntry {
         if MeasureOpen.requested() {
             MeasureOpen.run()  // exits
         }
+        // And the third, which opens a panel and then closes it: what this app
+        // keeps spawning with nothing on screen cannot be measured without a
+        // real panel going away. Every spawn in it is substituted, so it
+        // reaches no proxy at all.
+        if let seconds = MeasureIdle.requestedSeconds() {
+            MeasureIdle.run(seconds: seconds)  // exits
+        }
 
         let app = NSApplication.shared
         // The bundle already sets `LSUIElement`, so this matches what the app

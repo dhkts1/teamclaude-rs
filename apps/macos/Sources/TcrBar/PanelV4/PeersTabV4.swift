@@ -739,11 +739,23 @@ final class PeerController: ObservableObject {
         PeerController(pinned: snapshot, refusal: refusal)
     }
 
+    /// Starts the three second read, which then runs for as long as this view
+    /// tree lives and reads only while the panel is on screen.
+    ///
+    /// The tick asks ``PeerPollGate`` rather than assuming that a stop arrives:
+    /// `stop()` is called from the view's `onDisappear`, and a popover closing
+    /// does not reliably tear its content down, so the task outlived the panel
+    /// and kept spending two children every three seconds on a tab nobody could
+    /// see. Skipping rather than cancelling is what makes a reopen work: the
+    /// same live task starts reading again, which a cancelled one could not do
+    /// without an `onAppear` that a surviving view tree never fires.
     func start() {
         guard !isPinned, task == nil else { return }
         task = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.refresh()
+                if PeerPollGate.shouldRead() {
+                    await self?.refresh()
+                }
                 guard let interval = self?.interval else { return }
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             }
