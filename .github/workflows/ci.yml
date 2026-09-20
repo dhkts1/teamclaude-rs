@@ -366,3 +366,34 @@ jobs:
           cargo +nightly miri test model::
           cargo +nightly miri test account_uuid::
           cargo +nightly miri test quota::
+
+  # netlab (phase 7 of docs/plans/lan-p2p/netlab-design.md), red-allowed. Runs
+  # every scenario tests/containers/** already proves under compose, this time
+  # one namespace lab per scenario inside a single Docker container
+  # (--network none, NET_ADMIN plus SYS_ADMIN, nothing else), so the scenario
+  # file is exercised under both harnesses on every pull request instead of
+  # only on whatever machine someone remembers to run it on. continue-on-error
+  # keeps a red scenario here from blocking a merge; promotion to the required
+  # check list is a separate one-line branch-protection change, not this job.
+  netlab:
+    name: netlab
+    needs: changes
+    if: needs.changes.outputs.inert != 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run the netlab scenarios
+        run: |
+          cores="$(nproc)"
+          export CARGO_BUILD_JOBS="$cores"
+          scripts/peer-containers.sh --netlab all | tee "$RUNNER_TEMP/netlab.log"
+
+      - name: Upload netlab log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: netlab-log
+          path: ${{ runner.temp }}/netlab.log
