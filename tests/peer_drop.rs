@@ -1,12 +1,13 @@
 //! The per-pair drop name and the sealed record: derivation, framing, and
-//! every refusal a reader can answer with.
+//! every refusal a reader can answer with. Also the store round trip, against
+//! a fake standing in for a real `HttpsTemplateStore` target.
 //!
-//! # Nothing here touches a network or a file
+//! # What touches a network in this file
 //!
-//! There is no listener, no temp file and no store in this file. It is pure
-//! computation over fixed inputs, so it cannot reach the proxy on
-//! `127.0.0.1:3456`, the operator's config directory, or anything else outside
-//! the test process.
+//! Most of this file is pure computation over fixed inputs and reaches
+//! nothing outside the test process. The one exception is the fake below: it
+//! binds `127.0.0.1:0`, nothing here leaves loopback, and no config
+//! directory is read anywhere in this file.
 //!
 //! # The values are obviously synthetic
 //!
@@ -14,12 +15,20 @@
 //! every address is from the documentation range (RFC 5737 TEST-NET-3). None
 //! of it is anybody's.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
+use axum::routing::get;
+use axum::Router;
 use tcr_peer_wire::PeerId;
 use teamclaude_rs::peer::drop::{
-    self, current_slot, seal, DropKeys, DropName, DropRecord, RecordRefusal, DROP_SLOT_SECONDS,
-    MAX_RECORD_AGE,
+    self, current_slot, seal, DeadDropStore, DropKeys, DropName, DropRecord, HttpsTemplateStore,
+    RecordRefusal, DROP_SLOT_SECONDS, MAX_RECORD_AGE,
 };
 
 /// A peer id that is plainly not a real one: 32 copies of one byte.
@@ -307,4 +316,169 @@ fn decode_hex(hex: &str) -> Vec<u8> {
             u8::from_str_radix(pair, 16).expect("the vector is lower-case hex")
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// A fake `HttpsTemplateStore` target on loopback, and its call log
+// ---------------------------------------------------------------------------
+
+/// Every call the fake saw, in arrival order: `"put <name> auth=<header>"`,
+/// `"get <name>"`. The header is recorded on the call itself, not inferred
+/// from the absence of an error, so a test can prove the token arrived.
+type CallLog = Arc<Mutex<Vec<String>>>;
+
+/// What the fake currently holds, name to bytes.
+type StoredRecords = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+#[derive(Clone)]
+struct FakeStoreState {
+    calls: CallLog,
+    records: StoredRecords,
+}
+
+/// Bind a loopback TCP listener and serve `PUT /{name}` and `GET /{name}`
+/// over a shared map, on a dedicated thread with its own runtime, the shape
+/// `spawn_http_server` in `tests/peer_reach_upnp.rs:161` serves the fake
+/// UPnP device in.
+fn spawn_fake_store(calls: CallLog) -> SocketAddr {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake store");
+    std_listener
+        .set_nonblocking(true)
+        .expect("the fake store's listener must be non-blocking for tokio");
+    let addr = std_listener
+        .local_addr()
+        .expect("the fake store's own address");
+
+    let state = FakeStoreState {
+        calls,
+        records: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the fake store");
+        rt.block_on(async move {
+            let app = Router::new()
+                .route("/{name}", get(fake_store_get).put(fake_store_put))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::from_std(std_listener)
+                .expect("the fake store's listener must convert to a tokio one");
+            let _served = axum::serve(listener, app).await;
+        });
+    });
+
+    addr
+}
+
+/// `PUT /{name}`: record the call, the bearer header, and the body, then
+/// answer `204`.
+async fn fake_store_put(
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    State(state): State<FakeStoreState>,
+    body: Bytes,
+) -> StatusCode {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<none>")
+        .to_string();
+    state
+        .calls
+        .lock()
+        .expect("the fake store's call log is never poisoned")
+        .push(format!("put {name} auth={auth}"));
+    state
+        .records
+        .lock()
+        .expect("the fake store's map is never poisoned")
+        .insert(name, body.to_vec());
+    StatusCode::NO_CONTENT
+}
+
+/// `GET /{name}`: record the call, then answer what was last `PUT` there, or
+/// `404` if nothing was.
+async fn fake_store_get(Path(name): Path<String>, State(state): State<FakeStoreState>) -> Response {
+    state
+        .calls
+        .lock()
+        .expect("the fake store's call log is never poisoned")
+        .push(format!("get {name}"));
+    let found = state
+        .records
+        .lock()
+        .expect("the fake store's map is never poisoned")
+        .get(&name)
+        .cloned();
+    match found {
+        Some(bytes) => Response::builder()
+            .status(200)
+            .body(Body::from(bytes))
+            .expect("the fake store's answer builds"),
+        None => Response::builder()
+            .status(404)
+            .body(Body::empty())
+            .expect("the fake store's 404 answer builds"),
+    }
+}
+
+/// A real `HttpsTemplateStore`, pointed at the loopback fake above, seals a
+/// record, `put`s it, `get`s it back, and opens it: the round trip the whole
+/// backend exists for.
+///
+/// The absence of an error is not evidence the fake was reached: a store
+/// whose `put` silently dropped the call and whose `get` silently returned
+/// `Ok(None)` would also pass a test that only checked the round trip's
+/// result. The call log is the second, independent check that the fake
+/// actually served a `PUT` and a `GET` at the same name, in that order, and
+/// that the bearer token this store was built with actually arrived.
+#[tokio::test]
+async fn a_fake_store_on_loopback_round_trips_a_record() {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let addr = spawn_fake_store(Arc::clone(&calls));
+
+    let publisher = peer_id(0x11);
+    let at = 1_758_240_000;
+    let slot = current_slot(at);
+    let keys = DropKeys::derive(&counting_secret());
+    let name = DropName::for_slot(&keys, &publisher, slot);
+    let sealed = seal(&keys, &name, &record_for(&publisher, slot, at)).expect("the record seals");
+
+    let template = format!("http://{addr}/{{name}}");
+    let store = HttpsTemplateStore::new(&template, Some("testtoken123"))
+        .expect("a template with a {name} placeholder must build");
+
+    store
+        .put(&name, &sealed)
+        .await
+        .expect("the fake store must accept the put");
+
+    let fetched = store
+        .get(&name)
+        .await
+        .expect("the fake store must answer the get")
+        .expect("the fake store must have what was just put");
+    assert_eq!(fetched, sealed, "the bytes must round-trip unchanged");
+
+    let opened = drop::open(&keys, &name, slot, &publisher, &fetched, at + 10)
+        .expect("the round-tripped record must still open");
+    assert_eq!(opened, record_for(&publisher, slot, at));
+
+    let name_wire = name.to_wire();
+    let log = calls
+        .lock()
+        .expect("the fake store's call log is never poisoned")
+        .clone();
+    assert_eq!(
+        log,
+        vec![
+            format!("put {name_wire} auth=Bearer testtoken123"),
+            format!("get {name_wire}"),
+        ],
+        "the fake must have been served a put and then a get at the same \
+         name, with the bearer token attached, not merely have answered \
+         without an error: {log:?}"
+    );
 }
