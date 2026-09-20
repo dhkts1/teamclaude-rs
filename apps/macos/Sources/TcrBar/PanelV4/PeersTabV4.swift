@@ -967,6 +967,51 @@ final class PeerController: ObservableObject {
         }
     }
 
+    /// Mint one join key for a Mac that is not on this network, and hand back
+    /// what the verb answered, classified.
+    ///
+    /// A sibling of ``mintMovedLink(peer:into:)``, not a case added to it:
+    /// the two verbs print different things and a shared case would have to
+    /// know which one ran. No argv here is a subject either, unlike that
+    /// verb's peer id: `tcr peer invite` takes none, so there is nothing to
+    /// pass and nothing that can be passed wrong.
+    func mintInvite(into sink: @escaping (PeerInviteMint.Outcome) -> Void) {
+        guard !isPinned else { return }
+        let arguments = PeerCommand.invite
+        let key = arguments.joined(separator: " ")
+        guard !pending.contains(key) else { return }
+        pending.insert(key)
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.invite(arguments: arguments)
+            }.value
+            guard let self else { return }
+            self.pending.remove(key)
+            sink(outcome)
+        }
+    }
+
+    /// Blocking, always called off the main actor. `tcr`'s own exit code and
+    /// both its streams, classified by ``PeerInviteMint``.
+    private nonisolated static func invite(arguments: [String]) -> PeerInviteMint.Outcome {
+        switch TcrTool.resolve() {
+        case .failure(let notFound):
+            return .couldNotRun(
+                "tcr not found (searched \(notFound.searched.count) locations). "
+                    + TcrTool.overrideRemedy)
+        case .success(let executable):
+            do {
+                let output = try TcrTool.run(executable: executable, arguments: arguments)
+                return PeerInviteMint.outcome(
+                    exitCode: output.exitCode,
+                    stdout: String(data: output.stdout, encoding: .utf8) ?? "",
+                    stderr: output.stderr)
+            } catch {
+                return .couldNotRun(error.localizedDescription)
+            }
+        }
+    }
+
     /// Put a failure this panel produced OUTSIDE a verb onto the tab, in the
     /// same place `tcr`'s own refusals land. One writer, so a message cannot
     /// be drawn in two different ways.
@@ -1257,6 +1302,14 @@ struct PeersTabV4: View {
     /// (the join key sheet's own precedent).
     @State private var minting: PeerRowModel?
     @State private var minted: PeerMovedMint.Outcome?
+    /// Whether the invite sheet is up. A `Bool` rather than an item, unlike
+    /// ``minting``: this sheet is about the tab, not about one row, so it has
+    /// nothing to key on.
+    @State private var inviting = false
+    /// What the last `tcr peer invite` answered, or `nil` while the sheet is
+    /// still open and nothing has answered yet: opening first and filling in
+    /// is ``startMinting(_:)``'s own precedent.
+    @State private var invited: PeerInviteMint.Outcome?
     /// Whether the refusal banner is showing the raw line tcr printed. Closed
     /// on every new refusal, because the sentence is what the next one is
     /// about.
@@ -1385,6 +1438,14 @@ struct PeersTabV4: View {
                 peerName: row.title,
                 outcome: minted,
                 onClose: { minting = nil })
+        }
+        // The third sheet on this tab, and it is about the tab rather than a
+        // row, so it is keyed on a `Bool` rather than an item the way the
+        // other two are.
+        .sheet(isPresented: $inviting) {
+            PeerInviteSheet(
+                outcome: invited,
+                onClose: { inviting = false })
         }
         // Block asks once, and the question names the address rather than the
         // name: the name is a string the other Mac chose, and the ban is on
@@ -1856,6 +1917,17 @@ struct PeersTabV4: View {
                 + "whatever you already use to talk to whoever is at that Mac.")
     }
 
+    /// Open the sheet first, then fill it in, so a slow `tcr peer invite`
+    /// reads as a screen that is working rather than a button that did
+    /// nothing. ``startMinting(_:)``'s own shape, and about the tab rather
+    /// than a row.
+    private func startInviting() {
+        guard !snapshotMode else { return }
+        invited = nil
+        inviting = true
+        controller.mintInvite { invited = $0 }
+    }
+
     /// Open the sheet first, then fill it in, so a slow mint reads as a screen
     /// that is working rather than a press that did nothing.
     private func startMinting(_ row: PeerRowModel) {
@@ -2217,7 +2289,8 @@ struct PeersTabV4: View {
                             + "appear here by themselves."
                         : (snapshot.finding
                             ? "Only Macs on this network, running tcr, with finding on, can "
-                                + "appear. A Mac elsewhere is added by hand in Settings."
+                                + "appear. A Mac somewhere else is invited with the button "
+                                + "below."
                             : "Turn finding on and any Mac running tcr on this network appears "
                                 + "here by itself."),
                     lineLimit: nil)
@@ -2258,6 +2331,13 @@ struct PeersTabV4: View {
                 .font(V4.font(V4.byToolLineSize))
                 .foregroundStyle(Tok.mute)
             Spacer(minLength: 0)
+            PeerActionButton(
+                title: "Invite…",
+                systemImage: nil,
+                help: "Mints a key for a Mac that is not on this network. It works once and "
+                    + "lasts ten minutes.",
+                enabled: true,
+                action: startInviting)
             PeerActionButton(
                 title: "Settings…",
                 systemImage: nil,
@@ -2583,6 +2663,132 @@ struct PeerActionButton: View {
         .disabled(!enabled)
         .accessibilityLabel(title)
         .help(help)
+    }
+}
+
+// MARK: - The invite sheet
+
+/// A join key for a Mac that is not on this network, and the one thing a
+/// person is entitled to know here that `tcr` does not: which chat window to
+/// paste it into.
+///
+/// A pure function of a ``PeerInviteMint/Outcome``, ``PeerMovedSheet``'s
+/// shape and for the same two reasons: a fixture can draw every state, and a
+/// test can build one with no subprocess. Everything that runs a process is
+/// in ``PeerController``.
+///
+/// # What is said here and what is quoted
+///
+/// The sentence about the chat window is this panel's, because it is about
+/// the chat window a person is about to use and `tcr` knows nothing about
+/// that. Everything else under the key is quoted from the run: how many
+/// addresses it holds, whether one reaches the open internet, and how long it
+/// lasts are the CLI's own printed sentences, unedited. Saying any of them
+/// again in Swift would be a second copy free to drift from the one a person
+/// reads in a terminal.
+///
+/// # Not the moved sheet's sentence
+///
+/// A moved link is sealed to one Mac. A join key is a bearer secret: anyone
+/// who reads it can use it, once, inside its ten minutes. The reassuring
+/// sentence the moved sheet says would be false here, so this one says the
+/// opposite of it on purpose.
+struct PeerInviteSheet: View {
+    /// What the mint answered, or `nil` while it is still running.
+    let outcome: PeerInviteMint.Outcome?
+    var onClose: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: V4.buttonGap) {
+            Text(title)
+                .font(V4.font(V4.summarySize, .semibold))
+                .foregroundStyle(Tok.ink)
+                .fixedSize(horizontal: false, vertical: true)
+
+            switch outcome {
+            case nil:
+                sentence("Minting one for a Mac that is not on this network.", tint: Tok.inkDim)
+            case .minted(let key, let sentences):
+                sentence(
+                    "Send it however you already talk to whoever is at that Mac. Anyone who "
+                        + "reads the message can use it once, so send it the way you would "
+                        + "send a password.", tint: Tok.inkDim)
+                keyBox(key)
+                if !sentences.isEmpty {
+                    sentence(sentences, tint: Tok.mute)
+                }
+                sentence(
+                    "Each press mints one more key. Every one of them works until it is used "
+                        + "or its own clock runs out.", tint: Tok.mute)
+            case .refused(let said):
+                // `tcr`'s own words, in place of the key box. Every invite
+                // refusal carries its own fix inside the sentence: no
+                // listener, no address to reach, the cap.
+                sentence(said, tint: Tok.near)
+            case .couldNotRun(let said):
+                sentence(said, tint: Tok.near)
+            }
+
+            HStack(spacing: V4.buttonGap) {
+                Spacer(minLength: 0)
+                PeerActionButton(
+                    title: "Done", systemImage: nil,
+                    help: "Closes this. The key stays good whether this is open or not."
+                ) { onClose() }
+                if case .minted(let key, _) = outcome {
+                    PeerActionButton(
+                        title: "Copy key", systemImage: nil,
+                        help: "Puts the key on the pasteboard. Nothing else goes with it."
+                    ) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(key, forType: .string)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, V4.cardPaddingV)
+        .padding(.horizontal, V4.cardPaddingH)
+        .frame(width: V4.panelWidth, alignment: .leading)
+        .background(Tok.panel)
+    }
+
+    /// The headline says which of the three screens this is, so a refusal is
+    /// never read as a key that has not arrived yet.
+    private var title: String {
+        switch outcome {
+        case nil, .minted: return "Invite a Mac"
+        case .refused: return "No key minted"
+        case .couldNotRun: return "That did not run"
+        }
+    }
+
+    /// The key itself: whole, wrapped rather than cut, and selectable, so it
+    /// can be taken by hand. Never truncated: half a key pasted into a chat
+    /// is a refusal at the other end with no way to see why. VoiceOver does
+    /// not spell it out, ``PeerMovedSheet/linkBox(_:)``'s own move.
+    private func keyBox(_ key: String) -> some View {
+        Text(key)
+            .font(V4.mono(V4.monoSize))
+            .foregroundStyle(Tok.ink)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, V4.yesBlockPaddingV)
+            .padding(.horizontal, V4.yesBlockPaddingH)
+            .background(
+                RoundedRectangle(cornerRadius: V4.buttonRadius)
+                    .fill(Tok.ink.opacity(V4.buttonFillAlpha))
+            )
+            .accessibilityLabel("A key for one Mac")
+    }
+
+    private func sentence(_ text: String, tint: Color) -> some View {
+        Text(text)
+            .font(V4.font(V4.dimSize))
+            .foregroundStyle(tint)
+            .fixedSize(horizontal: false, vertical: true)
+            .lineSpacing(V4.lineSpacing(V4.dimSize))
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

@@ -406,6 +406,14 @@ enum RenderStates {
                 }
             }
         }
+        for scene in peerInviteSheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeerInviteSheet(scene, appearance: appearance, into: directory) {
+                    written += 1
+                }
+            }
+        }
         for scene in controlScenes {
             for appearance in Appearance.allCases {
                 attempted += 1
@@ -1755,6 +1763,114 @@ enum RenderStates {
         }
     }
 
+    /// Six states of the invite sheet, `w14` since `w13` is the moved sheet's.
+    ///
+    /// The strings are the ones the verb prints, quoted as it prints them, and
+    /// every address is a documentation range: this repository is public and
+    /// a real key is a real Mac's addresses.
+    private static var peerInviteSheetScenes: [(name: String, outcome: PeerInviteMint.Outcome?)] {
+        [
+            // Still running: the sheet opens before tcr has answered, so a
+            // slow mint reads as a screen working rather than a press that
+            // did nothing.
+            ("w14-invite-minting", nil),
+            // The common case a friend off this network meets: no address a
+            // friend outside this Wi-Fi could reach, said in the CLI's own
+            // words.
+            (
+                "w14-invite-key",
+                .minted(
+                    key: "tcr-join:v2:192.0.2.10:7755,198.51.100.20:7755:"
+                        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                    sentences: "peer invite: ok id=3 label=joining-mac ttl_s=600 uses=1\n"
+                        + "peer invite: lan 192.0.2.10:7755\n"
+                        + "peer invite: tailscale 198.51.100.20:7755\n"
+                        + "peer invite: this key carries no internet address, so a friend who "
+                        + "is not on this network or this tailnet needs this Mac's router to "
+                        + "forward the port; `tcr peer reach` reports where that stands\n"
+                        + "peer invite: this key is join-capable by anything that can read "
+                        + "peers.json until it is used or expires, `tcr peer invite --revoke 3` "
+                        + "ends it early")
+            ),
+            // The two have to be told apart at a glance, or the honest answer
+            // about reach is not being given: this one carries a path the
+            // open internet can dial.
+            (
+                "w14-invite-internet",
+                .minted(
+                    key: "tcr-join:v2:198.51.100.20:7755,192.0.2.10:7755:"
+                        + "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+                    sentences: "peer invite: ok id=4 label=joining-mac ttl_s=600 uses=1\n"
+                        + "peer invite: internet 198.51.100.20:7755\n"
+                        + "peer invite: lan 192.0.2.10:7755\n"
+                        + "peer invite: this key is join-capable by anything that can read "
+                        + "peers.json until it is used or expires, `tcr peer invite --revoke 4` "
+                        + "ends it early")
+            ),
+            // No listener at all: `tcr peer find on` is the fix, inside the
+            // sentence.
+            (
+                "w14-invite-no-listener",
+                .refused(
+                    "peer invite: this node has no peer listener, so a token would carry no "
+                        + "address to dial (`tcr peer find on` opens one)")
+            ),
+            // Eight outstanding is the cap, reached by pressing the new
+            // button repeatedly, which this change makes easy for the first
+            // time.
+            (
+                "w14-invite-cap",
+                .refused(
+                    "peer invite: 8 invites are already outstanding, which is the cap "
+                        + "(MAX_OUTSTANDING_INVITES); every one of them is a PSK the registrar "
+                        + "must try against message 1, so `tcr peer invite --revoke <id>` "
+                        + "first")
+            ),
+            // Not a refusal: nothing ran. About this Mac's own installation,
+            // which is why it is not drawn in tcr's voice.
+            (
+                "w14-invite-failed",
+                .couldNotRun("tcr not found (searched 4 locations). " + TcrTool.overrideRemedy)
+            ),
+        ]
+    }
+
+    /// One invite-sheet state, over the empty tab: this sheet is opened by
+    /// somebody with nobody to show yet, and the moved sheet's fixture (a
+    /// trusted Mac) would tell the wrong story here.
+    @MainActor
+    private static func renderPeerInviteSheet(
+        _ scene: (name: String, outcome: PeerInviteMint.Outcome?),
+        appearance: Appearance,
+        into directory: URL
+    ) -> Bool {
+        withDrawingAppearance(appearance.nsAppearance) {
+            let view =
+                peersPanel(snapshot: inviteSheetTab, dry: false, appearance: appearance)
+                .overlay {
+                    ZStack {
+                        Color.black.opacity(sheetScrimAlpha)
+                        PeerInviteSheet(outcome: scene.outcome)
+                            .background(
+                                RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel)
+                            )
+                            .shadow(radius: sheetShadowRadius)
+                    }
+                }
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+            return rasterise(
+                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
+
+    /// The tab underneath every invite sheet: finding on, nobody found yet,
+    /// so the footer's `Invite…` button is drawn on the panel behind the
+    /// scrim, which is what a person actually sees before they press it.
+    private static var inviteSheetTab: PeersSnapshot {
+        peersSnapshot(
+            PeerListDocument(finding: true, peers: [], name: "desk-mac"))
+    }
+
     /// The tab underneath every link sheet: the trusted Mac this one cannot
     /// reach, whose own path line is the press that opened the sheet.
     private static var movedSheetTab: PeersSnapshot {
@@ -1799,46 +1915,46 @@ enum RenderStates {
         let scene = (snapshot: snapshot, dry: dry)
         return
             PanelV4(
-                    freshness: "updated 2s ago",
-                    tabs: PanelTab.allCases,
-                    selected: .peers,
-                    badges: [:],
-                    onSelect: { _ in },
-                    onSettings: {},
-                    // Thirteen, the fleet every other scene in this file
-                    // draws, so `PanelDensity.auto` resolves the same way it
-                    // does on the Accounts tab and these PNGs are comparable
-                    // with those.
-                    accountCount: 13,
-                    summary: {
-                        SummaryLine(
-                            lines: [
-                                scene.dry
-                                    ? [
-                                        .init(text: "13 accounts", tint: Tok.dim),
-                                        .init(text: "none with headroom", tint: Tok.near),
-                                    ]
-                                    : [
-                                        .init(text: "13 accounts", tint: Tok.dim),
-                                        .init(
-                                            text: "6 with headroom", tint: Tok.ok,
-                                            emphasised: true),
-                                    ]
-                            ])
-                    },
-                    content: {
-                        PeersTabV4(
-                            controller: PeerController.pinned(scene.snapshot, refusal: refusal),
-                            snapshotMode: true,
-                            refusalDetailsOpen: detailsOpen)
-                    },
-                    footer: { EmptyView() }
-                )
-                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
-                // A FIXED size, for the reason the fleet scenes give: the
-                // panel sizes itself from a GeometryReader preference and
-                // `ImageRenderer` performs no second layout pass.
-                .fixedSize()
+                freshness: "updated 2s ago",
+                tabs: PanelTab.allCases,
+                selected: .peers,
+                badges: [:],
+                onSelect: { _ in },
+                onSettings: {},
+                // Thirteen, the fleet every other scene in this file
+                // draws, so `PanelDensity.auto` resolves the same way it
+                // does on the Accounts tab and these PNGs are comparable
+                // with those.
+                accountCount: 13,
+                summary: {
+                    SummaryLine(
+                        lines: [
+                            scene.dry
+                                ? [
+                                    .init(text: "13 accounts", tint: Tok.dim),
+                                    .init(text: "none with headroom", tint: Tok.near),
+                                ]
+                                : [
+                                    .init(text: "13 accounts", tint: Tok.dim),
+                                    .init(
+                                        text: "6 with headroom", tint: Tok.ok,
+                                        emphasised: true),
+                                ]
+                        ])
+                },
+                content: {
+                    PeersTabV4(
+                        controller: PeerController.pinned(scene.snapshot, refusal: refusal),
+                        snapshotMode: true,
+                        refusalDetailsOpen: detailsOpen)
+                },
+                footer: { EmptyView() }
+            )
+            .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+            // A FIXED size, for the reason the fleet scenes give: the
+            // panel sizes itself from a GeometryReader preference and
+            // `ImageRenderer` performs no second layout pass.
+            .fixedSize()
     }
 
     // MARK: - Settings > Peers controls

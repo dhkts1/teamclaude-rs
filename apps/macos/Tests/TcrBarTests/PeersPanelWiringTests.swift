@@ -574,6 +574,57 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "spellings of one number is the one that drifts")
     }
 
+    // MARK: - The invite sheet
+
+    /// The contract in one check: every sentence about what a key is worth,
+    /// which paths it carries, and how long it lasts is a line `tcr peer
+    /// invite` printed, not a second spelling of it in Swift.
+    ///
+    /// Both directions, the technique `FleetStatusTests.swift:872-889`
+    /// already uses across this boundary, since Swift cannot import Rust and
+    /// no shared constant crosses it: the sentences still exist over there,
+    /// so this is not pinned to words `tcr` has already moved past, and the
+    /// `PeerInviteSheet` slice contains none of them re-spelled.
+    func testTheInviteSheetQuotesTheCliRatherThanRespellingIt() throws {
+        let mainRs = try source("src/main.rs")
+        XCTAssertTrue(
+            mainRs.contains("no internet address"),
+            "the no-internet-address sentence has moved or been reworded in src/main.rs; "
+                + "update this check and confirm PeerInviteSheet still says nothing of its own "
+                + "about it")
+        XCTAssertTrue(
+            mainRs.contains("needs this Mac's router to forward the"),
+            "the router-forwarding sentence has moved or been reworded in src/main.rs")
+        XCTAssertTrue(
+            mainRs.contains("is used or expires"),
+            "the join-capable-until sentence has moved or been reworded in src/main.rs")
+        let pairRs = try source("src/peer/pair.rs")
+        XCTAssertTrue(
+            pairRs.contains("one use and ten minutes"),
+            "the ten-minutes-one-use sentence has moved or been reworded in src/peer/pair.rs")
+
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let sheet = try slice(
+            tab, from: "struct PeerInviteSheet: View {", to: "// MARK: - The link sheet")
+        for word in ["ten minutes", "one use", "expires", "internet address", "router"] {
+            XCTAssertFalse(
+                sheet.contains(word),
+                "PeerInviteSheet says \"\(word)\" itself, which is a second spelling of a "
+                    + "fact tcr already printed and free to drift from it")
+        }
+    }
+
+    /// A render run mints nothing: `--render-states` writes PNGs and runs no
+    /// subprocess, the same guard every other press on this tab carries.
+    func testTheInvitePressMintsNothingInARenderRun() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let start = try slice(
+            tab, from: "private func startInviting() {", to: "private func startMinting")
+        XCTAssertTrue(
+            start.contains("guard !snapshotMode else { return }"),
+            "a render run starts a subprocess: --render-states writes PNGs and runs nothing")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
