@@ -23,8 +23,27 @@ SCENARIO="state-restored-log-spam"
 export SCENARIO
 . "$HERE/../lib/assert.sh"
 
-# The compose services this scenario needs, for the runner and for a reader.
-SERVICES="node-a1"
-export SERVICES
+if [ "${NETLAB:-0}" != "1" ]; then
+  not_wired "compose: the steps above are written, the driving is only under --netlab"
+fi
 
-not_wired "$SERVICES: the steps above are written, the driving is not"
+TOPOLOGY="$HERE/../topologies/one-node.json"
+export TOPOLOGY
+# shellcheck source=../lib/netlab.sh
+. "$HERE/../lib/netlab.sh"
+
+up node-a1 || { finish; exit 1; }
+pass "node-a1 is up"
+
+sleep 60
+
+count="$(grep -c "peer state restored" "/lab/node-a1/boot.log" 2>/dev/null || true)"
+count="${count:-0}"
+echo "state-restored-log-spam: node-a1 printed 'peer state restored' $count time(s) in 60s"
+if [ "$count" -le 2 ]; then
+  pass "at most two 'peer state restored' lines in 60s ($count)"
+else
+  fail "$count 'peer state restored' lines in 60s, more than the two expected"
+fi
+
+finish

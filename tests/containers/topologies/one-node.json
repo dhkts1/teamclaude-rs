@@ -1,0 +1,8 @@
+{
+  "lans": [
+    { "name": "home-a", "bridge": "br-home-a", "cidr": "10.77.1.0/24" }
+  ],
+  "hosts": [
+    { "name": "node-a1", "lan": "home-a", "ip": "10.77.1.11", "role": "node", "listen": 7755, "proxy": 8088 }
+  ]
+}
