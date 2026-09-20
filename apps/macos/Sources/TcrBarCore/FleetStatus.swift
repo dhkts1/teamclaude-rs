@@ -2142,8 +2142,9 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         groupTags.contains(where: \.isReserved)
     }
 
-    /// What the pool-membership pill says about this account, or `nil` when it
-    /// has nothing to claim.
+    /// Where this account stands with the pool, or `nil` when there is nothing
+    /// to say. Whether the state is worth a PILL is ``RotationState/label``'s
+    /// question, not this one: `.rotating` is a real state that draws no pill.
     ///
     /// `"Rotating"` means one thing — the pool is sending this account traffic
     /// right now — and it is the single most misreadable word on the panel,
@@ -2179,8 +2180,9 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         return .rotating
     }
 
-    /// What the pool-membership pill says, or `nil` when it draws none.
-    public var rotationLabel: String? { rotation?.label }
+    /// What the pool-membership pill says, or `nil` when it draws none, which
+    /// now includes the ordinary rotating account.
+    public var rotationLabel: String? { rotation.flatMap(\.label) }
 
     /// The sentence behind this account's state pill — what the word means and,
     /// where there is one, the way out.
@@ -2240,7 +2242,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         var parts = [name]
         if let plan, !plan.isEmpty { parts.append(plan) }
         if isControl { parts.append("control account") }
-        if let rotation { parts.append(rotation.label.lowercased()) }
+        if let word = rotation?.label { parts.append(word.lowercased()) }
         parts.append(FleetTally.Kind(account: self).phrase)
         for window in [
             (label: "5h", value: fiveHour, state: fiveHourState, reset: fiveHourResetAtMs),
@@ -2269,22 +2271,23 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// The sentence behind the pool-membership pill, for the one state that
     /// needs explaining: `Group only` is not a word an operator meets anywhere
     /// else.
+    ///
+    /// `nil` wherever ``RotationState/label`` is `nil`, `.rotating` included:
+    /// a sentence behind a pill nothing draws is a sentence no hover can reach.
     public var rotationHelp: String? {
         switch rotation {
         case .groupOnly:
             let reserved = groupTags.filter(\.isReserved).map(\.name).joined(separator: ", ")
             return "Reserved for \(reserved): this account serves requests that ask for "
                 + "that group, and no pool traffic at all."
-        case .rotating:
-            return "The pool is sending this account traffic right now."
-        case .none:
+        case .rotating, .none:
             return nil
         }
     }
 }
 
-/// What ``Account/rotation`` found: the two things a pool-membership pill is
-/// ever allowed to claim.
+/// What ``Account/rotation`` found: the two ways an account can stand with the
+/// pool.
 public enum RotationState: Equatable, Sendable {
     /// The pool is sending this account traffic right now.
     case rotating
@@ -2292,9 +2295,22 @@ public enum RotationState: Equatable, Sendable {
     /// traffic at all. ``Account/servesGroupTrafficOnly``.
     case groupOnly
 
-    public var label: String {
+    /// The pill's word, or `nil` for a state that draws no pill.
+    ///
+    /// `.rotating` draws none. Every exclusion above it in ``Account/rotation``
+    /// already returns `nil`, so a card that carries no pool word is a card
+    /// where the pool is sending traffic: the word was on every healthy card at
+    /// once and so separated none of them, while taking a pill's width off the
+    /// one thing that tells two cards apart, the name. Same reasoning the
+    /// parked and re-login cases are already decided by, one step further: the
+    /// pool sending traffic is the default, and the default is silent.
+    ///
+    /// `"Group only"` keeps its pill. It is the rarer state, it is the one an
+    /// operator cannot infer from anything else on the card, and silence there
+    /// would read as the default it is not.
+    public var label: String? {
         switch self {
-        case .rotating: return "Rotating"
+        case .rotating: return nil
         case .groupOnly: return "Group only"
         }
     }

@@ -56,6 +56,69 @@ final class SegmentedTabsFitTests: XCTestCase {
                 + "of residual overflow once shortened")
     }
 
+    /// An equal quarter share is not enough for "Sessions" beside a two-digit
+    /// badge, and no token can close the gap: the strip has 3 pt of gap to give
+    /// and the label is over twenty short. What IS enough is the strip letting
+    /// each segment take its own width, because the four together want less
+    /// than the strip has. Measured at the widest counts this panel can reach.
+    ///
+    /// Without that the label WRAPS, which is what the released panel drew:
+    /// `Sess` over `ions` beside its badge. This gate says the fix is
+    /// available, so a strip that asks each segment for its ideal width and a
+    /// label that refuses to wrap cannot overflow the panel.
+    func testTheFourSegmentsTogetherFitTheStripAtTheirOwnWidths() throws {
+        let accountsLabel = try panelTabTitle("accounts")
+        let sessions = try panelTabTitle("sessions")
+        let tools = try panelTabTitle("tools")
+        let segGap = try token("segGap")
+        let available =
+            try token("panelWidth") - 2 * (try token("panelPaddingSide"))
+            - 2 * (try token("segPadding")) - segGap * 3
+
+        // The widest two-digit and three-digit counts a fleet this size
+        // reaches: sessions run to three figures, tools to two.
+        let widest =
+            try idealSegmentWidth(label: accountsLabel, badge: nil)
+            + (try idealSegmentWidth(label: sessions, badge: 120))
+            + (try idealSegmentWidth(label: tools, badge: 12))
+            + (try idealSegmentWidth(label: "Peers", badge: nil))
+
+        XCTAssertLessThan(
+            widest, available,
+            "the four segments want \(String(format: "%.1f", widest)) pt of the strip's "
+                + "\(String(format: "%.1f", available)) pt, so at their own widths they do not "
+                + "fit and a label has to wrap or be cut")
+        XCTAssertGreaterThan(
+            try idealSegmentWidth(label: sessions, badge: 22),
+            try allottedSegmentWidth(tabCount: 4),
+            "\"\(sessions)\" now fits an equal quarter share, so this gate is measuring "
+                + "nothing: it exists because it does not")
+    }
+
+    /// The arithmetic above says the fit is AVAILABLE. Whether the strip takes
+    /// it is a property of the view, and only the view can be asked.
+    ///
+    /// Each item is `.frame(maxWidth: .infinity)`, so without these two the
+    /// label accepts an equal quarter of the strip and breaks in half rather
+    /// than asking for the width it needs: the released panel drew `Sess` over
+    /// `ions`. Pinned at the source, because a wrap is invisible to every
+    /// assertion that measures a string instead of a rendered line.
+    func testTheTabLabelAsksForItsOwnWidthAndNeverWraps() throws {
+        let source = try panelSource("PanelV4/SegmentedTabs.swift")
+        let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
+        let label = try XCTUnwrap(
+            squashed.range(of: "Text(tab.title)").map { String(squashed[$0.upperBound...]) },
+            "`Text(tab.title)` is no longer in SegmentedTabs in the shape this test reads")
+        let modifiers = String(label.prefix(300))
+        XCTAssertTrue(
+            modifiers.contains(".lineLimit(1)"),
+            "the tab label may wrap again: no `.lineLimit(1)` on it")
+        XCTAssertTrue(
+            modifiers.contains(".fixedSize(horizontal:true,vertical:false)"),
+            "the tab label takes an equal quarter of the strip again rather than its own "
+                + "width, which is what made \"Sessions\" break in two")
+    }
+
     /// `[label: idealWidth]` for the four segments — the three real tabs plus
     /// the literal "Peers" stand-in (see the class doc-comment).
     private func idealWidths(accountsLabel: String) throws -> [String: CGFloat] {

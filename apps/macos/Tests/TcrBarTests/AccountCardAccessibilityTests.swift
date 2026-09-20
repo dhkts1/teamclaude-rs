@@ -29,7 +29,7 @@ final class AccountCardAccessibilityTests: XCTestCase {
             sevenDay: 0.30, sevenDayState: .ok)
         XCTAssertEqual(
             account.cardSummaryLabel(now: now),
-            "alice@example.com, Max 20x, rotating, ready, "
+            "alice@example.com, Max 20x, ready, "
                 + "5h 12% used, within limit, resets 2h 10m, 7d 30% used, within limit")
     }
 
@@ -59,6 +59,32 @@ final class AccountCardAccessibilityTests: XCTestCase {
         XCTAssertFalse(parked.cardSummaryLabel(now: now).contains("rotating"))
     }
 
+    /// Silence, spoken. The card draws no pool pill on a healthy account, so
+    /// the summary says no pool word either: a listener told "rotating" over a
+    /// card that shows nothing is told something no sighted reader is, and the
+    /// summary's whole rule is that it may not claim what the card does not
+    /// draw. The state word right after the plan ("ready") is still spoken.
+    func testTheSummarySpeaksNoPoolWordWhereTheCardDrawsNoPoolPill() {
+        let healthy = cardAccount(
+            "mira@example.com", plan: "Max 20x", quota: 0.12, fiveHour: 0.12,
+            fiveHourState: .ok, sevenDay: 0.30, sevenDayState: .ok)
+        let summary = healthy.cardSummaryLabel(now: now)
+        XCTAssertEqual(healthy.rotation, .rotating)
+        XCTAssertFalse(
+            summary.contains("rotating"),
+            "the card draws no ROTATING pill; the summary must not speak one: \(summary)")
+        XCTAssertTrue(summary.contains("Max 20x, ready"))
+    }
+
+    /// The reserved account is the other arm: its pill is drawn, so its word
+    /// is spoken.
+    func testTheSummarySpeaksTheReservedWordTheCardStillDraws() {
+        let reserved = cardAccount(
+            "nadia@example.com", quota: 0.2, fiveHour: 0.2, sevenDay: 0.2,
+            groups: ["research"], reservedGroups: ["research"])
+        XCTAssertTrue(reserved.cardSummaryLabel(now: now).contains("group only"))
+    }
+
     /// An unmeasured window is left out of the summary rather than spoken as a
     /// zero — the same rule the row itself follows.
     func testAnUnmeasuredWindowIsNotSpokenAsAReading() {
@@ -71,14 +97,14 @@ final class AccountCardAccessibilityTests: XCTestCase {
     }
 
     /// The control account's card says so in the same sentence as its plan,
-    /// before rotation and state — the order its `CONTROL` pill draws in.
+    /// before the state word, the order its `CONTROL` pill draws in.
     func testTheSummaryNamesTheControlAccount() {
         let account = cardAccount(
             "kate@example.com", plan: "Max 20x", quota: 0.12,
             fiveHour: 0.12, fiveHourState: .ok, sevenDay: 0.30, sevenDayState: .ok)
         XCTAssertEqual(
             account.cardSummaryLabel(now: now, isControl: true),
-            "kate@example.com, Max 20x, control account, rotating, ready, "
+            "kate@example.com, Max 20x, control account, ready, "
                 + "5h 12% used, within limit, 7d 30% used, within limit")
     }
 

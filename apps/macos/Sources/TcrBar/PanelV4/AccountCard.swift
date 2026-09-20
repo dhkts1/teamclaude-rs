@@ -217,25 +217,41 @@ struct AccountCard<Actions: View>: View {
     /// Round 1 gave `.compact` a `ViewThatFits` that wrapped the plan onto a
     /// second line when the pair did not fit — that is what the mockup's own
     /// `henry1@example.com` / `Team Standard` two-line card shows, because
-    /// round 1 did not restructure those two rows. Round 2 does: the mockup's
-    /// `.name .dom` gives way FIRST, so the card never grows a line for the
-    /// plan, in either shape — Gil approved the render this way 2026-09-13.
+    /// round 1 did not restructure those two rows. Round 2 does: the card
+    /// never grows a line for the plan, in either shape.
+    ///
+    /// WHICH piece gives way was decided on a render on 2026-09-13, the domain
+    /// first and the plan never, and reopened by the owner on 2026-09-20 asking
+    /// for the name's room back.
+    ///
+    /// The plan is now drawn whole or not at all: ``drawnPlanName`` measures
+    /// the row before it is laid out, and a plan that cannot fit beside a
+    /// handle at its floor is left off rather than cut down. The plan gave way
+    /// by truncating for one commit in between, which on a grouped card drew
+    /// `T` and taught a reader nothing about whether the plan was Team 5x or
+    /// Team Standard.
+    ///
+    /// So the order, top to bottom, is the name, then the plan, then the
+    /// handle. The name is the only piece that says WHICH account this card is;
+    /// the handle is usually the same domain twice over, and half of one still
+    /// reads as a domain.
     @ViewBuilder
     private var nameRow: some View {
         HStack(alignment: .firstTextBaseline, spacing: V4.tabGap) {
-            // NEITHER of these two takes `.fixedSize()` — that forces a view
+            // NONE of these three takes `.fixedSize()`: that forces a view
             // to its ideal width regardless of what the row can actually
             // give it, which is the opposite of "never truncated": measured
             // on `01g-widest-row`, it overflowed the row's whole HStack and
-            // corrupted the layout above it. `layoutPriority` is what the
-            // mockup's "domain gives way FIRST" needs: default priority
-            // (0) here beats the domain's lowered one below, so `HStack`
-            // asks the domain to shrink before it asks either of these to.
+            // corrupted the layout above it. `layoutPriority` is what orders
+            // the three instead: `HStack` asks the lowest priority to shrink
+            // first, so the handle gives way, then the plan, and the name
+            // last.
             Text(localPart)
                 .font(V4.font(V4.nameSize, .semibold))
                 .tracking(V4.nameTracking)
                 .foregroundStyle(Tok.ink)
                 .lineLimit(1)
+                .layoutPriority(1)
             if let domain {
                 Text(domain)
                     .font(V4.font(V4.nameSize, .medium))
@@ -244,13 +260,75 @@ struct AccountCard<Actions: View>: View {
                     .truncationMode(.tail)
                     .layoutPriority(-1)
             }
-            if let plan = planName {
+            if let plan = drawnPlanName {
+                // ABOVE the handle, not below it. Being drawn at all already
+                // means it fits beside a handle shrunk to its floor
+                // (``drawnPlanName``), so the piece that has to give from here
+                // is the handle. Left at the bottom of the order it was
+                // squeezed first instead, and a plan this row had measured room
+                // for still rendered as `T`.
                 MuteText(text: plan)
+                    .layoutPriority(0)
             }
         }
         .frame(minHeight: V4.lineHeight(V4.nameSize), alignment: .leading)
         .help(account.name)
         .accessibilityValue(account.name)
+    }
+
+    /// The plan, or `nil` when this card has no room to draw it whole.
+    ///
+    /// ``NameRowFit`` holds the rule and the reason. What is decided here is
+    /// only the width to hand it: ``nameRowWidth``. The `layoutPriority` order
+    /// above still stands and does the rest, since a plan that fits may share
+    /// a row with a handle that does not.
+    private var drawnPlanName: String? {
+        guard let plan = planName else { return nil }
+        return NameRowFit.drawsPlan(
+            localPart: localPart, domain: domain, plan: plan, available: nameRowWidth,
+            nameSize: V4.nameSize, planSize: V4.muteSize, gap: V4.tabGap) ? plan : nil
+    }
+
+    /// What the header leaves the name row, in points.
+    ///
+    /// Every term is a width the row can never take back: the panel's own side
+    /// padding, the card's inset, the group box's padding on a card inside one,
+    /// the pills this card will draw, the gaps between them, and the trailing
+    /// controls. The controls are counted whether or not this card draws any,
+    /// which over-reserves on the handful that pass an empty `actions` closure
+    /// rather than under-reserving on every card that does not.
+    private var nameRowWidth: CGFloat {
+        let outer =
+            V4.panelWidth - 2 * V4.panelPaddingSide
+            // A member card sits inside `GroupBox`'s own side padding and
+            // stroke, so it has that much less to spend than a loose one. This
+            // is the second thing the card's shape decides, and the first that
+            // is about width rather than about a word.
+            - (shape == .compact ? 2 * (V4.groupPaddingSide + V4.groupStroke) : 0)
+        let pills = pillWords.map(pillWidth)
+        let block = pills.reduce(0, +) + V4.pillGap * CGFloat(max(pills.count - 1, 0))
+        return outer - 2 * V4.cardInsetH - V4.rowGap - block - V4.pillGap
+            - NameRowFit.actionsSlotWidth
+    }
+
+    /// Exactly the pills ``body`` draws in the header's trailing slot, in the
+    /// order it draws them, so the width reserved for them and the width they
+    /// take cannot disagree.
+    private var pillWords: [String] {
+        var words: [String] = []
+        if isControl { words.append("Control") }
+        if let rotation = rotationPillText { words.append(rotation) }
+        if exitWaitingPillText == nil { words.append(statePillText) }
+        return words
+    }
+
+    /// One outlined pill: the word uppercased at the pill font, its tracking
+    /// once per character, and the padding on both sides. The border is drawn
+    /// inside and adds nothing.
+    private func pillWidth(_ word: String) -> CGFloat {
+        let text = word.uppercased()
+        return NameRowFit.textWidth(text, size: V4.pillFontSize, weight: .bold)
+            + V4.pillTracking * CGFloat(text.count) + 2 * V4.pillPaddingH
     }
 
     /// `"henry10"` — everything before the first `@`, or the whole name when
