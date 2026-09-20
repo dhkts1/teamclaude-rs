@@ -96,6 +96,12 @@ struct PeerRowModel: Identifiable, Equatable {
     /// different things (``PeerPathAbsence``) and one of them draws nothing at
     /// all, so "no line" and "no path" are not the same state.
     var hasPath: Bool = false
+    /// WHICH absence the empty path list is, so the mini mesh can say it in
+    /// the same words this row does. Carried rather than re-derived from
+    /// ``pathLines``: recovering it would mean comparing the worded line
+    /// against a second copy of the sentence, which is the drift that had the
+    /// plate claiming a measured absence over a row saying nothing was read.
+    var pathAbsence: PeerPathAbsence = .measured
     /// The first path's own figures, kept beside the worded lines for the mini
     /// mesh: the card draws a dot and a number, not a sentence, and re-parsing
     /// them out of `pathLines` would be a second place the wording matters.
@@ -260,7 +266,11 @@ struct PeersSnapshot: Equatable {
                 // number; a Mac with no path at all is a dotted edge and a
                 // plate. Deriving the second from the first draws the plate on
                 // the first Mac an unprobed endpoint belongs to.
-                hasPath: row.hasPath)
+                hasPath: row.hasPath,
+                // And WHICH absence, so the plate on the edge and the line
+                // under the tile cannot answer "did this Mac look" two
+                // different ways on one screen.
+                absence: row.pathAbsence)
         }
     }
 
@@ -488,6 +498,7 @@ enum PeersSnapshotBuilder {
             pathLines: PeerFormat.pathLines(
                 entry.paths, names: names, absence: absence, answerable: entry.id != nil),
             hasPath: !entry.paths.isEmpty,
+            pathAbsence: absence,
             pathRttMs: entry.paths.first?.rttMs,
             pathLossPct: entry.paths.first?.lossPct,
             pathViaName: entry.paths.first.flatMap { path in

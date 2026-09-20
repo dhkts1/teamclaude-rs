@@ -243,6 +243,27 @@ public enum PeerPathAbsence: Equatable, Sendable {
     /// spelled the same.
     public var isActionable: Bool { self == .measured }
 
+    /// The same absence in the room a plate on a mesh edge has.
+    ///
+    /// Two spellings for one fact, held here together rather than one here and
+    /// one in the card, which is how the two drifted in the first place: the
+    /// plate said `no path now` for BOTH absences while the row two inches
+    /// below said which one it was. A plate sits over a 44 pt tile and the
+    /// row's own `no path right now` does not fit there, so the measured case
+    /// keeps its shorter word and the unreported one keeps the row's, which is
+    /// already short.
+    ///
+    /// `nil` is the case that draws no plate at all, for the same reason its
+    /// line is absent: work is flowing over a path this row cannot name, and a
+    /// plate saying otherwise would be the card contradicting the row.
+    public var plateSentence: String? {
+        switch self {
+        case .measured: return "no path now"
+        case .notReported: return "path not reported"
+        case .silent: return nil
+        }
+    }
+
     /// What an actionable absence adds after its own sentence, so the line
     /// states the act and not only the problem.
     public static let remedy = "send it a link"
