@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """netlab-client: behave like Claude Code toward one node's own proxy.
 
-Nothing else in this lab drives a node's proxy the way a real client does —
+Nothing else in this lab drives a node's proxy the way a real client does , 
 every other scenario asks the `tcr` binary itself questions (`peer ls`,
 `invite`, `join`) rather than sending it `POST /v1/messages`. This is that
 missing half: a load generator that speaks the one HTTP shape the proxy
-serves, from stdlib `http.client` — python3 is already in the image, and
+serves, from stdlib `http.client`, python3 is already in the image, and
 `hey`/`oha` would be a new binary on every machine that runs this for a load
 generator that is a hundred lines and has to print one line per request
 either way.
@@ -18,7 +18,7 @@ Usage:
     netlab-client.py <config.json> <rate-per-second> <body-bytes> <count>
 
 <config.json> is the node's own teamclaude.json (this script reads
-proxy.port, proxy.apiKey and accounts[0].name off it — nothing is passed
+proxy.port, proxy.apiKey and accounts[0].name off it, nothing is passed
 twice). One line per request on stdout:
 
     <request_id> <account> <status> <latency-ms>

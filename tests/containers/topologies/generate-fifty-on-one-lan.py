@@ -2,9 +2,9 @@
 """Regenerate fifty-on-one-lan.json. Run this and commit its output; the
 topology itself is not hand-edited.
 
-Fifty nodes on one /24, deliberately 10.77.1.0/24 — the same subnet
+Fifty nodes on one /24, deliberately 10.77.1.0/24, the same subnet
 two-on-one-lan.json and every other single-LAN topology in this directory
-already uses — so that bringing this lab up beside one of those is the proof
+already uses, so that bringing this lab up beside one of those is the proof
 two labs cannot collide: each is a bridge inside its own container
 (`--network none`), never a network the Docker daemon itself routes.
 """

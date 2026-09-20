@@ -17,7 +17,7 @@
 #   3. node-a1 serves one request through its OWN proxy first: `lendable`
 #      (`Manager::lendable_fraction`) is measured headroom, and a lender that
 #      has never served a request has none measured, which reads as nothing
-#      to lend (`LeaseRefusal::OwnerGuard`) — not a lab quirk, a real "an
+#      to lend (`LeaseRefusal::OwnerGuard`), not a lab quirk, a real "an
 #      account with zero observed traffic has no fraction to offer" rule.
 #   4. disable node-a2's own account, restart it (the peer-lease provider
 #      installs at boot, from the peers file; `src/fallback.rs`)
@@ -30,11 +30,11 @@
 #     (src/proxy.rs, src/peer/lease.rs)
 #   - the new row the ledger (`GET /_ledger` on the stub,
 #     tests/containers/upstream-stub.py) gains from this request carries the
-#     LENDER's credential, not the borrower's — a field, never a substring of
+#     LENDER's credential, not the borrower's, a field, never a substring of
 #     a log line. Not correlated by request_id: node-a1's own outbound call is
 #     made over the peer CONTROL channel, not a plain HTTP forward, so it
 #     carries none of the lab's x-netlab-* test headers node-a2's client sent
-#     — measured, not assumed; see the comment at the ledger read below.
+#    , measured, not assumed; see the comment at the ledger read below.
 #   - the response is 200
 set -eu
 
@@ -146,7 +146,7 @@ pass "node-a2 restarted with its own account disabled"
 # --- the borrow itself -------------------------------------------------------
 # The ledger BEFORE: the request this relay makes is node-a1's own outbound
 # call, over the peer CONTROL channel rather than a plain HTTP forward, so it
-# carries none of the lab's x-netlab-* test headers node-a2's client sent —
+# carries none of the lab's x-netlab-* test headers node-a2's client sent , 
 # there is no `request_id` to correlate on the other side of a relay like
 # that, only the row COUNT and the credential the new row carries.
 before="$SCRATCH/ledger-before.json"
