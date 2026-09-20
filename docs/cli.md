@@ -897,12 +897,24 @@ Prints this node's own peer id, minting the keypair on first use.
 
 ### `tcr peer ls`
 
-Lists pinned peers, what each may do, and what is in flight.
+Lists pinned peers, what each may do, what is in flight, and every Mac heard announcing on
+the LAN in the last minute and not yet trusted, a found row.
+
+A found row never comes from this command running its own scan: it reads
+`peer-state.json`, which a running server's own browse task, on the same cadence as its
+beacon, writes to. With no server running, `tcr peer ls` still answers, and simply shows no
+found rows, the same honest reading a stale peers file with no proxy behind it already gives.
+
+Trusted rows print first, found rows after, newest first within the found group. A found
+row's line is `<address>  <name>  found <age>s ago, not trusted`, with `no name announced` in
+the name column when the beacon carried none. The summary line carries `found=<n>` (how many
+are shown) and `not-shown=<n>` (how many this Mac is holding back past the twelve-row cap, the
+`abuse-resistance.md` display limit).
 
 | flag | type | default | effect |
 |---|---|---|---|
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to read |
-| `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape |
+| `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape. `peers` carries both kinds of row: a trusted one has `node`; a found one has `name`, `address`, `trusted: false`, `lastSeenMs`, and no `node` at all, because a found row carries no key to pin |
 | `--config <path>` | path | `~/.config/teamclaude.json` | main config to read for the account labels the `lentTo` block is keyed by. Nothing else is taken from it; a config that is missing or unreadable leaves `lentTo` empty instead of failing the listing |
 
 ### `tcr peer find <on\|off>`
@@ -915,11 +927,18 @@ Turns discovery on or off: announcing this Mac's presence and looking for others
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
 | `--announce-name <on\|off>` | enum | `off` | whether the beacon includes this Mac's display name. Off either way, the beacon never carries a key, a peer id, or any other identity material |
 
-**This verb writes a flag; the running server does the announcing.** It re-reads the flag
-about every twenty seconds, so `on` starts the beacon within that and `off` stops it within a
-minute, neither one needing a restart. The beacon carries the announcing process's per-boot
-instance id, which is why the CLI cannot announce on the server's behalf: a neighbour's knock
-names the id it saw, and an id from a CLI that has already exited matches nothing.
+**This verb writes a flag; the running server does the announcing AND the browsing.** It
+re-reads the flag about every twenty seconds, so `on` starts the beacon within that and `off`
+stops it within a minute, neither one needing a restart. The beacon carries the announcing
+process's per-boot instance id, which is why the CLI cannot announce on the server's behalf: a
+neighbour's knock names the id it saw, and an id from a CLI that has already exited matches
+nothing.
+
+**Running `tcr peer find on` in a terminal also runs one scan of its own, right away, and
+prints what it saw**: an address and a name (or `no name announced`) per line, `no Macs found`
+when there was nothing. That scan is a diagnostic readout for an operator at a prompt; it
+writes nothing to disk. The list `tcr peer ls` and the Peers tab read comes from the running
+server's own browse task, never from this command.
 
 ### `tcr peer name [name]`
 
