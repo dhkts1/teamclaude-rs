@@ -93,11 +93,14 @@ enum MeasureOpen {
     /// groups the app actually runs them in.
     ///
     /// The single `tcr` reads are timed OFF the main thread, in one detached
-    /// task, because that is where the app runs every one of them and because
-    /// the main thread charges for them differently: `Process.waitUntilExit()`
-    /// spins the run loop, and the same child measured on the main thread here
-    /// came back about ten times its own cost. The main-thread control below
-    /// keeps that visible instead of hiding it in an average.
+    /// task, because that is where the app runs every one of them. The
+    /// main-thread controls below say whether the two threads are still charged
+    /// differently, which they were: a wait that ran the run loop rounded a
+    /// main-thread read up to the loop's own step, and a child that does
+    /// nothing but exit read 1.6 ms off the main thread and 64.8 ms on it. With
+    /// the wait ending on the child's exit instead, the same pair reads 1.5 ms
+    /// and 1.4 ms. Keeping both sides printed is what lets the next person see
+    /// it come back rather than take this paragraph's word for it.
     @MainActor
     private static func measureReads(round: Int, executable: URL) async {
         for measured in await Task.detached(priority: .userInitiated, operation: {
@@ -109,6 +112,21 @@ enum MeasureOpen {
             round, "run status --json on the main thread",
             seconds(of: { _ = try? TcrTool.run(executable: executable, arguments: statusRead) }),
             "control: the run loop is what the wait costs")
+        // Two more main-thread controls, because one was not enough to tell a
+        // slow CLI from a slow wait. `status --json` is the most expensive read
+        // here, so its own cost hides whatever the wait adds on top. The spawn
+        // floor costs nothing at all and `peer ls --json` costs a few
+        // milliseconds, so on these two the wait is nearly the whole number,
+        // and a change to how the wait ends shows up in them first.
+        line(
+            round, "spawn floor on the main thread",
+            seconds(of: { _ = try? TcrTool.run(executable: noOpChild, arguments: []) }),
+            "control: pair with the spawn floor above")
+        line(
+            round, "run peer ls --json on the main thread",
+            seconds(of: { _ = try? TcrTool.run(executable: executable, arguments: PeerCommand.list) }
+            ),
+            "control: pair with the peers group read above")
         line(round, "read session files", seconds(of: { _ = SessionFiles.read() }), "main thread")
         line(round, "read machine stats", seconds(of: { _ = MachineStats.read() }), "main thread")
         line(round, "read process table", seconds(of: { _ = ProcessTable.read() }), "main thread")
