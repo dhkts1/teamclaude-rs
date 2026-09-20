@@ -3708,7 +3708,10 @@ async fn a_join_key_falls_through_to_the_second_address() {
         2,
         "the host mints a key, which carries the address it listens on",
     );
-    let minted = host.peer_ok(&["invite", "--label", "guest-mac", "--ttl", "300"]);
+    // `--plain`: this test doctors the address text inside the key, which
+    // only the readable v2 spelling carries; the opaque v3 one this build
+    // mints by default is not what step 3 below is about.
+    let minted = host.peer_ok(&["invite", "--label", "guest-mac", "--ttl", "300", "--plain"]);
     let key = minted
         .lines()
         .find(|line| line.starts_with("tcr-join:"))

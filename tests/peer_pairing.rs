@@ -4312,6 +4312,49 @@ fn a_mint_on_a_pinned_listener_carries_exactly_that_address() {
     );
 }
 
+/// **A v3 key round-trips every address family**, and the rendered string
+/// hides them: no run of digits and dots, no bracketed run of hex and colons,
+/// that a glance could read as an address.
+///
+/// Watched red: change `JoinToken::to_token_v3` to fall back to plain-text
+/// addresses and this fails on the "no address is visible" assertion, or
+/// break `dialaddrs::decode` and this fails on the round trip itself.
+#[test]
+fn a_v3_key_round_trips_every_address_family() {
+    let token = pair::JoinToken::new(
+        vec![
+            "192.0.2.10:7755".parse().expect("a test address"),
+            "[2001:db8::1]:7755".parse().expect("a test address"),
+            "198.51.100.20:7755".parse().expect("a test address"),
+        ],
+        PeerId([5_u8; 32]),
+        [9_u8; 32],
+    );
+    let rendered = token.to_token_v3();
+    assert!(
+        rendered.starts_with(pair::TOKEN_PREFIX_V3),
+        "a v3 key is minted with its own prefix: {rendered}"
+    );
+    assert_eq!(
+        pair::JoinToken::parse(&rendered).expect("a v3 key parses"),
+        token,
+        "every address family must survive the round trip"
+    );
+    assert_eq!(
+        pair::JoinToken::parse(&format!("  {rendered}\n")).expect("a pasted v3 key parses"),
+        token,
+        "a paste carries whitespace"
+    );
+
+    let body = rendered
+        .strip_prefix(pair::TOKEN_PREFIX_V3)
+        .expect("the prefix was just asserted");
+    assert!(
+        !body.contains('.') && !body.contains(':'),
+        "an opaque key must show nobody an address at a glance: {rendered}"
+    );
+}
+
 /// **`tcr peer invite` says what each address in the key is**, on the surface
 /// an operator reads before they paste it into a chat window.
 ///
@@ -4343,8 +4386,17 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
     assert!(output.status.success(), "the mint failed: {out}{err}");
 
     assert!(
-        out.contains(&format!("\n{}", pair::TOKEN_PREFIX_V2)),
-        "the key itself is still printed on a line of its own: {out}"
+        out.contains(&format!("\n{}", pair::TOKEN_PREFIX_V3)),
+        "the key printed by default is opaque now: {out}"
+    );
+    assert!(
+        !out.contains(pair::TOKEN_PREFIX_V2),
+        "a v2 key is not printed unless --plain asked for it: {out}"
+    );
+    assert!(
+        out.contains("cannot read this key"),
+        "the older-build sentence is the inviting side's job, since no new build can edit a \
+         1.1.9 refusal: {out}"
     );
     assert!(
         out.contains("peer invite: chosen 127.0.0.1:9600"),
@@ -4353,5 +4405,39 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
     assert!(
         out.contains("carries no internet address"),
         "a key with nothing an outside friend can open says so, in one sentence: {out}"
+    );
+}
+
+/// **`tcr peer invite --plain` mints exactly the readable v2 key**, and none
+/// of the v3-only sentences that only make sense next to an opaque one.
+#[test]
+fn tcr_peer_invite_plain_mints_the_readable_key() {
+    let node = Node::new("invite-cli-plain");
+    let mut file = node.file();
+    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
+    node.write_file(&file);
+
+    let home = scratch("invite-cli-plain-home");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+        .args(["peer", "invite", "--label", "laptop-2", "--plain"])
+        .args(["--peers", node.peers.to_str().expect("a utf-8 path")])
+        .env("HOME", &home)
+        .output()
+        .expect("spawn tcr peer invite --plain");
+    let out = String::from_utf8_lossy(&output.stdout).to_string();
+    let err = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "the mint failed: {out}{err}");
+
+    assert!(
+        out.contains(&format!("\n{}", pair::TOKEN_PREFIX_V2)),
+        "--plain still mints the readable key: {out}"
+    );
+    assert!(
+        !out.contains(pair::TOKEN_PREFIX_V3),
+        "--plain does not also mint the opaque one: {out}"
+    );
+    assert!(
+        !out.contains("cannot read this key"),
+        "the older-build sentence is about the opaque key and does not belong here: {out}"
     );
 }

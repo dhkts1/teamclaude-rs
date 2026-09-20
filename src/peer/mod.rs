@@ -155,3 +155,7 @@ pub mod drop;
 /// saying where it is now. The seal and the refusals only, called by nothing
 /// yet.
 pub mod moved;
+
+/// One codec for a list of dial addresses, shared by the v3 join key and the
+/// sealed reply so the same list is never spelled into bytes twice.
+pub mod dialaddrs;
