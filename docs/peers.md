@@ -347,9 +347,17 @@ One link repairs both directions: once their Mac dials yours, yours learns where
 the connection itself. A link goes stale after a day, because by then you have probably moved
 again; if it does, send another one.
 
-The one case where there is nothing to send: a pair that has not completed a single session
-since this build's shared secret existed has no key only the two of them hold, so `mint`
-refuses and says so. Reach that Mac once on any address that works, and then it will seal.
+What goes into the link is the same set `tcr peer invite` puts in a key: your tailnet address if
+you have one, the external socket your router mapped if it mapped one, and the addresses your
+own interfaces hold. The port your listener is configured with is not itself an address, so a
+Mac listening on every interface publishes the interfaces rather than the wildcard: `0.0.0.0` is
+where a listener binds, never somewhere a friend can dial.
+
+Two cases leave nothing to send. A pair that has not completed a single session since this
+build's shared secret existed has no key only the two of them hold, so `mint` refuses and says
+so; reach that Mac once on any address that works, and then it will seal. And a Mac with no
+address anyone could dial, on no network and with no router mapping, gets a refusal naming
+`tcr peer reach` and `tcr peer internet on` rather than a link that would fail on the far side.
 
 ### Friends of friends: refreshed, never introduced
 

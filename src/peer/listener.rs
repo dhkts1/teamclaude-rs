@@ -77,8 +77,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
 use crate::peer::config::{
-    self as config, ControlGrants, Endpoint, EndpointSource, NetworkKey, PeerFile, PeerRow,
-    PeerStore,
+    self as config, ControlGrants, NetworkKey, PeerFile, PeerRow, PeerStore,
 };
 use crate::peer::id::NodeKey;
 use crate::peer::lease::Ledger;
@@ -2053,9 +2052,9 @@ struct HelloWrites {
     rendezvous: Result<bool>,
     /// The neighbour briefs, when the frame carried any.
     briefs: Option<Result<usize>>,
-    /// The endpoints this peer says it listens on, plus the one it was seen
-    /// from.
-    endpoints: Result<bool>,
+    /// The endpoints this peer says it listens on, plus the host it was seen
+    /// from on the port it announced.
+    endpoints: Result<crate::peer::config::Observed>,
     /// The address this peer says it sees us at, when it named one that parses.
     sees_us_at: Option<Result<bool>>,
 }
@@ -2953,13 +2952,19 @@ where
             // address is a side effect of a correctly authenticated packet
             // arriving, never a configured fact.
             Control::Hello(incoming) => {
-                let mut learned = config::endpoints_from_hello(&incoming.addrs, now_ms());
-                learned.push(Endpoint::direct(from, now_ms(), EndpointSource::Hello));
+                // `from` goes through the same combine the dialing side uses,
+                // and not onto the row whole: its HOST is the one fact this
+                // frame proves about where that peer is, and its PORT is the
+                // ephemeral one the far side's kernel picked for this
+                // connection, which answers nothing once it closes. The rule
+                // for pairing the two is
+                // [`crate::peer::config::endpoints_and_connection_from_hello`].
+                let learned =
+                    config::endpoints_and_connection_from_hello(&incoming.addrs, from, now_ms());
                 // The two reflexive halves of this frame, recorded in memory
-                // and never onto the row: `from` is the address a NAT in front
-                // of that peer rewrote its packets to, which is not an address
-                // it listens on, so it is advice for a punch and never an
-                // endpoint to dial.
+                // and never onto the row: `from` whole is the address a NAT in
+                // front of that peer rewrote its packets to, so it is advice
+                // for a punch and never an endpoint to dial.
                 crate::peer::reach::remember_observed_peer(session.peer, from);
                 let sees_us_at = match incoming.observed_you_at.as_deref() {
                     None => None,

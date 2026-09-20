@@ -777,13 +777,41 @@ impl PeerRow {
     }
 }
 
+/// What one [`observe_endpoints`] call did.
+///
+/// **Three outcomes, because a yes-or-no answered two questions at once.** The
+/// writer used to return `Ok(false)` both for a batch it refused every entry of
+/// and for a peer it holds no row for, and a caller reading that one `false`
+/// has to pick one of the two to say out loud. `tcr peer moved open --yes` read
+/// it and printed "that Mac has no row here now" over a row its own preview had
+/// just named, on a link whose every address was undialable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observed {
+    /// The row took the batch. `added` counts the endpoints handed to it, which
+    /// is the caller's batch minus whatever [`is_dialable_claim`] refused; a
+    /// locator the row already held counts as one and is re-dated rather than
+    /// written twice.
+    Written {
+        /// How many endpoints went onto the row.
+        added: usize,
+    },
+    /// Nothing in the batch was an address anything can dial, so the file was
+    /// never opened. Not an error: a peer announcing its own bind address is
+    /// reporting its configuration honestly, and the honest report is still not
+    /// something to dial.
+    NothingDialable,
+    /// This node holds no row for that peer, so there was nothing to write
+    /// onto.
+    NoRow,
+}
+
 /// Record endpoints against one pinned row, on disk, under the file lock.
 ///
-/// Returns whether the row was there. A peer that is not pinned is NOT
-/// created: this function is called from a session that has already proved a
-/// pinned static key, so an absent row means the operator forgot the peer
-/// while the session was open, and re-creating it here would undo a
-/// revocation. That is the one direction `forget` must never fail in.
+/// A peer that is not pinned is NOT created: this function is called from a
+/// session that has already proved a pinned static key, so an absent row means
+/// the operator forgot the peer while the session was open, and re-creating it
+/// here would undo a revocation. That is the one direction `forget` must never
+/// fail in, and it is [`Observed::NoRow`] rather than an error.
 ///
 /// Locked for the reason [`crate::peer::pair::forget`] gives: this is a
 /// read-modify-write of the operator's file, and an unlocked one loses
@@ -813,51 +841,59 @@ impl PeerRow {
 /// kinds of evidence, not one address. The connection's-own-source-port rule
 /// a hello batch also needs is therefore scoped to the hello call sites, not
 /// here: see [`endpoints_and_connection_from_hello`].
-pub fn observe_endpoints(path: &Path, peer: &PeerId, endpoints: &[Endpoint]) -> Result<bool> {
+pub fn observe_endpoints(path: &Path, peer: &PeerId, endpoints: &[Endpoint]) -> Result<Observed> {
     let endpoints: Vec<Endpoint> = endpoints
         .iter()
         .filter(|endpoint| endpoint.direct_addr().is_none_or(is_dialable_claim))
         .copied()
         .collect();
     if endpoints.is_empty() {
-        return Ok(false);
+        return Ok(Observed::NothingDialable);
     }
     let _lock = FileLock::acquire(path)?;
     let mut file = read_or_default(path)?;
     let Some(row) = file.peers.iter_mut().find(|row| &row.node == peer) else {
-        return Ok(false);
+        return Ok(Observed::NoRow);
     };
+    let added = endpoints.len();
     for endpoint in endpoints {
         row.observe_endpoint(endpoint);
     }
     save(path, &file)?;
-    Ok(true)
+    Ok(Observed::Written { added })
 }
 
-/// A hello's own claimed addresses, plus the connection's observed address
-/// when it is not redundant with one of them.
+/// A hello's own claimed addresses, plus the host the connection came from on
+/// the port that hello announced.
 ///
-/// **The third refusal the measured defect needs, scoped to where it is
-/// safe.** [`observe_endpoints`] cannot drop a same-host duplicate itself
-/// (its own doc comment says why: a brief batch legitimately holds several
-/// ports on one host), so this is the caller-side combine a hello exchange
-/// uses instead of pushing the connection's address unconditionally. When
-/// [`endpoints_from_hello`] already produced a dialable entry for
-/// `connection_source`'s host, that entry is the hello's own claim about its
-/// listen port and is kept; the connection's address is the ephemeral source
-/// port of the socket that carried this one hello, gone the moment it
-/// closes, and is dropped rather than sitting on the row as a second,
-/// unreachable way to the same Mac. When nothing in `addrs` named that host,
-/// `connection_source` is the only fact this node has and is kept, filtered
-/// by [`is_dialable_claim`] like every other endpoint.
+/// **Both sides of a hello exchange come through here**, the dialing side
+/// (`peer::serve`) and the answering side (`peer::listener`), and they must,
+/// because the address each of them holds means something different. The dialer
+/// holds the socket it dialed, which is the peer's listen socket. The listener
+/// holds the socket the packets arrived FROM, which is an ephemeral port the
+/// far side's kernel picked for this one connection and which answers nothing
+/// once it closes. Pushed unconditionally, that second one lands on the row as
+/// a dead address ranked beside a live one; measured between two nodes whose
+/// configured listener is `0.0.0.0:7755`, the accepting side recorded a `:36076`
+/// it could never reach.
 ///
-/// Used by the dialing side of a hello exchange (`peer::serve`). The
-/// listener side builds its own batch by pushing the connection's address
-/// after [`endpoints_from_hello`] unconditionally; that push does not go
-/// through this function, so a peers file learned entirely from inbound
-/// hellos does not yet get this refusal. Reported to the lead as a gap for
-/// whoever owns that call site to close, rather than folded into
-/// [`observe_endpoints`] and risking the brief regression above.
+/// **So the host is taken from the connection and the port is taken from the
+/// hello.** When [`endpoints_from_hello`] already produced a dialable entry for
+/// `connection_source`'s host, that entry is the hello's own claim about where
+/// it answers and nothing is added. Otherwise the hello named only addresses
+/// this node cannot dial (a Mac whose listener is bound to every interface
+/// honestly announces `0.0.0.0:<port>`), and the one fact left is the host the
+/// packets came from; it is paired with the port that hello announced, which is
+/// the dialable form of what the peer was trying to say.
+///
+/// A hello that announced no port at all, or two different ones, leaves
+/// [`announced_port`] with nothing to pair, and then nothing is added: an
+/// address made of a connection's own source port is not a second-best answer,
+/// it is a wrong one.
+///
+/// [`observe_endpoints`] cannot make this refusal itself (its own doc comment
+/// says why: a neighbour brief legitimately holds several ports on one host),
+/// which is why it is here, at the two call sites that hold a connection.
 pub fn endpoints_and_connection_from_hello(
     addrs: &[String],
     connection_source: SocketAddr,
@@ -869,14 +905,53 @@ pub fn endpoints_and_connection_from_hello(
             .direct_addr()
             .is_some_and(|addr| addr.ip() == connection_source.ip())
     });
-    if !already_named && is_dialable_claim(connection_source) {
+    if already_named {
+        return learned;
+    }
+    let Some(port) = announced_port(addrs) else {
+        return learned;
+    };
+    let dialable = SocketAddr::new(connection_source.ip(), port);
+    if is_dialable_claim(dialable) {
         learned.push(Endpoint::direct(
-            connection_source,
+            dialable,
             observed_at_ms,
             EndpointSource::Hello,
         ));
     }
     learned
+}
+
+/// The port a hello's own addresses agree on, when they agree on one.
+///
+/// Every entry in a hello's `addrs` is the same Mac describing the same
+/// listener, so the port is a property of that listener and not of whichever
+/// interface each entry names. One distinct port is therefore the ordinary
+/// case, including the one this exists for: a wildcard bind announces
+/// `0.0.0.0:<port>` and nothing else.
+///
+/// `None` when the hello named no parseable address, and `None` when two of
+/// them disagree: there is then no single answer to "which port does this Mac
+/// answer on", and guessing one would put an address on the row that no
+/// evidence supports. Port `0` is not an answer either, for the reason
+/// [`is_dialable_claim`] gives, so it is passed over rather than counted as a
+/// disagreement.
+fn announced_port(addrs: &[String]) -> Option<u16> {
+    let mut announced: Option<u16> = None;
+    for addr in addrs
+        .iter()
+        .filter_map(|addr| addr.parse::<SocketAddr>().ok())
+    {
+        if addr.port() == 0 {
+            continue;
+        }
+        match announced {
+            None => announced = Some(addr.port()),
+            Some(held) if held == addr.port() => {}
+            Some(_) => return None,
+        }
+    }
+    announced
 }
 
 /// Record the pair's rendezvous secret on a pinned row.
@@ -989,6 +1064,13 @@ fn is_dialable_claim(addr: SocketAddr) -> bool {
 /// way, for the reason that function states: a `Hello` naming its own bind
 /// address is not lying, it is reporting the configuration honestly, and the
 /// honest report is still not something to dial.
+///
+/// **A caller that also holds the connection the hello arrived on wants
+/// [`endpoints_and_connection_from_hello`] instead**, and every caller in this
+/// tree that holds one does. This function answers only what the hello said;
+/// combining that with an observed connection address has its own rule about
+/// which half of that address may be believed, and a caller doing the combine
+/// by hand gets it wrong in a way nothing fails on until a dial times out.
 pub fn endpoints_from_hello(addrs: &[String], observed_at_ms: i64) -> Vec<Endpoint> {
     addrs
         .iter()
@@ -2404,6 +2486,10 @@ mod tests {
     /// own bind address, `0.0.0.0:7766`, which [`endpoints_from_hello`]
     /// already drops, and the socket the dial actually reached,
     /// `198.51.100.7:7766`, is the one fact this node has left.
+    ///
+    /// The dial reached the peer's listen port here, so the address kept is the
+    /// connection's whole socket either way. The test below is the same case
+    /// from the other end of the exchange, where it is not.
     #[test]
     fn endpoints_and_connection_from_hello_keeps_the_connection_address_when_the_hello_named_nothing(
     ) {
@@ -2417,6 +2503,120 @@ mod tests {
             addrs,
             vec!["198.51.100.7:7766".parse::<SocketAddr>().unwrap()],
             "the only address a peer with a junk bind claim can be dialed at must survive: {addrs:?}"
+        );
+    }
+
+    /// **The answering side keeps the host it was reached FROM on the port the
+    /// hello announced, never the source port that carried it.** Two nodes
+    /// whose listener is `0.0.0.0:7755` greet each other; the one that accepts
+    /// the connection sees an ephemeral `:52790` as the source, and the hello
+    /// it holds names only the far side's bind address. Neither half is
+    /// dialable alone. `198.51.100.7:7755` is, and it is the only thing this
+    /// exchange proved.
+    ///
+    /// The test above cannot see this: its connection port is `7766`, a listen
+    /// port, so keeping the source port whole and pairing the source host with
+    /// the announced port produce the same answer.
+    ///
+    /// Watch it fail by pushing `connection_source` whole instead of pairing
+    /// its host with [`announced_port`]: the row learns `198.51.100.7:52790`,
+    /// a socket that stopped existing when the greeting closed.
+    #[test]
+    fn endpoints_and_connection_from_hello_pairs_the_reached_host_with_the_announced_port() {
+        let learned = endpoints_and_connection_from_hello(
+            &["0.0.0.0:7755".to_string()],
+            "198.51.100.7:52790".parse().unwrap(),
+            3_000,
+        );
+        let addrs: Vec<SocketAddr> = learned.iter().filter_map(Endpoint::direct_addr).collect();
+        assert_eq!(
+            addrs,
+            vec!["198.51.100.7:7755".parse::<SocketAddr>().unwrap()],
+            "the host came from the connection and the port from the hello: {addrs:?}"
+        );
+    }
+
+    /// **A hello that announced no port leaves nothing to pair the connection's
+    /// host with, and then nothing is recorded.** An address built out of a
+    /// connection's own source port is not a worse answer than the right one,
+    /// it is a wrong one: it answers for as long as that greeting is open and
+    /// never again.
+    ///
+    /// The second case is two announcements disagreeing, which leaves no single
+    /// answer to "which port does this Mac answer on" either.
+    #[test]
+    fn endpoints_and_connection_from_hello_records_nothing_when_no_one_port_was_announced() {
+        let none =
+            endpoints_and_connection_from_hello(&[], "198.51.100.7:52790".parse().unwrap(), 3_000);
+        assert!(
+            none.is_empty(),
+            "a hello naming no address at all proves no port: {none:?}"
+        );
+
+        let disagreeing = endpoints_and_connection_from_hello(
+            &["0.0.0.0:7755".to_string(), "0.0.0.0:7766".to_string()],
+            "198.51.100.7:52790".parse().unwrap(),
+            3_000,
+        );
+        assert!(
+            disagreeing.is_empty(),
+            "two announced ports are no announced port: {disagreeing:?}"
+        );
+    }
+
+    /// **`observe_endpoints` says which of the two nothings happened.** A batch
+    /// it refused every entry of and a peer it holds no row for are different
+    /// facts, and the caller that has to put one of them in front of a person
+    /// cannot tell them apart from a single `false`.
+    ///
+    /// Watch it fail by folding either arm back into the other, for instance
+    /// returning [`Observed::NoRow`] for an empty batch: the first assertion
+    /// reads `NoRow` for a row that is plainly there.
+    #[test]
+    fn observe_endpoints_tells_a_refused_batch_from_an_absent_row() {
+        let peer = PeerId(*b"peer-observed-outcome-test-aaaaa");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tcr-peers.json");
+        let mut file = PeerFile::default();
+        file.peers.push(PeerRow {
+            node: peer,
+            label: "outcome".to_string(),
+            endpoints: Vec::new(),
+            added_at: 0,
+            allow: Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        });
+        save(&path, &file).unwrap();
+
+        let junk = vec![Endpoint::direct(
+            "0.0.0.0:7755".parse().unwrap(),
+            1_000,
+            EndpointSource::Moved,
+        )];
+        assert_eq!(
+            observe_endpoints(&path, &peer, &junk).unwrap(),
+            Observed::NothingDialable,
+            "the row is there and the batch is the thing that was refused"
+        );
+
+        let good = vec![Endpoint::direct(
+            "198.51.100.7:7755".parse().unwrap(),
+            1_000,
+            EndpointSource::Moved,
+        )];
+        assert_eq!(
+            observe_endpoints(&path, &peer, &good).unwrap(),
+            Observed::Written { added: 1 },
+            "one dialable address went onto the row"
+        );
+
+        let stranger = PeerId(*b"peer-observed-outcome-test-bbbbb");
+        assert_eq!(
+            observe_endpoints(&path, &stranger, &good).unwrap(),
+            Observed::NoRow,
+            "the same good batch, for a peer this file holds no row for"
         );
     }
 

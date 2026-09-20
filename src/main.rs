@@ -3350,8 +3350,9 @@ const GRAPH_PAGE_HTML: &str = include_str!("peer_graph_page.html");
 /// [`teamclaude_rs::peer::config::observe_endpoints`], through nothing else.
 /// That pair is what makes the bound true by construction rather than by
 /// review: the second is the peers file's one endpoint writer and answers
-/// `Ok(false)` for a peer it does not already hold, so a link can never pin a
-/// Mac, un-forget one, or bring back a row an operator revoked; the first caps
+/// [`teamclaude_rs::peer::config::Observed::NoRow`] for a peer it does not
+/// already hold, so a link can never pin a Mac, un-forget one, or bring back a
+/// row an operator revoked; the first caps
 /// how much of a row a link may ever own and leaves every stronger endpoint
 /// alone, neither re-dated nor rewritten as a link's.
 ///
@@ -3380,16 +3381,31 @@ fn run_peer_moved(args: peer_cli::PeerMovedArgs) -> anyhow::Result<()> {
 
 /// `tcr peer moved mint <peer>`: one link for one pinned Mac.
 ///
-/// # Where the addresses come from, and the one that is left out
+/// # Where the addresses come from, and the ones that are left out
 ///
-/// Two at most: the configured listen socket, which is what a peer on this LAN
-/// acts on, and the router mapping a serving process holds, which is what a
-/// peer off it acts on. The mapping is read off the runtime-state file the way
-/// [`run_peer_reach`] reads it, and for the reason that function states: the
-/// register [`teamclaude_rs::peer::reach::external_socket`] answers from is
-/// filled by a keeper thread, a CLI process has run none, so asking it here
-/// would silently ship the LAN socket alone on a Mac whose mapping is live. A
-/// record past its deadline reads as no mapping.
+/// The same ranked set an invite key carries,
+/// [`teamclaude_rs::peer::pair::dial_addresses`], plus the router mapping a
+/// serving process holds. The rank is the order a dial should try, and each
+/// band is there because a different friend is on the other end: the tailnet
+/// address, the mapped external socket, then the addresses a real interface
+/// holds.
+///
+/// The mapping is read off the runtime-state file the way [`run_peer_reach`]
+/// reads it, and for the reason that function states: the register
+/// [`teamclaude_rs::peer::reach::external_socket`] answers from is filled by a
+/// keeper thread, a CLI process has run none, so asking it here would silently
+/// ship the LAN socket alone on a Mac whose mapping is live. A record past its
+/// deadline reads as no mapping. It is offered to the ranking AND added
+/// afterwards, because `dial_addresses` short circuits on a listen socket
+/// somebody pinned by hand and a friend off this LAN would then get a link with
+/// nothing in it they can open.
+///
+/// **The configured listen socket is not itself an address.** `0.0.0.0:7755`
+/// is the product default and it is what a wildcard bind honestly reports; it
+/// is also the one thing no friend can dial, and a link carrying it teaches a
+/// Mac an address that fails every time. Running the listen socket through the
+/// same ranking the invite key uses is what turns it into the addresses this
+/// Mac actually answers on.
 ///
 /// `PeerRow::sees_us_at`, the address that peer last said it sees this Mac at,
 /// is left out **on purpose**. It is written per completed session, and in the
@@ -3431,41 +3447,63 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
         .and_then(|state| state.mapping)
         .filter(|record| record.expires_at_ms > now_ms);
 
-    let mut addresses: Vec<std::net::SocketAddr> = Vec::new();
-    if let Some(listen) = file.listen {
-        addresses.push(listen);
-    }
-    if let Some(record) = &held {
+    let external = held.as_ref().and_then(|record| {
         match record.external_address.as_deref() {
             Some(text) => match text.parse::<std::net::SocketAddr>() {
-                Ok(addr) => addresses.push(addr),
+                Ok(addr) => Some(addr),
                 // Said out loud rather than skipped: a held mapping this verb
                 // could not read is the difference between a link a friend off
                 // the LAN can act on and one they cannot.
-                Err(why) => println!(
-                    "peer moved: the held mapping's external address did not parse ({why}), \
-                     so this link carries the listen socket alone"
-                ),
+                Err(why) => {
+                    println!(
+                        "peer moved: the held mapping's external address did not parse ({why}), \
+                         so this link carries what this Mac answers on here alone"
+                    );
+                    None
+                }
             },
-            None => println!(
-                "peer moved: the router mapped a port and would not name its own external \
-                 address, so this link carries the listen socket alone"
-            ),
+            None => {
+                println!(
+                    "peer moved: the router mapped a port and would not name its own external \
+                     address, so this link carries what this Mac answers on here alone"
+                );
+                None
+            }
         }
-    }
+    });
+
+    // The interfaces this Mac holds, in the shape the ranking takes them. The
+    // live half of `dial_addresses` reads the external socket off a register a
+    // keeper thread fills and this process has run none, so the walk is done
+    // here and the mapping above is handed in explicitly.
+    let host: Vec<peer::pair::HostAddress> = teamclaude_rs::status::network_fact::interfaces()
+        .into_iter()
+        .map(|(interface, addr)| peer::pair::HostAddress { interface, addr })
+        .collect();
+    let ranked = file
+        .listen
+        .map(|listen| peer::pair::dial_addresses(listen, &host, external))
+        .unwrap_or_default();
+
     let mut carried: Vec<std::net::SocketAddr> = Vec::new();
-    for addr in addresses {
+    let mut carry = |addr: std::net::SocketAddr| {
         if !carried.contains(&addr) {
             carried.push(addr);
         }
+    };
+    for entry in ranked {
+        carry(entry.addr);
+    }
+    if let Some(external) = external {
+        carry(external);
     }
     carried.truncate(peer::drop::MAX_RECORD_ENDPOINTS);
     if carried.is_empty() {
         anyhow::bail!(
-            "peer moved: this Mac has no address to put in a link: no peer listener is \
-             configured and no serving process holds a router mapping. `tcr peer reach` \
-             says what this Mac can be reached on, and `tcr peer internet on` is what asks \
-             the router for the second one"
+            "peer moved: this Mac has no address to put in a link: nothing it listens on is \
+             something a friend could dial, and no serving process holds a router mapping. \
+             `tcr peer reach` says what this Mac can be reached on, and `tcr peer internet \
+             on` is what asks the router for the second one"
         );
     }
 
@@ -3645,18 +3683,24 @@ fn run_peer_moved_open(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
     }
 
     let node = row.node;
-    let wrote = peer::config::observe_endpoints(peers_path, &node, &fresh)?;
-    if !wrote {
-        println!(
+    // Three outcomes and three sentences. The writer used to answer one
+    // `false` for two different facts, and this arm picked the second of them
+    // to print, so a link whose addresses were all undialable told a person
+    // their own Mac had forgotten a row the preview had just named.
+    match peer::config::observe_endpoints(peers_path, &node, &fresh)? {
+        peer::config::Observed::Written { added } => {
+            println!("peer moved: added {added} address(es) to {label}; nothing else changed")
+        }
+        peer::config::Observed::NothingDialable => println!(
+            "peer moved: nothing was written; every address in this link is one nothing can \
+             dial, an unspecified host or port zero, so {label} is still reachable at \
+             whatever its row already held and the Mac that sent this needs to mint a new one"
+        ),
+        peer::config::Observed::NoRow => println!(
             "peer moved: that Mac has no row here now, so nothing was written; a link never \
              creates one"
-        );
-        return Ok(());
+        ),
     }
-    println!(
-        "peer moved: added {} address(es) to {label}; nothing else changed",
-        fresh.len()
-    );
     Ok(())
 }
 
