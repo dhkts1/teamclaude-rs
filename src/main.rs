@@ -2821,14 +2821,14 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             }
 
             if pending.is_empty() {
-                println!("no Macs are asking to pair");
+                println!("no Macs are asking to connect");
             }
             for knock in &pending {
-                // `<name or address> wants to pair`, which is the row
+                // `<name or address> wants to connect`, which is the row
                 // `abuse-resistance.md` specifies, plus the instance id so the
                 // operator can name it to `accept` unambiguously.
                 println!(
-                    "{}: pending: {} ({}) wants to pair  instance={} wire={}",
+                    "{}: pending: {} ({}) wants to connect  instance={} wire={}",
                     knock.addr,
                     knock.proposed_name.as_deref().unwrap_or(&knock.addr),
                     knock.addr,
