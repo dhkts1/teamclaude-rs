@@ -3700,6 +3700,10 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     // Every NAT-PMP outcome is a string, including the failures, because the
     // reader of this verb wants to see WHICH refusal the router gave.
     let client = reach::NatPmp::on_default_gateway();
+    // `no_mapping` is the one sentence that names what is left when the router
+    // refuses both protocols; `None` whenever the router answered or was not
+    // asked, so it never prints under a mapping that worked.
+    let mut no_mapping: Option<String> = None;
     let (gateway, external, mapping) = match &client {
         Ok(client) => {
             let external = match client.external_address() {
@@ -3736,10 +3740,14 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
                                 granted.external_port, granted.internal_port, granted.lifetime_secs
                             )
                         }
-                        Err(reach::ReachError::Silent { .. }) => {
+                        Err(err @ reach::ReachError::Silent { .. }) => {
+                            no_mapping = reach::reach_no_mapping_line(&err, Some(port));
                             "router did not answer".to_string()
                         }
-                        Err(err) => format!("refused: {err}"),
+                        Err(err) => {
+                            no_mapping = reach::reach_no_mapping_line(&err, Some(port));
+                            format!("refused: {err}")
+                        }
                     }
                 }
             };
@@ -3799,6 +3807,9 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     println!("reach: gateway: {gateway}");
     println!("reach: external-address: {external}");
     println!("reach: mapping: {mapping}");
+    if let Some(line) = &no_mapping {
+        println!("{line}");
+    }
     match internal_port {
         Some(port) => println!("reach: listen-port: {port}"),
         None => println!("reach: listen-port: none (the peer listener is off)"),

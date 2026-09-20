@@ -2646,6 +2646,471 @@ async fn the_internet_switch_starts_a_keeper_again_on_a_running_server() {
     );
 }
 
+/// One captured tracing event: its level and its message.
+///
+/// The level is the point of this copy. The capture layer in
+/// `tests/peer_refusal_log.rs` keeps the fields and the message, and what is
+/// asserted here is that the second identical answer is written quietly.
+#[derive(Debug, Clone)]
+struct CapturedEvent {
+    level: tracing::Level,
+    message: String,
+}
+
+#[derive(Clone, Default)]
+struct CaptureLayer {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+struct MessageVisitor(Option<String>);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = Some(value.to_string());
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = MessageVisitor(None);
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                level: *event.metadata().level(),
+                message: visitor.0.unwrap_or_else(|| "<no message>".to_string()),
+            });
+    }
+}
+
+impl CaptureLayer {
+    fn matching(&self, needle: &str) -> Vec<CapturedEvent> {
+        self.events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|event| event.message.contains(needle))
+            .cloned()
+            .collect()
+    }
+}
+
+/// **A router that would not map is not asked again at every single wake.**
+///
+/// A keeper whose router refuses ends within a couple of seconds of starting,
+/// so "a mapping is wanted and none is running" was true at every wake of this
+/// loop and the router was asked every five seconds for the life of the
+/// process. The owner's log carried 169 of the resulting warning pairs in one
+/// day, from one router that has no NAT-PMP service on it.
+///
+/// Driven with a keeper handle that is dead the moment it is handed back,
+/// which is what a refused keeper looks like from here, and with a wake far
+/// shorter than the first rung of the ladder so the deferral is the only
+/// reason a second request would not go out.
+///
+/// Watch it fail: delete the `if !retry.due()` arm from `keep_internet_mapping`
+/// and this reads six starts and no deferrals.
+#[test]
+fn a_router_that_refuses_is_asked_once_and_then_left_alone() {
+    use std::sync::atomic::AtomicUsize;
+    use teamclaude_rs::peer::config::{save, PeerFile};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let dir = tempfile::tempdir().expect("a temp profile directory");
+    let peers_path = dir.path().join("tcr-peers.json");
+    save(
+        &peers_path,
+        &PeerFile {
+            internet: true,
+            ..PeerFile::default()
+        },
+    )
+    .expect("the peers file writes");
+    let local: SocketAddr = "192.0.2.7:7755".parse().expect("a literal address");
+
+    let starts = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&starts);
+    let capture = CaptureLayer::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a current-thread runtime");
+
+    let watched = tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(capture.clone()),
+        || {
+            runtime.block_on(reach::keep_internet_mapping(
+                peers_path.clone(),
+                local,
+                Duration::from_millis(10),
+                Some(6),
+                move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    // Dead on arrival: a keeper whose router refused the first
+                    // request ends on its own, and this loop sees only that.
+                    Some(FakeKeeper {
+                        alive: Arc::new(AtomicBool::new(false)),
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    })
+                },
+                None,
+            ))
+        },
+    );
+
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "one request to a router that has already said no, not one per wake: {watched:?}"
+    );
+    assert_eq!(
+        (watched.started, watched.deferred),
+        (1, 5),
+        "and every wake after it is counted as what it is, a router left alone until the ladder \
+         says otherwise: {watched:?}"
+    );
+
+    let deferrals = capture.matching("this router would not map, so the next request waits");
+    assert_eq!(
+        deferrals.len(),
+        5,
+        "each deferral says so once, so an operator reading at DEBUG can see the wait: \
+         {deferrals:?}"
+    );
+    assert!(
+        deferrals
+            .iter()
+            .all(|event| event.level == tracing::Level::DEBUG),
+        "and says it quietly: the loud line is the change of answer, which is written once by \
+         the keeper thread: {deferrals:?}"
+    );
+    assert!(
+        capture
+            .matching("asking its router for a mapping")
+            .iter()
+            .all(|event| event.level == tracing::Level::INFO),
+        "positive control: the capture really is seeing this loop's own lines"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A router with no NAT-PMP service on it
+// ---------------------------------------------------------------------------
+
+/// An address on loopback with nothing bound on it, so a datagram sent there is
+/// refused with an ICMP port unreachable.
+///
+/// A port is bound and released rather than picked out of the air, because a
+/// number nobody has ever bound is a number some other test in this binary may
+/// bind while this one runs, and then the "refusal" would be a fake gateway's
+/// silence.
+fn refusing_gateway() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a port to learn a free one");
+    let addr = socket.local_addr().expect("its own address");
+    drop(socket);
+    addr
+}
+
+/// **A refused probe is the ROUTER's answer, not a fault of this Mac's
+/// socket.**
+///
+/// Measured on a real router: `tcr peer reach` printed `external-address:
+/// unavailable: peer reach: the local UDP socket failed: Connection refused
+/// (os error 61)`. The gateway answers the port 5351 probe with an ICMP port
+/// unreachable, which says only that nothing there speaks NAT-PMP, and the one
+/// thing the operator was told was that their own socket had failed. Worse,
+/// `MappingKeeper::map` asks UPnP about answers that mean "this router may not
+/// speak NAT-PMP", and a socket fault is not one of them, so a router with UPnP
+/// on it was never asked over UPnP at all.
+///
+/// Watch it fail: return `ReachError::Socket(err)` from `NatPmp::probe_error`
+/// for every error kind, and this reads
+/// `the local UDP socket failed: Connection refused`, with
+/// `no_natpmp_service()` false.
+#[test]
+fn a_refused_natpmp_probe_names_the_router_and_not_the_local_socket() {
+    let gateway = refusing_gateway();
+
+    let failure = NatPmp::at(gateway)
+        .external_address()
+        .expect_err("nothing is bound on that port, so the probe has to be refused");
+
+    assert!(
+        matches!(failure, ReachError::NoNatPmp { .. }),
+        "a refused probe is an answer about the router, and every caller that routes on the \
+         error reads the variant: {failure:?}"
+    );
+    assert!(
+        failure.no_natpmp_service(),
+        "and it means the same thing as silence to the UPnP fallback, or the one router that \
+         needs the fallback is the one that never gets it: {failure:?}"
+    );
+    let said = failure.to_string();
+    assert!(
+        said.contains("refused") && said.contains(&gateway.to_string()),
+        "the words an operator reads have to say who refused and that it was a refusal: {said}"
+    );
+    assert!(
+        !said.contains("the local UDP socket failed"),
+        "and must not blame this Mac's socket for what the router did: {said}"
+    );
+}
+
+/// **A gateway that ANSWERS and says no is still not asked over UPnP.**
+///
+/// The positive control for the widening above: `no_natpmp_service` has to
+/// separate "there is no service there" from "the service there refused", or
+/// the fallback routes around a decision the router made on purpose.
+#[test]
+fn a_result_code_refusal_is_not_a_missing_natpmp_service() {
+    let refused = ReachError::Refused(ResultCode::NotAuthorized);
+    assert!(
+        !refused.no_natpmp_service(),
+        "a gateway that read the request and said no has decided, and a second protocol is not \
+         this node's answer to that"
+    );
+    let malformed = ReachError::Malformed("not a NAT-PMP response".to_string());
+    assert!(
+        !malformed.no_natpmp_service(),
+        "and an unreadable answer is still an answer from something that is listening"
+    );
+}
+
+/// **The retry ladder is 5 s, 30 s, 2 min, 10 min, and then 10 min forever.**
+///
+/// Asserted as the sequence of intervals rather than by sleeping through them:
+/// the ladder is a pure function of how many refusals are behind it, which is
+/// the reason [`reach::MappingRetry`] takes its elapsed time as an argument.
+///
+/// Watch it fail: make `MappingRetry::interval` return
+/// `MAPPING_RETRY_LADDER[0]` always, and the sequence reads 5 s four times.
+#[test]
+fn the_retry_ladder_grows_and_then_holds_at_its_cap() {
+    use reach::{MappingAnswer, MappingRetry};
+
+    let mut retry = MappingRetry::new();
+    assert_eq!(
+        retry.interval(),
+        Duration::ZERO,
+        "nothing has been refused yet, so the first request goes out at once"
+    );
+
+    let mut rungs = Vec::new();
+    for _ in 0..6 {
+        retry.answered(MappingAnswer::Refused);
+        rungs.push(retry.interval());
+    }
+    assert_eq!(
+        rungs,
+        vec![
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_secs(120),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        ],
+        "a router that keeps saying no is asked less and less often, and then at the cap, so a \
+         router replaced tomorrow is still noticed within ten minutes"
+    );
+
+    // The wait itself: due only once the rung has elapsed.
+    let mut retry = MappingRetry::new();
+    retry.answered(MappingAnswer::Refused);
+    retry.asked();
+    retry.tick(Duration::from_secs(4));
+    assert!(
+        !retry.due(),
+        "four seconds into a five-second rung, the router is left alone"
+    );
+    retry.tick(Duration::from_secs(1));
+    assert!(retry.due(), "and at five seconds it may be asked again");
+
+    // A mapping puts the ladder back where it started.
+    retry.answered(MappingAnswer::Mapped);
+    assert_eq!(
+        retry.interval(),
+        Duration::ZERO,
+        "a router that mapped is not a router on a ladder: the next refusal, weeks from now, \
+         waits five seconds and not ten minutes"
+    );
+}
+
+/// **A Mac carried to another router asks it straight away.**
+///
+/// The ladder is about ONE router's answer. Waiting out ten minutes built up
+/// behind a router in another building is a Mac that is unreachable for ten
+/// minutes for no reason.
+///
+/// Watch it fail: drop the `self.reset()` from `gateway_is_now`, and the
+/// interval after the move is still the cap.
+#[test]
+fn a_different_default_gateway_puts_the_ladder_back_on_its_first_rung() {
+    use reach::{MappingAnswer, MappingRetry};
+
+    let old: Ipv4Addr = "192.0.2.1".parse().expect("a literal address");
+    let new: Ipv4Addr = "198.51.100.1".parse().expect("a literal address");
+
+    let mut retry = MappingRetry::new();
+    assert!(
+        !retry.gateway_read_due(),
+        "a node that is being answered has no ladder to reset, so its route table is not read \
+         at all"
+    );
+    for _ in 0..4 {
+        retry.answered(MappingAnswer::Refused);
+    }
+    assert_eq!(retry.interval(), Duration::from_secs(600));
+
+    assert!(
+        !retry.gateway_is_now(Some(old)),
+        "the first reading is not a move: there was nothing to have moved from"
+    );
+    assert!(
+        !retry.gateway_is_now(Some(old)),
+        "and the same router twice is the same router"
+    );
+    assert_eq!(
+        retry.interval(),
+        Duration::from_secs(600),
+        "so the ladder this Mac built behind that router still stands"
+    );
+
+    assert!(
+        retry.gateway_is_now(Some(new)),
+        "another gateway address is another router"
+    );
+    assert_eq!(
+        retry.interval(),
+        Duration::ZERO,
+        "and the new one is asked on the next wake, not in ten minutes"
+    );
+
+    // The route table is read on a clock of its own, since reading it runs a
+    // route-table tool.
+    let mut retry = MappingRetry::new();
+    retry.answered(MappingAnswer::Refused);
+    retry.tick(reach::GATEWAY_RECHECK_INTERVAL - Duration::from_secs(1));
+    assert!(!retry.gateway_read_due());
+    retry.tick(Duration::from_secs(1));
+    assert!(
+        retry.gateway_read_due(),
+        "and after the recheck interval it is read once, which resets that clock"
+    );
+    retry.gateway_is_now(None);
+    assert!(!retry.gateway_read_due());
+}
+
+/// **The one sentence `tcr peer reach` prints when nothing will map a port.**
+///
+/// The operator's evening ended with a `reach` readout that said what had
+/// failed and nothing about what was left to do. Two things are: forward the
+/// port by hand, or put both Macs on one private network.
+///
+/// Watch it fail: return `None` unconditionally from `reach_no_mapping_line`.
+#[test]
+fn reach_names_the_two_ways_left_when_no_protocol_will_map() {
+    let refused = ReachError::NoNatPmp {
+        gateway: "192.0.2.1:5351".parse().expect("a literal address"),
+        source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+    };
+
+    let line = reach::reach_no_mapping_line(&refused, Some(7_755))
+        .expect("a router with no mapping service on it is exactly what this line is for");
+    assert!(
+        line.starts_with("reach: no-mapping: "),
+        "in the shape the rest of the verb prints, so it greps with them: {line}"
+    );
+    assert!(
+        line.contains("tcp port 7755"),
+        "naming the port to forward, since the operator has to type it into a router page: \
+         {line}"
+    );
+    assert!(
+        line.contains("by hand") && line.contains("private network"),
+        "and both ways left, or this is a line that says only that something failed: {line}"
+    );
+
+    let silent = ReachError::Silent {
+        gateway: "192.0.2.1:5351".parse().expect("a literal address"),
+        tries: TRIES,
+    };
+    assert!(
+        reach::reach_no_mapping_line(&silent, None)
+            .is_some_and(|line| line.contains("the peer listener's port")),
+        "a Mac with no listener configured still gets the advice, without inventing a port for \
+         it"
+    );
+
+    assert!(
+        reach::reach_no_mapping_line(&ReachError::Refused(ResultCode::NotAuthorized), Some(7_755))
+            .is_none(),
+        "but a device that ANSWERED and was refused by name is a different problem, and the \
+         thing to do about it is read the name"
+    );
+}
+
+/// **A keeper's answer is one line when it changes and a quiet one when it
+/// repeats.**
+///
+/// The live log had 169 `would not map` warnings in a day, one every five
+/// seconds, all of them the same sentence about the same router.
+///
+/// Driven at the decision rather than at the two log sites, which are three
+/// hundred lines apart and one of them needs a real router to reach.
+///
+/// Watch it fail: have `mapping_answer_voice` answer `News` unconditionally.
+#[test]
+fn the_same_answer_from_one_router_is_said_once() {
+    use reach::{AnswerVoice, MappingAnswer};
+
+    // Its own address, because the record is per gateway and per process and
+    // the other tests in this binary share the process.
+    let gateway: SocketAddr = "192.0.2.61:5351".parse().expect("a literal address");
+
+    assert_eq!(
+        reach::mapping_answer_voice(gateway, MappingAnswer::Refused),
+        AnswerVoice::News,
+        "the first refusal from a router is a thing the operator has not been told"
+    );
+    assert_eq!(
+        reach::mapping_answer_voice(gateway, MappingAnswer::Refused),
+        AnswerVoice::Repeat,
+        "the second is the same sentence about the same router"
+    );
+    assert_eq!(
+        reach::mapping_answer_voice(gateway, MappingAnswer::Mapped),
+        AnswerVoice::News,
+        "a router that was refusing and now maps is news: what they were told last is no \
+         longer true"
+    );
+    assert_eq!(
+        reach::mapping_answer_voice(gateway, MappingAnswer::Mapped),
+        AnswerVoice::Repeat,
+        "and an ordinary mapping is the ordinary record of a keeper starting"
+    );
+
+    let other: SocketAddr = "192.0.2.62:5351".parse().expect("a literal address");
+    assert_eq!(
+        reach::mapping_answer_voice(other, MappingAnswer::Refused),
+        AnswerVoice::News,
+        "another router's first answer is its own first line"
+    );
+}
+
 /// **The reverse-carry decision is the two facts and whether carriers are
 /// parked**, with no router and no friend.
 #[test]

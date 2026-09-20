@@ -185,12 +185,54 @@ pub enum ReachError {
         /// How many times.
         tries: u32,
     },
+    /// The gateway refused the packet rather than answering it: an ICMP port
+    /// unreachable, which arrives here as `ConnectionRefused`, or the reset
+    /// some gateways send instead.
+    ///
+    /// **Not a fault of the local socket**, which is what this used to be
+    /// reported as, and what it cost: a router with no NAT-PMP service on port
+    /// [`GATEWAY_PORT`] refuses the probe, the refusal came back as
+    /// [`Self::Socket`], and [`MappingKeeper::map`] asks UPnP only about an
+    /// answer that means "this router may not speak NAT-PMP at all". So a
+    /// router that speaks UPnP and not NAT-PMP was never asked over UPnP, and
+    /// `tcr peer reach` told its operator the local UDP socket had failed.
+    #[error(
+        "peer reach: the gateway {gateway} refused the NAT-PMP probe, so nothing there speaks \
+         it ({source})"
+    )]
+    NoNatPmp {
+        /// Who refused.
+        gateway: SocketAddr,
+        /// What the socket reported.
+        #[source]
+        source: std::io::Error,
+    },
     /// The gateway answered and said no.
     #[error("peer reach: the gateway refused: {0}")]
     Refused(ResultCode),
     /// The gateway answered with something that is not a NAT-PMP response.
     #[error("peer reach: the gateway's answer was not readable: {0}")]
     Malformed(String),
+}
+
+impl ReachError {
+    /// Does this answer mean "there is no NAT-PMP service on that router"?
+    ///
+    /// Two shapes, one meaning. A router with the service off usually drops the
+    /// probe ([`Self::Silent`]); one with nothing bound on [`GATEWAY_PORT`]
+    /// refuses it ([`Self::NoNatPmp`]). Both are answers about the ROUTER and
+    /// neither is a decision the router made about this node, which is what
+    /// separates them from [`Self::Refused`]: a gateway that read the request
+    /// and said no has decided, and asking a second protocol would be routing
+    /// around it.
+    ///
+    /// One predicate rather than a `matches!` at each site, because the two
+    /// sites are the UPnP fallback and the retry ladder, and a router the
+    /// fallback treats as mapless while the ladder treats it as broken is a
+    /// router asked over UPnP every five seconds forever.
+    pub fn no_natpmp_service(&self) -> bool {
+        matches!(self, Self::Silent { .. } | Self::NoNatPmp { .. })
+    }
 }
 
 /// The gateway's own view of the internet, as opcode 0 reports it.
@@ -391,7 +433,11 @@ impl NatPmp {
             socket
                 .set_read_timeout(Some(timeout))
                 .map_err(ReachError::Socket)?;
-            socket.send(request).map_err(ReachError::Socket)?;
+            // Both halves are classified, because a refusal can land on
+            // either: the ICMP port unreachable for one send is delivered to
+            // the next operation on the connected socket, which is this recv
+            // on the same pass and this send on the following one.
+            socket.send(request).map_err(|err| self.probe_error(err))?;
 
             let mut buffer = [0_u8; MAX_RESPONSE];
             match socket.recv(&mut buffer) {
@@ -408,13 +454,30 @@ impl NatPmp {
                     // RFC 6886 § 3.1: double and try again.
                     timeout *= 2;
                 }
-                Err(err) => return Err(ReachError::Socket(err)),
+                Err(err) => return Err(self.probe_error(err)),
             }
         }
         Err(ReachError::Silent {
             gateway: self.gateway,
             tries: TRIES,
         })
+    }
+
+    /// Name a socket error from the [`GATEWAY_PORT`] exchange for what it says
+    /// about the ROUTER, where it says anything.
+    ///
+    /// A refused datagram and a reset are the gateway's answer, not this Mac's
+    /// failure; everything else is the local socket and keeps its old name.
+    fn probe_error(&self, err: std::io::Error) -> ReachError {
+        match err.kind() {
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset => {
+                ReachError::NoNatPmp {
+                    gateway: self.gateway,
+                    source: err,
+                }
+            }
+            _ => ReachError::Socket(err),
+        }
     }
 }
 
@@ -702,6 +765,204 @@ pub const MAPPING_RENEW_INTERVAL: Duration = Duration::from_secs(1_800);
 /// a shutdown must delete the mapping now, not up to half an hour from now.
 pub const MAPPING_STOP_POLL: Duration = Duration::from_millis(250);
 
+/// How long to wait before asking a router that would not map again, by how
+/// many refusals in a row it has given.
+///
+/// The first wait is [`INTERNET_POLL_INTERVAL`], which is what every wait used
+/// to be: a router with no mapping service on it was asked again every five
+/// seconds, for as long as the process ran, and a day of that is thousands of
+/// round trips and two log lines each. The last rung is the cap, so a router
+/// that will never map is still re-asked often enough to notice the day it is
+/// replaced or its settings change.
+///
+/// A ladder of fixed rungs rather than a doubling, so the wait an operator
+/// sees is one of four numbers they can read here rather than an arithmetic
+/// result, and so a test can assert the sequence.
+pub const MAPPING_RETRY_LADDER: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+];
+
+/// How much of a wait passes before the default gateway is re-read, while a
+/// refusal is being waited out.
+///
+/// Read on a clock of its own rather than at every wake, because reading it
+/// runs a route-table tool: at the top of the ladder that is one subprocess a
+/// half-minute instead of one every five seconds, and the whole point of the
+/// ladder is to stop paying per wake for a router that has already answered.
+pub const GATEWAY_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What the router last answered a mapping request with.
+///
+/// Two values rather than a `bool`, because both of them are logged and the
+/// name is what the reader of the log sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingAnswer {
+    /// A port was mapped.
+    Mapped,
+    /// No protocol would map one.
+    Refused,
+}
+
+/// When a node whose router would not map may ask it again.
+///
+/// Pure, and driven by elapsed time handed in rather than by a clock it reads,
+/// so the suite asserts the SEQUENCE of intervals rather than sleeping through
+/// them.
+///
+/// # What it is for
+///
+/// `keep_internet_mapping` wakes every [`INTERNET_POLL_INTERVAL`] and starts a
+/// keeper whenever none is running. A keeper whose router refuses dies within a
+/// couple of seconds, so "none is running" was true at every single wake and
+/// the router was asked forever, at five-second spacing, by a node that had
+/// already been told no.
+#[derive(Debug, Clone, Default)]
+pub struct MappingRetry {
+    /// How many times in a row the router would not map.
+    refusals: u32,
+    /// How long since the last request went out.
+    waited: Duration,
+    /// How long since the default gateway was last read.
+    since_gateway_read: Duration,
+    /// The gateway the last request went to, so a node that has moved to
+    /// another network asks the new router straight away.
+    gateway: Option<Ipv4Addr>,
+}
+
+impl MappingRetry {
+    /// A ladder at its first rung, having asked nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How long this node waits before asking again, given what it has been
+    /// answered so far. Zero when nothing has been refused yet, which is the
+    /// boot case: the first request goes out at once.
+    pub fn interval(&self) -> Duration {
+        if self.refusals == 0 {
+            return Duration::ZERO;
+        }
+        let rung = usize::try_from(self.refusals)
+            .unwrap_or(MAPPING_RETRY_LADDER.len())
+            .min(MAPPING_RETRY_LADDER.len())
+            .saturating_sub(1);
+        MAPPING_RETRY_LADDER[rung]
+    }
+
+    /// Time has passed: `elapsed` more of it.
+    pub fn tick(&mut self, elapsed: Duration) {
+        self.waited = self.waited.saturating_add(elapsed);
+        self.since_gateway_read = self.since_gateway_read.saturating_add(elapsed);
+    }
+
+    /// May the router be asked now?
+    pub fn due(&self) -> bool {
+        self.waited >= self.interval()
+    }
+
+    /// Is enough of a wait behind this node to be worth re-reading the default
+    /// gateway? Always false while nothing has been refused, since a node that
+    /// is being answered has no ladder to reset.
+    pub fn gateway_read_due(&self) -> bool {
+        self.refusals > 0 && self.since_gateway_read >= GATEWAY_RECHECK_INTERVAL
+    }
+
+    /// The default gateway reads as `gateway` now. Answers whether that is a
+    /// different router than the one that refused, which puts the ladder back
+    /// on its first rung: a Mac carried to another network is one request away
+    /// from a mapping, and making it wait out the old router's ten minutes is
+    /// making it wait for nothing.
+    pub fn gateway_is_now(&mut self, gateway: Option<Ipv4Addr>) -> bool {
+        self.since_gateway_read = Duration::ZERO;
+        let moved = self.gateway.is_some() && self.gateway != gateway;
+        self.gateway = gateway;
+        if moved {
+            self.reset();
+        }
+        moved
+    }
+
+    /// A request is going out now.
+    pub fn asked(&mut self) {
+        self.waited = Duration::ZERO;
+    }
+
+    /// The router answered `answer`, which is what moves the ladder: a refusal
+    /// steps it up a rung and a mapping puts it back on the first one.
+    ///
+    /// Which LEVEL that answer is logged at is decided elsewhere, by
+    /// [`mapping_answer_voice`], because the log is per gateway and per
+    /// process while this ladder belongs to one loop.
+    pub fn answered(&mut self, answer: MappingAnswer) {
+        match answer {
+            MappingAnswer::Mapped => self.refusals = 0,
+            MappingAnswer::Refused => self.refusals = self.refusals.saturating_add(1),
+        }
+    }
+
+    /// Back to the first rung: the switch was toggled, or this Mac is on
+    /// another router.
+    pub fn reset(&mut self) {
+        self.refusals = 0;
+        self.waited = Duration::ZERO;
+    }
+
+    /// How many refusals in a row are behind the current wait.
+    pub fn refusals(&self) -> u32 {
+        self.refusals
+    }
+}
+
+/// The last answer each gateway gave, so the same answer twice is not the same
+/// line twice.
+///
+/// Process-wide and keyed by gateway, the shape `peer state restored` uses
+/// (`crate::peer::state`, `restore_counts_changed`): the two writers are the
+/// keeper thread and the loop that starts it, which have no channel between
+/// them, and a Mac that moves to another router gets its own first line there.
+static LAST_MAPPING_ANSWER: OnceLock<Mutex<HashMap<SocketAddr, MappingAnswer>>> = OnceLock::new();
+
+/// How loudly a router's answer is worth saying.
+///
+/// The decision, named and returned, rather than a `bool` each log site reads
+/// its own way: the two sites are three hundred lines apart and one of them
+/// used to write a warning every five seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerVoice {
+    /// Something an operator has not been told: one line at WARN.
+    News,
+    /// The same answer as last time: kept at DEBUG, or at INFO for a mapping,
+    /// where the line is the ordinary record of a keeper starting.
+    Repeat,
+}
+
+/// Record what `gateway` answered and say how loudly to say it.
+///
+/// The two answers are not symmetric, and that is the whole of this function:
+/// a refusal is news unless the last answer from this router was also a
+/// refusal, while a mapping is news ONLY when the last answer was a refusal,
+/// because the first mapping after a boot is the ordinary case and not a thing
+/// to warn anybody about.
+pub fn mapping_answer_voice(gateway: SocketAddr, answer: MappingAnswer) -> AnswerVoice {
+    let previous = LAST_MAPPING_ANSWER
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .insert(gateway, answer);
+    let news = match answer {
+        MappingAnswer::Refused => previous != Some(MappingAnswer::Refused),
+        MappingAnswer::Mapped => previous == Some(MappingAnswer::Refused),
+    };
+    if news {
+        AnswerVoice::News
+    } else {
+        AnswerVoice::Repeat
+    }
+}
+
 /// What a keeper did to the router, in the order it did it.
 ///
 /// Recorded as a list rather than inferred from the router's state because the
@@ -882,7 +1143,8 @@ pub struct MappingKeeper {
 pub enum MappedOver {
     /// NAT-PMP answered the first request.
     NatPmp,
-    /// NAT-PMP was silent and UPnP IGD answered.
+    /// The router had no NAT-PMP service, by silence or by refusing the probe,
+    /// and UPnP IGD answered.
     Upnp,
 }
 
@@ -900,12 +1162,15 @@ impl MappingKeeper {
         }
     }
 
-    /// Fall back to UPnP IGD, through `discoverer`, when NAT-PMP is silent.
+    /// Fall back to UPnP IGD, through `discoverer`, when the router has no
+    /// NAT-PMP service: [`ReachError::no_natpmp_service`] decides which
+    /// answers those are.
     ///
-    /// Only silence. A gateway that ANSWERS and refuses has made a decision
-    /// this node does not get to route around by asking a second protocol; a
-    /// gateway that says nothing is one that may not speak NAT-PMP at all,
-    /// which is the case UPnP exists for here.
+    /// Silence and a refused probe, and nothing else. A gateway that READ the
+    /// request and answered no has made a decision this node does not get to
+    /// route around by asking a second protocol; a gateway that says nothing,
+    /// or refuses the packet outright, is one that may not speak NAT-PMP at
+    /// all, which is the case UPnP exists for here.
     #[must_use]
     pub fn with_upnp(mut self, discoverer: crate::peer::reach_upnp::Discoverer) -> Self {
         self.upnp = Some(discoverer);
@@ -928,8 +1193,9 @@ impl MappingKeeper {
                 self.steps.push(MappingStep::Mapped);
                 mapping
             }
-            // Silence, and only silence, is what UPnP is asked about.
-            Err(ReachError::Silent { .. }) if self.upnp.is_some() => {
+            // A router with no NAT-PMP service on it, by silence or by
+            // refusal, is the only thing UPnP is asked about.
+            Err(err) if err.no_natpmp_service() && self.upnp.is_some() => {
                 let mapping = self.map_over_upnp()?;
                 self.steps.push(MappingStep::MappedOverUpnp);
                 mapping
@@ -992,7 +1258,8 @@ impl MappingKeeper {
         tracing::info!(
             external = %external,
             port = self.internal_port,
-            "peer internet: NAT-PMP said nothing and UPnP IGD mapped this node's listener port"
+            "peer internet: this router has no NAT-PMP and UPnP IGD mapped this node's listener \
+             port"
         );
         // UPnP IGD confirms the port asked for or refuses, so there is no
         // granted-port field to read back the way NAT-PMP has one.
@@ -1234,6 +1501,7 @@ pub fn run_mapping_while(
     stop: &AtomicBool,
     keep_going: &dyn Fn() -> bool,
 ) -> Result<Vec<MappingStep>, ReachError> {
+    let gateway = client.gateway();
     let mut keeper = MappingKeeper::new(client, internal_port, lifetime_secs);
     if let Some(discoverer) = upnp {
         keeper = keeper.with_upnp(discoverer);
@@ -1248,12 +1516,24 @@ pub fn run_mapping_while(
     if keeper.granted_by() != Some(MappedOver::Upnp) {
         publish_external(keeper.external_socket(), Some(&mapping));
     }
-    tracing::info!(
-        external_port = mapping.external_port,
-        internal_port = mapping.internal_port,
-        lifetime_secs = mapping.lifetime_secs,
-        "peer internet: the router mapped this node's listener port"
-    );
+    // A router that was refusing and now maps is the one mapping event worth a
+    // warning: the operator changed something, or this Mac is somewhere else,
+    // and either way what they were told last is no longer true.
+    if mapping_answer_voice(gateway, MappingAnswer::Mapped) == AnswerVoice::News {
+        tracing::warn!(
+            external_port = mapping.external_port,
+            internal_port = mapping.internal_port,
+            lifetime_secs = mapping.lifetime_secs,
+            "peer internet: the router mapped this node's listener port"
+        );
+    } else {
+        tracing::info!(
+            external_port = mapping.external_port,
+            internal_port = mapping.internal_port,
+            lifetime_secs = mapping.lifetime_secs,
+            "peer internet: the router mapped this node's listener port"
+        );
+    }
 
     while !stop.load(Ordering::SeqCst) {
         if !keep_going() {
@@ -1541,6 +1821,7 @@ pub fn spawn_mapping_keeper(peers_path: &Path, internal_port: u16) -> Option<Map
             return None;
         }
     };
+    let gateway = client.gateway();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let alive = Arc::new(AtomicBool::new(true));
@@ -1562,10 +1843,20 @@ pub fn spawn_mapping_keeper(peers_path: &Path, internal_port: u16) -> Option<Map
                 &thread_stop,
                 &|| internet_is_on(&peers_path),
             ) {
-                tracing::warn!(
-                    error = %err,
-                    "peer internet: the router would not map this node's listener port"
-                );
+                // The same answer from the same router is a line nobody reads
+                // twice, and this one used to be written every five seconds
+                // for as long as the process ran.
+                if mapping_answer_voice(gateway, MappingAnswer::Refused) == AnswerVoice::Repeat {
+                    tracing::debug!(
+                        error = %err,
+                        "peer internet: the router would not map this node's listener port"
+                    );
+                } else {
+                    tracing::warn!(
+                        error = %err,
+                        "peer internet: the router would not map this node's listener port"
+                    );
+                }
             }
         })
         .map_err(|err| {
@@ -1644,6 +1935,10 @@ pub struct InternetWatch {
     pub started: usize,
     /// Keepers stopped because the switch went off.
     pub stopped: usize,
+    /// Wakes where a keeper was wanted, none was running, and the router that
+    /// refused the last one was left alone: the ladder's whole effect, counted
+    /// so a test can see it without a clock.
+    pub deferred: usize,
 }
 
 /// Keep this process's mapping keeper in step with `peer.internet`, for as
@@ -1658,6 +1953,17 @@ pub struct InternetWatch {
 ///
 /// `rounds` bounds the loop so a test can drive it; [`None`] is the production
 /// shape, which is forever.
+///
+/// # A router that says no is asked less often
+///
+/// A keeper whose router refuses the first request ends within a couple of
+/// seconds, so "a mapping is wanted and none is running" was true at every
+/// wake and this loop asked the same router every five seconds for the life of
+/// the process: a day of that is one pair of log lines every five seconds and
+/// nothing gained. [`MappingRetry`] spaces the asks out instead, along
+/// [`MAPPING_RETRY_LADDER`], and puts them back at five seconds the moment the
+/// answer could have changed: the switch toggled, this Mac moved to another
+/// router, or a request was granted.
 pub async fn keep_internet_mapping<H, S>(
     peers_path: std::path::PathBuf,
     local: SocketAddr,
@@ -1671,6 +1977,11 @@ where
     S: FnMut() -> Option<H>,
 {
     let mut tally = InternetWatch::default();
+    // The ladder that decides when a router which would not map is asked
+    // again. A keeper handed in is one already asked for, so its death is this
+    // router's answer and not this loop's first question.
+    let mut retry = MappingRetry::new();
+    let mut expecting = held.is_some();
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The first tick is immediate and the boot decision has already been
@@ -1685,6 +1996,7 @@ where
         }
         round += 1;
         ticker.tick().await;
+        retry.tick(every);
 
         // A peers file that does not read for a moment is not the same fact as
         // the switch being off, the rule `internet_is_on` states: the mapping
@@ -1706,21 +2018,68 @@ where
             decision,
             held.as_ref().is_some_and(KeeperHandle::is_running),
         ) {
-            KeeperStep::Idle | KeeperStep::Renew => {}
+            KeeperStep::Idle => {}
+            // A keeper that is still running is a router that mapped, which
+            // puts the ladder back on its first rung: the next refusal, weeks
+            // from now, is not made to wait ten minutes for one that has been
+            // answering ever since.
+            KeeperStep::Renew => retry.answered(MappingAnswer::Mapped),
             KeeperStep::Start => {
+                if expecting {
+                    // A keeper this loop is responsible for is gone. It only
+                    // ends on its own when the first request was refused, so
+                    // this is the router's answer, and the line naming it is
+                    // written by the keeper thread itself.
+                    retry.answered(MappingAnswer::Refused);
+                    expecting = false;
+                }
+                // A Mac carried to another network is behind another router,
+                // and this one may map on the first ask.
+                if retry.gateway_read_due() && retry.gateway_is_now(default_gateway().ok()) {
+                    tracing::info!(
+                        "peer internet: this Mac is behind a different router than the one that \
+                         would not map, so it is asked straight away"
+                    );
+                }
+                if !retry.due() {
+                    tally.deferred += 1;
+                    tracing::debug!(
+                        wait_secs = retry.interval().as_secs(),
+                        refusals = retry.refusals(),
+                        "peer internet: this router would not map, so the next request waits"
+                    );
+                    continue;
+                }
                 held = start();
-                tally.started += 1;
-                tracing::info!(
-                    peer_listen = %local,
-                    "peer internet: the switch is on, so this node is asking its router for a \
-                     mapping (`tcr peer reach` reports what it gets)"
-                );
+                retry.asked();
+                expecting = held.is_some();
+                match &held {
+                    Some(_) => {
+                        tally.started += 1;
+                        tracing::info!(
+                            peer_listen = %local,
+                            "peer internet: the switch is on, so this node is asking its router \
+                             for a mapping (`tcr peer reach` reports what it gets)"
+                        );
+                    }
+                    // No keeper at all: there is no gateway to ask, and the
+                    // line saying so is written where that is decided. It
+                    // counts as a refusal here, or this loop re-asks a Mac
+                    // with no router every five seconds for as long as it
+                    // runs.
+                    None => retry.answered(MappingAnswer::Refused),
+                }
             }
             KeeperStep::Stop => {
                 // Dropping the handle stops the keeper, which deletes the
                 // mapping over the protocol that granted it.
                 held = None;
                 tally.stopped += 1;
+                // The switch being toggled is an operator act, and the next
+                // `on` asks the router at once rather than waiting out a
+                // ladder built before they touched anything.
+                expecting = false;
+                retry.reset();
                 tracing::info!(
                     "peer internet: the switch is off, so the mapping this node holds is \
                      deleted and no keeper runs"
@@ -2746,4 +3105,34 @@ pub fn reach_punch_line(label: &str, peer: &tcr_peer_wire::PeerId) -> String {
         "reach: peer: {label} {}: sees-us-at: {seen}: punch-possible: {punch}",
         peer.display()
     )
+}
+
+/// The last line `tcr peer reach` prints when no protocol will map a port:
+/// what an operator can still do about it, in one sentence.
+///
+/// [`Some`] only for the outcome it is about, a router with no mapping service
+/// this node can talk to ([`ReachError::no_natpmp_service`] names it, and the
+/// keeper's answer carries the UPnP half too). Every other refusal is a device
+/// that ANSWERED and was refused by name, where the thing to do is read that
+/// name rather than reach for a workaround, so this stays [`None`] and the
+/// verb prints nothing extra.
+///
+/// A function here rather than a `println!` in the verb, for the reason
+/// [`reach_punch_line`] gives: the wording ships next to the decision that
+/// selects it.
+///
+/// No new state, and nothing is asked of the router to produce it.
+pub fn reach_no_mapping_line(failure: &ReachError, listen_port: Option<u16>) -> Option<String> {
+    if !failure.no_natpmp_service() {
+        return None;
+    }
+    let port = match listen_port {
+        Some(port) => format!("tcp port {port}"),
+        None => "the peer listener's port".to_string(),
+    };
+    Some(format!(
+        "reach: no-mapping: this router will not open a port over either protocol, so two ways \
+         are left: forward {port} to this Mac by hand in the router's own settings, or put both \
+         Macs on one private network (Tailscale, or any VPN they both join) and pair over that"
+    ))
 }
