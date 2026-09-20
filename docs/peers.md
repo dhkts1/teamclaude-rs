@@ -13,10 +13,14 @@ tcr peer find on
 ```
 
 turns on discovery. Other Macs running `tcr peer find on` on the same network start showing
-up as rows you can Trust. Discovery announces this Mac's presence and port to the network so
-it can be found back; see "what leaves this Mac" below for exactly what that announcement
-does and does not carry. Up to 12 discovered rows are shown at once, newest first, and at
-most 2 from the same address; a Mac that stops announcing drops off the list after a minute.
+up as rows you can Trust, in the Peers tab and in `tcr peer ls`/`tcr peer ls --json` alike:
+the running `tcr` browses on its own, about every twenty seconds, and writes what it heard, so
+either surface reads the same list. Discovery announces this Mac's presence and port to the
+network so it can be found back; see "what leaves this Mac" below for exactly what that
+announcement does and does not carry. Up to 12 discovered rows are shown at once, newest
+first, and at most 2 from the same address; a Mac that stops announcing drops off the list
+after a minute, and `tcr peer ls`'s summary line names how many more are held back with
+`not-shown=`.
 
 ```
 tcr peer find off
@@ -433,7 +437,17 @@ proxy starts, so quit and reopen it once after that first command, before going 
    that already had `listen` set, neither line prints and `peer.find: on` takes effect right
    away, followed by `a running server starts announcing within a minute`.
 
-2. Mac A asks to pair with Mac B:
+2. Wait about half a minute, then either Mac:
+
+   ```
+   tcr peer ls
+   ```
+
+   prints a line for the other Mac: its address, its name (or `no name announced`), and
+   `found <age>s ago, not trusted`. That address is what the next step pairs with; a person
+   with no panel open never has to ask the other operator for it by hand.
+
+3. Mac A asks to pair with Mac B, using the address `tcr peer ls` just printed:
 
    ```
    tcr peer pair <Mac B's address>
@@ -441,7 +455,7 @@ proxy starts, so quit and reopen it once after that first command, before going 
 
    Mac A's screen shows `peer pair: this Mac shows` followed by six digits.
 
-3. Mac B sees the request and opens the window:
+4. Mac B sees the request and opens the window:
 
    ```
    tcr peer pending
@@ -456,7 +470,7 @@ proxy starts, so quit and reopen it once after that first command, before going 
    (`<target>` is the instance id or address `tcr peer pending` printed.) Mac B's screen shows
    `peer accept: ok` followed by the instance id, address and the window's end time.
 
-4. Compare the six digits on both screens. If they match, both operators confirm, each typing
+5. Compare the six digits on both screens. If they match, both operators confirm, each typing
    the address of the OTHER Mac:
 
    ```
@@ -468,16 +482,18 @@ proxy starts, so quit and reopen it once after that first command, before going 
    [Trust: pairing with a Mac](#trust-pairing-with-a-mac) above; the four commands above are
    the whole of what to type.
 
-5. Either Mac:
+6. Either Mac:
 
    ```
    tcr peer ls
    ```
 
    prints a row for the other Mac's peer id and name once both sides confirmed, followed by a
-   line `peer ls: pending=0 blocked=0 muted=0`.
+   line `peer ls: pending=0 blocked=0 muted=0 found=0 not-shown=0` (a paired Mac keeps
+   announcing, so it may still show as a found row too until its beacon is the only thing
+   left saying it is there).
 
-6. Mac A lends Mac B one hour of account access. `tcr peer lend` takes the peer id in its
+7. Mac A lends Mac B one hour of account access. `tcr peer lend` takes the peer id in its
    full wire form, not the short `tcr-…` one `tcr peer ls` just printed, so read it off:
 
    ```
@@ -561,7 +577,7 @@ proxy starts, so quit and reopen it once after that first command, before going 
 
 ### A hand-mode lend
 
-Mac A lends Mac B the same hour of account access as step 6 in "On one LAN" above, but with
+Mac A lends Mac B the same hour of account access as step 7 in "On one LAN" above, but with
 `--mode hand`:
 
 ```

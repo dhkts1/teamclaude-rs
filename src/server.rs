@@ -1062,6 +1062,10 @@ async fn boot_peer_listener(
     // The beacon, announced by the process that is actually listening.
     spawn_beacon(peers_path, local.port(), shutdown, background);
 
+    // The browse, on the same cadence, writing what it heard into the state
+    // file this process already owns.
+    spawn_browse(peers_path, &state_path, shutdown, background);
+
     // The reverse carriers, for a Mac nothing can dial.
     //
     // Asked against the two facts `reach` measures: a router mapping this
@@ -1222,6 +1226,122 @@ fn spawn_beacon(
                     );
                 }
             }
+        }
+    })));
+}
+
+/// Browse for other nodes' beacons, from the process that is actually
+/// listening, for as long as `peer.find` is on, and write what it heard into
+/// this profile's state file.
+///
+/// A twin of [`spawn_beacon`]: `supervise`, a ticker on
+/// [`crate::peer::discovery::BROWSE_INTERVAL`] with `MissedTickBehavior::Skip`,
+/// and the `find` flag re-read off the peers file each wake rather than taken
+/// from the boot snapshot, the same reason [`spawn_beacon`] gives.
+///
+/// Holds a [`discovery::FoundList`] across wakes: the caps and the ageing
+/// live there, in memory, and this task's whole job after each browse is
+/// dropping this node's own beacon (never by address, only by instance id;
+/// see the module's own refusal) and writing [`discovery::FoundList::shown`]
+/// and [`discovery::FoundList::not_shown`] into `peer-state.json`.
+///
+/// A peers file, or a state file, that does not read or write for a moment
+/// is not the same fact as `find` being off: logged and left as it is until
+/// the next wake, the same containment [`spawn_beacon`] already has.
+fn spawn_browse(
+    peers_path: &std::path::Path,
+    state_path: &std::path::Path,
+    shutdown: &watch::Sender<bool>,
+    background: &mut Vec<JoinHandle<()>>,
+) {
+    use crate::peer::discovery;
+
+    let peers_path = peers_path.to_path_buf();
+    let state_path = state_path.to_path_buf();
+    let mut stop = shutdown.subscribe();
+    background.push(tokio::spawn(supervise("peer-browse", async move {
+        let browsing = async move {
+            let mut found = discovery::FoundList::new();
+            let mut ticker = tokio::time::interval(discovery::BROWSE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let file = match crate::peer::config::read_or_default(&peers_path) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %peers_path.display(),
+                            error = %err,
+                            "peer find: the peers file did not read, so the found list is left \
+                             as it is until the next wake"
+                        );
+                        continue;
+                    }
+                };
+                // `AnnounceStep` is the beacon's own re-stamp decision and not
+                // what this task reads; the flag itself is: browsing while
+                // `find` is off would show rows an operator who turned
+                // discovery off never asked to see.
+                if !file.discovery {
+                    continue;
+                }
+                let store = match crate::peer::config::PeerStore::open(&peers_path) {
+                    Ok(store) => store,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "peer find: the peers file did not open, so no browse ran this wake"
+                        );
+                        continue;
+                    }
+                };
+                let scan = match discovery::browse(&store).await {
+                    Ok(scan) => scan,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "peer find: this node could not browse the LAN this wake"
+                        );
+                        continue;
+                    }
+                };
+                let now_ms = crate::now_ms();
+                // Never by address: one Mac has several, and two containers
+                // share a host. The instance id is the only sound key for
+                // "this is my own beacon".
+                let this_instance = crate::peer::id::boot_instance_id();
+                let scan: Vec<discovery::Discovered> = scan
+                    .into_iter()
+                    .filter(|row| row.instance_id != this_instance)
+                    .collect();
+                found.observe(scan, now_ms);
+                let rows: Vec<crate::peer::state::Found> = found
+                    .shown()
+                    .into_iter()
+                    .map(|row| crate::peer::state::Found {
+                        addr: row.addrs.first().cloned().unwrap_or_default(),
+                        instance_id: row.instance_id,
+                        announced_name: row.name,
+                        listen_port: row.port,
+                        first_seen_ms: now_ms,
+                        last_seen_ms: now_ms,
+                    })
+                    .collect();
+                if let Err(err) =
+                    crate::peer::state::save_found(&state_path, rows, found.not_shown(), now_ms)
+                {
+                    tracing::warn!(
+                        path = %state_path.display(),
+                        error = %err,
+                        "peer find: the found list did not write, so the last scan's rows are \
+                         only in this process's memory"
+                    );
+                }
+            }
+        };
+        tokio::select! {
+            _ = browsing => {}
+            _ = stop.changed() => {}
         }
     })));
 }

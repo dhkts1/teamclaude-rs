@@ -1780,6 +1780,21 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                         status::PeerLsRow::from_row(row, until, ended)
                     })
                     .collect();
+                // Trusted rows first, found rows after, newest first within
+                // the found group: `visible_found` returns them in the order
+                // `discovery::FoundList` already sorts in, and no rewriting
+                // happens here.
+                let found_rows: Vec<status::PeerFoundRow> = state
+                    .visible_found()
+                    .iter()
+                    .map(found_row_for_readers)
+                    .collect();
+                let peers: Vec<status::PeerLsPeer> = masked
+                    .iter()
+                    .cloned()
+                    .map(status::PeerLsPeer::Trusted)
+                    .chain(found_rows.iter().cloned().map(status::PeerLsPeer::Found))
+                    .collect();
                 let file = store.file();
                 let exits = peer_ls_exits(
                     &config_accounts,
@@ -1789,7 +1804,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 );
                 let out = status::PeerLsJson {
                     supported: true,
-                    peers: masked,
+                    peers,
                     lent_to,
                     internet: file.internet,
                     network: status::network_fact::network_present(),
@@ -1800,7 +1815,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     blocked: state.banned.clone(),
                     muted_count: state.muted.len(),
                     muted: state.muted.clone(),
-                    limited: 0,
+                    limited: state.found_not_shown,
                     caps: status::PeerCapsJson {
                         found_rows: peer::discovery::MAX_FOUND_ROWS,
                         found_per_address: peer::discovery::MAX_FOUND_PER_ADDRESS,
@@ -1818,14 +1833,37 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 for row in &rows {
                     println!("{}  {}", row.node.display(), masked_label(&row.label));
                 }
+                // Newest first, the same order `discovery::FoundList` already
+                // sorts `visible_found` in, so a human reading the terminal
+                // sees the Mac they just turned on first, the same rule the
+                // JSON array follows.
+                for row in state.visible_found() {
+                    let found = found_row_for_readers(&row);
+                    let age_secs = (peer::pair::now_ms().saturating_sub(row.last_seen_ms).max(0)
+                        / 1_000)
+                        .max(0);
+                    let name = found
+                        .name
+                        .as_deref()
+                        .unwrap_or("no name announced")
+                        .to_string();
+                    println!(
+                        "{}  {}  found {age_secs}s ago, not trusted",
+                        found.address, name
+                    );
+                }
                 // Greppable, `key: value`-shaped, and printed even at zero:
                 // "pending=0" is a fact an operator can act on and a missing
-                // line is one they have to go and check.
+                // line is one they have to go and check. `found=` and
+                // `not-shown=` are the same rule extended to the list this
+                // change adds.
                 println!(
-                    "peer ls: pending={} blocked={} muted={}",
+                    "peer ls: pending={} blocked={} muted={} found={} not-shown={}",
                     state.visible_pending().len(),
                     state.banned.len(),
-                    state.muted.len()
+                    state.muted.len(),
+                    state.visible_found().len(),
+                    state.found_not_shown
                 );
             }
             Ok(())
@@ -4232,6 +4270,21 @@ fn pending_row_for_readers(mut knock: peer::state::Knock) -> peer::state::Knock 
     knock
 }
 
+/// One found row as a READER of it wants it: [`pending_row_for_readers`]'s
+/// twin. The dial address is built here for the same reason, an operator or
+/// the panel's Trust button hands this string straight to `tcr peer pair`,
+/// and the announced name is masked again for the same reason: it is text a
+/// stranger's Mac chose, already whitelisted on arrival, and this repository
+/// is public.
+fn found_row_for_readers(row: &peer::state::Found) -> status::PeerFoundRow {
+    status::PeerFoundRow {
+        name: row.announced_name.as_deref().map(masked_label),
+        address: row.dial_address(),
+        trusted: false,
+        last_seen_ms: row.last_seen_ms,
+    }
+}
+
 /// What `tcr peer pair` dials, from what an operator typed.
 ///
 /// A `host:port` is taken as it is. A BARE address gets the port this Mac's
@@ -4356,11 +4409,38 @@ struct RealPeerFinder;
 
 impl PeerFinder for RealPeerFinder {
     async fn start_browse(&self, store: &peer::config::PeerStore) -> anyhow::Result<()> {
-        // `find on` proves browsing works and discards the one scan's
-        // results here: nothing renders a discovered list yet (the panel
-        // does that), so there is nothing
-        // useful to do with them beyond confirming the call started.
-        peer::discovery::browse(store).await.map(|_found| ())
+        // `find on` runs one scan and prints what it saw, then writes
+        // nothing: this CLI process's mDNS daemon dies with the command, so
+        // a scan here is a diagnostic readout for an operator at a prompt
+        // and not a source of truth. The list `tcr peer ls --json` and the
+        // panel read comes from the serving process's own browse task
+        // (`server::spawn_browse`), which writes into `peer-state.json` on
+        // its own cadence; a second writer on that key is the defect the
+        // peers-file lock exists to prevent.
+        let found = peer::discovery::browse(store).await?;
+        if found.is_empty() {
+            println!("no Macs found");
+        }
+        for row in &found {
+            // Reusing `Found::dial_address` rather than a second bracket
+            // rule: the timestamps are unused by that method and are not
+            // written anywhere, this row is never persisted.
+            let as_found = peer::state::Found {
+                addr: row.addrs.first().cloned().unwrap_or_default(),
+                instance_id: row.instance_id,
+                announced_name: row.name.clone(),
+                listen_port: row.port,
+                first_seen_ms: 0,
+                last_seen_ms: 0,
+            };
+            let name = as_found
+                .announced_name
+                .as_deref()
+                .map(masked_label)
+                .unwrap_or_else(|| "no name announced".to_string());
+            println!("{}  {}", as_found.dial_address(), name);
+        }
+        Ok(())
     }
 }
 
