@@ -51,6 +51,34 @@ public enum PeerSealedMint {
     /// `src/peer/ask.rs`. Pinned by the same test.
     public static let replyPrefix = "tcr-reply:v1:"
 
+    /// True for the sentence `connect_in_key_order` bails with when a dial
+    /// found nobody home (`src/peer/pair.rs:1019-1024`), false for every
+    /// `ask::ReplyRefusal` sentence (`src/peer/ask.rs:258-278`), those being
+    /// the reply that never opened at all.
+    ///
+    /// A spent dial has a remedy the sheet can offer, the invite works in
+    /// the other direction too, and a reply that never opened does not: it
+    /// is a stale, spent or misaddressed ask, and pressing anything again
+    /// asks for a fresh one. Both reach the same enum case, so a view that
+    /// drew the two apart itself would be the only reader of a fact `tcr`
+    /// already prints; `theyDidNotAnswer` is that one reading, tested
+    /// against the Rust sentence it keys on rather than a copy of it.
+    public static func theyDidNotAnswer(_ said: String) -> Bool {
+        said.contains("nothing answered at any address")
+    }
+
+    /// The reply screen's headline, said once here rather than by each of
+    /// its two readers: `PeersSettingsView.pasteKeySheet`, which draws it
+    /// today, and `PeerInviteSheet.sealedModeContent`, whose `answered` arm
+    /// starts drawing it once the swap ships.
+    public static let sendThisBackTitle = "Send this back"
+
+    /// The reply screen's sentence, the same two readers as
+    /// ``sendThisBackTitle``.
+    public static let sendThisBackBody =
+        "This carries your address, sealed so only the Mac that invited you can open it. "
+        + "Nobody else who reads the message learns anything from it."
+
     /// Classify one run from its exit code and its two streams.
     ///
     /// The exit code leads, the same way ``PeerInviteMint/outcome(exitCode:stdout:stderr:)``

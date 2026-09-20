@@ -3065,7 +3065,7 @@ struct PeerInviteSheet: View {
                 // opened and the dial that followed found nobody. `tcr`'s
                 // own sentence in each carries the difference; this only
                 // has to head the reader to the right fix.
-                return said.contains("nothing answered at any address")
+                return PeerSealedMint.theyDidNotAnswer(said)
                     ? "They did not answer" : "That reply did not open"
             case .couldNotRun: return "That did not run"
             }
