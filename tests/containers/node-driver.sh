@@ -69,8 +69,17 @@ case "${1:-}" in
     # waited on. The writer parks until `pair-answer` has written the digits,
     # which is what keeps the pair process's stdin open through the wait.
     ( while [ ! -s "$CODE" ]; do sleep 1; done; cat "$CODE" ) > "$FIFO" 2>/dev/null </dev/null &
-    ( tcr peer pair "$addr" --peers "$PEERS" --json < "$FIFO" > "$OUT" 2>&1
-      echo "$?" > "$STATUS" ) >/dev/null 2>&1 </dev/null &
+    # The status is recorded through an `if` and not after the command: a
+    # subshell inherits `set -e`, so a refused pairing killed the subshell
+    # before it could write its own exit code, and `pair-wait` then sat out its
+    # whole deadline over a refusal that had already been printed. Watched: the
+    # wrong-digits run said `driver: pair did not finish within 180s` under a
+    # `refused` event that was right there in the log.
+    ( if tcr peer pair "$addr" --peers "$PEERS" --json < "$FIFO" > "$OUT" 2>&1; then
+        echo 0 > "$STATUS"
+      else
+        echo "$?" > "$STATUS"
+      fi ) >/dev/null 2>&1 </dev/null &
     echo "driver: pair-start addr=$addr"
     ;;
   pair-instance)
