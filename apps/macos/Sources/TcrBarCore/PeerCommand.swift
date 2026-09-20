@@ -85,6 +85,23 @@ public enum PeerCommand {
     /// digit found in string" and the pane never had a join key to show.
     public static let invite = ["peer", "invite", "--ttl", "600", "--uses", "1"]
 
+    /// `tcr peer invite --sealed`, mode B's first paste: a one-time public
+    /// key that names no address and grants nothing. Its stdout is an ask,
+    /// which is why the pane reads it through ``PeerController/mintSealedInvite(into:)``
+    /// rather than firing and forgetting, ``invite``'s own reason.
+    public static let sealedInvite = ["peer", "invite", "--sealed"]
+
+    /// `tcr peer invite --reply --stdin`, with the reply ON STDIN, opening a
+    /// reply this Mac was handed back and joining immediately.
+    ///
+    /// A reply is a live answer to a live ask this Mac minted: it carries the
+    /// friend's freshly-sealed join key, so it is a secret in the same shape
+    /// a join key is, and it rides stdin for the same reason ``join(key:)``
+    /// does.
+    public static func openReply(_ reply: String) -> PeerSecretInvocation {
+        PeerSecretInvocation(arguments: ["peer", "invite", "--reply", "--stdin"], stdin: reply)
+    }
+
     /// `tcr peer join --stdin`, with the key ON STDIN, the other half, on the
     /// Mac that was given the key.
     ///
@@ -100,6 +117,11 @@ public enum PeerCommand {
     /// than two arguments a caller pairs up: a `--stdin` flag with nothing fed
     /// to it hangs, and a key handed to the argv half is the leak this whole
     /// function exists to close.
+    ///
+    /// The parameter is named `key` because it started as one, but it now
+    /// carries whatever a person pasted: a v1 or v2 key, a `tcr://` link, or
+    /// an ask (`tcr-invite:v1:…`). `JoinInput` on the other end decides which
+    /// one arrived; this factory does not need to know.
     public static func join(key: String) -> PeerSecretInvocation {
         PeerSecretInvocation(arguments: ["peer", "join", "--stdin"], stdin: key)
     }

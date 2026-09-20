@@ -87,8 +87,15 @@ final class PeersPanelWiringTests: XCTestCase {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let sheet = try slice(
             tab, from: "struct PeerInviteSheet: View {", to: "// MARK: - The link sheet")
+        // Anchor moved: Copy key and mode B's Copy now share one `copy(_:)`
+        // helper rather than each spelling `NSPasteboard.general.setString`
+        // itself, so the check is on the call rather than the literal.
         XCTAssertTrue(
-            sheet.contains("NSPasteboard.general.setString(key, forType: .string)"),
+            sheet.contains("title: \"Copy key\""),
+            "the shared invite sheet has no Copy key button any more")
+        XCTAssertTrue(
+            sheet.contains("private func copy(_ text: String) {")
+                && sheet.contains("NSPasteboard.general.setString(text, forType: .string)"),
             "the shared invite sheet has no Copy: the key is a string somebody has to paste "
                 + "on another Mac, and it is not selectable from a screenshot")
     }
@@ -124,11 +131,19 @@ final class PeersPanelWiringTests: XCTestCase {
     /// are what the sheet hands over, and an empty field cannot be submitted.
     func testPasteAKeyPassesTheTypedKeyToTheVerb() throws {
         let pane = try source("apps/macos/Sources/TcrBar/PeersSettingsView.swift")
+        // Anchor moved with the sealed exchange: the field now takes three
+        // shapes, so Join goes through `joinOrAnswer()`, which classifies by
+        // prefix before deciding whether to run fire-and-forget or captured.
+        // The field's contents still flow into the same verb either way.
         XCTAssertTrue(
-            pane.contains("PeerCommand.join(key: trimmedPastedKey)"),
+            pane.contains("private func joinOrAnswer() {"),
+            "the field's Join button no longer decides between a fire-and-forget join and a "
+                + "captured answer, so an ask paste either hangs or closes with nothing shown")
+        XCTAssertTrue(
+            pane.contains("controller.run(PeerCommand.join(key: value))"),
             "Paste a key is not passing the field's contents to `tcr peer join` any more")
         XCTAssertTrue(
-            pane.contains("TextField(\"Join key\", text: $pastedKey)"),
+            pane.contains("TextField(\"Key, link or invite\", text: $pastedKey)"),
             "the paste sheet has no text field, so there is nothing for the key to arrive in")
         XCTAssertTrue(
             pane.contains(".disabled(trimmedPastedKey.isEmpty)"),
@@ -639,6 +654,60 @@ final class PeersPanelWiringTests: XCTestCase {
         XCTAssertTrue(
             start.contains("guard !snapshotMode else { return }"),
             "a render run starts a subprocess: --render-states writes PNGs and runs nothing")
+    }
+
+    // MARK: - The sealed sheet
+
+    /// The two prefixes cross the language boundary with no shared constant:
+    /// Swift cannot import Rust, so `PeerSealedMint.askPrefix` and
+    /// `.replyPrefix` are written out, the same as
+    /// ``PeerInviteMint/keyPrefix`` already is. Both directions, so this is
+    /// not pinned to a Rust spelling that already moved on: the Rust source
+    /// has to say the exact string too, not just contain a superset of it.
+    func testTheSealedSheetQuotesTheCliRatherThanRespellingIt() throws {
+        XCTAssertEqual(PeerSealedMint.askPrefix, "tcr-invite:v1:")
+        XCTAssertEqual(PeerSealedMint.replyPrefix, "tcr-reply:v1:")
+
+        let askRs = try source("src/peer/ask.rs")
+        XCTAssertTrue(
+            askRs.contains(#"pub const ASK_PREFIX: &str = "tcr-invite:v1:";"#),
+            "ASK_PREFIX has moved or been reworded in src/peer/ask.rs; update "
+                + "PeerSealedMint.askPrefix and this check together")
+        XCTAssertTrue(
+            askRs.contains(#"pub const REPLY_PREFIX: &str = "tcr-reply:v1:";"#),
+            "REPLY_PREFIX has moved or been reworded in src/peer/ask.rs")
+
+        let mainRs = try source("src/main.rs")
+        for sentence in [
+            "this names no address and grants nothing",
+            "it is good for ten minutes; paste what comes back with",
+            "send this back to whoever sent you the invite",
+            "opening it joins you immediately, pinned and trusted on both",
+        ] {
+            XCTAssertTrue(
+                mainRs.contains(sentence),
+                "the sentence \"\(sentence)\" has moved or been reworded in src/main.rs; "
+                    + "update this check and confirm PeerInviteSheet still says nothing of "
+                    + "its own about it")
+        }
+
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let sheet = try slice(
+            tab, from: "struct PeerInviteSheet: View {", to: "// MARK: - The link sheet")
+        for word in ["ten minutes", "one use", "expires", "internet address", "router"] {
+            XCTAssertFalse(
+                sheet.contains(word),
+                "PeerInviteSheet says \"\(word)\" itself, which is a second spelling of a "
+                    + "fact tcr already printed and free to drift from it")
+        }
+        // Mode B ends in a join, never a knock: no sentence in this sheet
+        // may promise a six-digit compare for it, the fact PR #377 changed
+        // out from under the earlier design.
+        XCTAssertFalse(
+            sheet.contains("six digit"),
+            "PeerInviteSheet promises a six-digit compare somewhere, and mode B has not "
+                + "compared digits since opening a reply started joining immediately "
+                + "(src/peer/ask.rs's own doc)")
     }
 
     // MARK: - Reading the source

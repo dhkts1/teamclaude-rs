@@ -174,7 +174,22 @@ struct PeersSettingsPane: View {
         .onDisappear { controller.stop() }
         .onChange(of: snapshot.name) { latest in fillNameIfEmpty(latest) }
         .sheet(isPresented: $showingJoinKey) {
-            PeerInviteSheet(outcome: joinKeyOutcome, onClose: { showingJoinKey = false })
+            PeerInviteSheet(
+                mode: $showingJoinKeyMode,
+                invite: joinKeyOutcome,
+                sealed: sealedJoinKeyOutcome,
+                onPickKey: {
+                    guard joinKeyOutcome == nil else { return }
+                    controller.mintInvite { joinKeyOutcome = $0 }
+                },
+                onPickSealed: {
+                    guard sealedJoinKeyOutcome == nil else { return }
+                    controller.mintSealedInvite { sealedJoinKeyOutcome = $0 }
+                },
+                onOpenReply: { reply in
+                    controller.openReply(reply) { sealedJoinKeyOutcome = $0 }
+                },
+                onClose: { showingJoinKey = false })
         }
         .sheet(isPresented: $pasting) { pasteKeySheet }
         .sheet(isPresented: $customizing) { defaultsSheet }
@@ -494,6 +509,7 @@ struct PeersSettingsPane: View {
                 LabeledContent("Paste a key or a link") {
                     Button("Paste…") {
                         pastedKey = ""
+                        pastedAnswer = nil
                         pasting = true
                     }
                     .controlSize(.small)
@@ -1026,35 +1042,104 @@ struct PeersSettingsPane: View {
     /// which key sets what, that a spent `jk` still sets `nk`, and re-spelling
     /// its query items here would be a second parser of one string, free to
     /// disagree with the one that ships.
+    ///
+    /// A pasted ASK is the third shape, and it does not join anything by
+    /// itself: `tcr peer join --stdin` seals this Mac's address to it and
+    /// prints a reply, which has to be shown and copied rather than closing
+    /// the sheet the way a key or a link does. So the field is classified by
+    /// its own prefix BEFORE the press, in ``PeerSealedMint/askPrefix``'s
+    /// shape: an ask runs captured, through ``PeerController/answerAsk(_:into:)``,
+    /// and a key or a link keeps the fire-and-forget path this sheet always
+    /// used, closing on Join the way it always has.
     private var pasteKeySheet: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Paste a key from another Mac")
-                .font(.headline)
-            TextField("Join key", text: $pastedKey)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(.body, design: .monospaced))
-            Text(
-                "The string the other Mac showed under Show join key, or a whole tcr:// link "
-                    + "somebody sent you. Joining with a key trusts that Mac without "
-                    + "comparing six digits, which is the whole point of a key: it is for the "
-                    + "Mac nobody is looking at."
-            )
-            .font(.caption)
-            .foregroundStyle(Tok.inkFaint)
-            .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 8) {
-                Spacer(minLength: 0)
-                Button("Cancel", role: .cancel) { pasting = false }
-                Button("Join") {
-                    controller.run(PeerCommand.join(key: trimmedPastedKey))
-                    pasting = false
+            switch pastedAnswer {
+            case nil:
+                Text("Paste a key from another Mac")
+                    .font(.headline)
+                TextField("Key, link or invite", text: $pastedKey)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                Text(
+                    "A key, a link, or an invite somebody sent you. A key trusts that Mac "
+                        + "without comparing six digits, which is the whole point of a key: "
+                        + "it is for the Mac nobody is looking at. An invite trusts nothing "
+                        + "by itself: it sends them your address, sealed, and opening it "
+                        + "joins you both immediately."
+                )
+                .font(.caption)
+                .foregroundStyle(Tok.inkFaint)
+                .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Button("Cancel", role: .cancel) { pasting = false }
+                    Button("Join") { joinOrAnswer() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(trimmedPastedKey.isEmpty)
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(trimmedPastedKey.isEmpty)
+            case .answered(let reply, let sentences):
+                Text("Send this back")
+                    .font(.headline)
+                Text(
+                    "This carries your address, sealed so only the Mac that invited you can "
+                        + "open it. Nobody else who reads the message learns anything from it."
+                )
+                .font(.caption)
+                .foregroundStyle(Tok.inkFaint)
+                .fixedSize(horizontal: false, vertical: true)
+                Text(reply)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !sentences.isEmpty {
+                    Text(sentences)
+                        .font(.caption)
+                        .foregroundStyle(Tok.inkFaint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Button("Done") { pasting = false }
+                    Button("Copy reply") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(reply, forType: .string)
+                    }
+                }
+            case .refused(let said), .couldNotRun(let said):
+                Text("That did not answer")
+                    .font(.headline)
+                Text(said)
+                    .font(.caption)
+                    .foregroundStyle(Tok.near)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Button("Done") { pasting = false }
+                }
+            case .asked, .joined:
+                // `tcr peer join --stdin` never mints an ask or prints a bare
+                // joined sentence with no reply blob: those are what the
+                // INVITER's two verbs answer, never what answering one does.
+                EmptyView()
             }
         }
         .padding(20)
         .frame(width: 380)
+    }
+
+    /// The Join button's whole decision: an ask runs captured and stays open
+    /// to show the reply, anything else runs fire-and-forget and closes the
+    /// way this sheet always has.
+    private func joinOrAnswer() {
+        let value = trimmedPastedKey
+        guard !value.isEmpty else { return }
+        if value.hasPrefix(PeerSealedMint.askPrefix) {
+            pastedAnswer = nil
+            controller.answerAsk(value) { pastedAnswer = $0 }
+        } else {
+            controller.run(PeerCommand.join(key: value))
+            pasting = false
+        }
     }
 
     /// Opens the sheet FIRST and fills it in when the invite answers, so a
@@ -1064,6 +1149,8 @@ struct PeersSettingsPane: View {
     /// Swift spelling of what the invite verb already says.
     private func showJoinKey() {
         joinKeyOutcome = nil
+        sealedJoinKeyOutcome = nil
+        showingJoinKeyMode = .key
         showingJoinKey = true
         controller.mintInvite { joinKeyOutcome = $0 }
     }
@@ -1276,11 +1363,21 @@ struct PeersSettingsPane: View {
 
     @State private var advancedOpen = false
     @State private var showingJoinKey = false
+    /// Which segment `showingJoinKey`'s sheet is on. `.key`, so `Show…` keeps
+    /// minting a key the moment it opens, the way it always has.
+    @State private var showingJoinKeyMode: PeerInviteSheet.Mode = .key
     /// `nil` while the invite is in flight. Not an empty string: those are two
     /// different sheets.
     @State private var joinKeyOutcome: PeerInviteMint.Outcome?
+    /// What the sealed segment of `showingJoinKey`'s sheet last answered.
+    @State private var sealedJoinKeyOutcome: PeerSealedMint.Outcome?
     @State private var pasting = false
     @State private var pastedKey = ""
+    /// What answering a pasted ask last answered: a reply to show and copy,
+    /// or a refusal. `nil` is the ordinary paste field, the sheet's own
+    /// default; this is never set at all for a pasted key or link, which
+    /// still run fire-and-forget through ``PeerController/run(_:)``.
+    @State private var pastedAnswer: PeerSealedMint.Outcome?
     @State private var customizing = false
     @State private var confirmingRegenerate = false
     /// The Mac whose sheet is open, and the Mac whose Forget was pressed. Two

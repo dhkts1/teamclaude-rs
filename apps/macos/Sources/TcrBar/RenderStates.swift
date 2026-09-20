@@ -414,6 +414,14 @@ enum RenderStates {
                 }
             }
         }
+        for scene in peerSealedSheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeerSealedSheet(scene, appearance: appearance, into: directory) {
+                    written += 1
+                }
+            }
+        }
         for scene in controlScenes {
             for appearance in Appearance.allCases {
                 attempted += 1
@@ -1850,11 +1858,102 @@ enum RenderStates {
                 .overlay {
                     ZStack {
                         Color.black.opacity(sheetScrimAlpha)
-                        PeerInviteSheet(outcome: scene.outcome)
-                            .background(
-                                RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel)
-                            )
-                            .shadow(radius: sheetShadowRadius)
+                        PeerInviteSheet(
+                            mode: .constant(.key), invite: scene.outcome, sealed: nil
+                        )
+                        .background(
+                            RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel)
+                        )
+                        .shadow(radius: sheetShadowRadius)
+                    }
+                }
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+            return rasterise(
+                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
+
+    /// Six states of the sealed sheet, `w15` since `w14` is the invite
+    /// sheet's plain key. Two ways in: minting an ask and waiting for a
+    /// reply, or opening one that a friend sent back. Both end without a
+    /// six-digit compare: opening a reply runs the join it carries
+    /// immediately, `src/peer/ask.rs`'s own doc.
+    private static var peerSealedSheetScenes:
+        [(name: String, mode: PeerInviteSheet.Mode, sealed: PeerSealedMint.Outcome?)]
+    {
+        [
+            // Neither segment pressed yet: the picker alone, and the two
+            // sentences under it are the whole of the security explanation.
+            ("w15-sealed-pick", .none, nil),
+            // The sealed segment pressed, the ask still minting: the same
+            // in-flight sentence mode A's own nil case draws.
+            ("w15-sealed-ask", .sealed, nil),
+            // The ask minted, the paste field waiting: nothing on this panel
+            // has asked a person to come back later with a string before.
+            (
+                "w15-sealed-waiting",
+                .sealed,
+                .asked(
+                    ask: "tcr-invite:v1:71HFE865V215DE1CTEWH0AVNH9DN65R6PPG2X7R5JQC42EJ5E6RHXQAQPDH4",
+                    sentences: "peer invite: this names no address and grants nothing; "
+                        + "whoever holds it can send you an address and nothing else\n"
+                        + "peer invite: it is good for ten minutes; paste what comes back "
+                        + "with `tcr peer invite --reply --stdin`")
+            ),
+            // A reply opened: no knock, no digits, joined on the spot.
+            (
+                "w15-sealed-joined",
+                .sealed,
+                .joined(
+                    sentences: "peer invite: ok addr=198.51.100.20:7755 file=tcr-peers.json")
+            ),
+            // A reply that does not open: a stale ask, a second paste of one
+            // already spent, or one sealed to a different Mac all read
+            // identically on purpose (`ask::ReplyRefusal`'s own doc).
+            (
+                "w15-sealed-wrong-reply",
+                .sealed,
+                .refused(
+                    "Error: peer join: this reply did not open against anything outstanding "
+                        + "here; it may answer an ask that already expired, was already "
+                        + "spent, or belongs to a different Mac")
+            ),
+            // The reply opened but the dial after it found nobody: the
+            // common failure, and the one a fallback direction would exist
+            // for.
+            (
+                "w15-sealed-no-answer",
+                .sealed,
+                .refused(
+                    "Error: peer join: nothing answered at any address this key carries: "
+                        + "198.51.100.20:7755 (connection refused). That Mac may be asleep "
+                        + "or on another network; ask for a fresh key, or `tcr peer reach` "
+                        + "on that Mac says whether its router forwards the port")
+            ),
+        ]
+    }
+
+    /// The sealed sheet's own scenes, `peerInviteSheetScenes`' shape, over
+    /// the same empty-tab fixture ``inviteSheetTab`` uses.
+    @MainActor
+    private static func renderPeerSealedSheet(
+        _ scene: (name: String, mode: PeerInviteSheet.Mode, sealed: PeerSealedMint.Outcome?),
+        appearance: Appearance,
+        into directory: URL
+    ) -> Bool {
+        withDrawingAppearance(appearance.nsAppearance) {
+            let view =
+                peersPanel(snapshot: inviteSheetTab, dry: false, appearance: appearance)
+                .overlay {
+                    ZStack {
+                        Color.black.opacity(sheetScrimAlpha)
+                        PeerInviteSheet(
+                            mode: .constant(scene.mode), invite: nil, sealed: scene.sealed
+                        )
+                        .background(
+                            RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel)
+                        )
+                        .shadow(radius: sheetShadowRadius)
                     }
                 }
                 .environment(\.colorScheme, appearance == .dark ? .dark : .light)
