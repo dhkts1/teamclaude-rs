@@ -1015,3 +1015,103 @@ fn a_drop_endpoint_sorts_below_a_brief() {
          Mac's own hints, then a friend's word, then a record off a surface nobody here owns"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The loop: a completed session measures, records, and survives a restart
+// ---------------------------------------------------------------------------
+
+/// **A completed `peer hello` measures the path it ran over, and the number
+/// survives into the state file.**
+///
+/// Real on both ends: the shipped listener (`listener::serve_on_with`)
+/// answering a real `Control::Probe`, and `serve::say_hello`, the same
+/// function `tcr peer hello` calls. Nothing here stands in for the prober.
+///
+/// Watched red: before the loop is wired, `say_hello` does not call
+/// `probe::probe_session` at all, so `probe::with_table` never gains a row for
+/// this peer and `state::save_paths` is never called on this session; the
+/// first assertion below fails with "no row for the peer this session dialled".
+#[tokio::test]
+async fn a_completed_hello_measures_the_path_and_it_survives_a_restart() {
+    let listener_dir = tempfile::tempdir().expect("a temp dir for the listener");
+    let listener_key_dir: PathBuf = listener_dir.path().to_path_buf();
+    let listener_peers_path = listener_dir.path().join("tcr-peers.json");
+    let listener_state_path = listener_dir.path().join("peer-state.json");
+
+    let dialer_dir = tempfile::tempdir().expect("a temp dir for the dialer");
+    let dialer_key_dir: PathBuf = dialer_dir.path().to_path_buf();
+    let dialer_peers_path = dialer_dir.path().join("tcr-peers.json");
+
+    let dialer_key = NodeKey::load_or_mint(&dialer_key_dir).expect("the dialer's node key");
+    let listener_key = NodeKey::load_or_mint(&listener_key_dir).expect("the listener's node key");
+
+    // The listener pins the dialer, the way a completed pairing would have
+    // left it.
+    let listener_file = PeerFile {
+        peers: vec![pinned(dialer_key.id().0, "attic-nuc")],
+        ..Default::default()
+    };
+    teamclaude_rs::peer::config::save(&listener_peers_path, &listener_file)
+        .expect("write the listener's peers file");
+
+    let listening = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let listener_addr = listening.local_addr().expect("the bound address");
+    let listener_store =
+        PeerStore::open(&listener_peers_path).expect("open the listener's peers file");
+    let context = SessionContext::new(&listener_key, listener_store.path(), &listener_state_path);
+    tokio::spawn(async move {
+        // Ends when the socket drops, at the end of this test.
+        let _ = listener::serve_on_with(listening, context).await;
+    });
+
+    // The dialer pins the listener at its bound loopback address, the row
+    // `dial_peer_with_endpoint` reads.
+    let mut dialer_row = pinned(listener_key.id().0, "studio-mac");
+    dialer_row.endpoints = vec![Endpoint::direct(
+        listener_addr,
+        FIXED_MS,
+        EndpointSource::Paired,
+    )];
+    let dialer_file = PeerFile {
+        peers: vec![dialer_row],
+        ..Default::default()
+    };
+    teamclaude_rs::peer::config::save(&dialer_peers_path, &dialer_file)
+        .expect("write the dialer's peers file");
+    let dialer_store = PeerStore::open(&dialer_peers_path).expect("open the dialer's peers file");
+
+    let _hello = serve::say_hello(&dialer_store, &PeerId(listener_key.id().0))
+        .await
+        .expect("say_hello did not error")
+        .expect("the listener answered the hello");
+
+    let locator = Locator::Direct {
+        addr: listener_addr,
+    };
+    let measured =
+        probe::with_table(|table| table.stat(&PeerId(listener_key.id().0), &locator).cloned())
+            .expect("the path table's lock is not poisoned")
+            .expect("no row for the peer this session dialled");
+    assert!(
+        measured.rtt_ms.is_some(),
+        "a completed session against a listener that answers probes must leave a round trip, \
+         not {:?}",
+        measured.rtt_ms
+    );
+
+    let dialer_state_path = serve::peer_state_path(&dialer_peers_path);
+    let restored = teamclaude_rs::peer::state::load(&dialer_state_path, FIXED_MS)
+        .expect("the dialer's state file reads");
+    let saved = restored
+        .paths
+        .iter()
+        .find(|stat| stat.peer == PeerId(listener_key.id().0) && stat.locator == locator)
+        .expect("the measured path survived into the state file");
+    assert!(
+        saved.rtt_ms.is_some(),
+        "the row written to disk must carry the round trip, not {:?}",
+        saved.rtt_ms
+    );
+}

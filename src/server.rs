@@ -984,6 +984,31 @@ async fn boot_peer_listener(
     // must not write the real machine's pairing window, knock queue, mutes or
     // bans. See `serve::peer_state_path`.
     let state_path = crate::peer::serve::peer_state_path(peers_path);
+
+    // The path table's boot install: this peers file's `paths` policy, plus
+    // whatever this state file already carries from a probe before this boot.
+    // Without this, every session that completes after boot probes into a
+    // table with no memory of the last one's samples, and the EWMA never gets
+    // past its first sample.
+    match crate::peer::state::load(&state_path, crate::now_ms()) {
+        Ok(state) => {
+            let table = crate::peer::probe::PathTable::new(file.paths.clone(), state.paths);
+            if let Err(err) = crate::peer::probe::install(table) {
+                tracing::warn!(
+                    error = %err,
+                    "peer listener: could not install the path table; this boot starts with \
+                     no measured paths",
+                );
+            }
+        }
+        Err(err) => tracing::warn!(
+            path = %state_path.display(),
+            error = %err,
+            "peer listener: the state file did not read, so the path table starts with no \
+             measurements from before this boot",
+        ),
+    }
+
     // RESTORED, not empty, the review's M2. `Ledger::new()` here was the whole
     // of why two doc-comments promised "restored=N expired=M" and no reader ever
     // saw the line: a restart voided every lease the operator had granted, and a

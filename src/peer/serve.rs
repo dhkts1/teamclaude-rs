@@ -2038,6 +2038,67 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
             "peer hello: this peer is no longer pinned here, so nothing was recorded for it",
         ),
     }
+
+    // The probe rides this session for free: it already paid the round trip a
+    // fresh dial would cost, and the endpoint just learned above and the cost
+    // of reaching it belong in the same write. The table is cloned out of its
+    // lock rather than probed in place, because `probe::with_table` holds a
+    // `std::sync::Mutex` and probing awaits the network between rounds; one
+    // round, on the constants the module already declares.
+    let locator = Locator::Direct { addr: reached };
+    match crate::peer::probe::with_table(|table| table.clone()) {
+        Ok(mut table) => {
+            match crate::peer::probe::probe_session(
+                &mut stream,
+                &mut session,
+                &mut table,
+                locator,
+                1,
+                crate::peer::probe::PROBE_INTERVAL,
+            )
+            .await
+            {
+                Ok(run) => {
+                    tracing::debug!(
+                        peer = %peer.display(),
+                        sent = run.sent,
+                        stop = ?run.stop,
+                        "peer hello: probed this session before it closed",
+                    );
+                    if let Err(err) =
+                        crate::peer::probe::with_table(|installed| *installed = table.clone())
+                    {
+                        tracing::warn!(
+                            peer = %peer.display(),
+                            error = %err,
+                            "peer hello: could not update the path table with this session's \
+                             probe",
+                        );
+                    }
+                    let state_path = peer_state_path(store.path());
+                    if let Err(err) = crate::peer::state::save_paths(&state_path, &table.stats) {
+                        tracing::warn!(
+                            peer = %peer.display(),
+                            error = %err,
+                            "peer hello: could not persist the measured path to the state file",
+                        );
+                    }
+                }
+                Err(err) => tracing::debug!(
+                    peer = %peer.display(),
+                    error = %err,
+                    "peer hello: probing this session failed, and the endpoints learned above \
+                     still stand",
+                ),
+            }
+        }
+        Err(err) => tracing::warn!(
+            peer = %peer.display(),
+            error = %err,
+            "peer hello: could not read the path table, so this session was not probed",
+        ),
+    }
+
     Ok(Some(theirs))
 }
 

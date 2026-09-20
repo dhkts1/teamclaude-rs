@@ -1250,11 +1250,15 @@ fn peer_paths(
                 .path_traffic
                 .iter()
                 .find(|traffic| traffic.peer == row.node && traffic.locator == endpoint.locator);
+            let measured = state
+                .paths
+                .iter()
+                .find(|stat| stat.peer == row.node && stat.locator == endpoint.locator);
             PathStatus {
                 endpoint: address,
                 kind,
-                rtt_ms: None,
-                loss_pct: None,
+                rtt_ms: measured.and_then(|stat| stat.rtt_ms),
+                loss_pct: measured.map(|stat| stat.loss_pct),
                 bytes_per_hour: metered.then(|| {
                     traffic.map_or(0, |row| {
                         rolled(row.bytes_last_hour, row.updated_at_ms, now_ms)
