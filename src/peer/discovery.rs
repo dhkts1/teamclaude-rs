@@ -110,6 +110,23 @@ pub const FOUND_TTL_MS: i64 = 60_000;
 /// NEXT poll, never interrupt one in flight.
 const BROWSE_WINDOW: Duration = Duration::from_millis(1500);
 
+/// How often the serving process wakes to browse for beacons: 20 seconds,
+/// the same cadence [`BEACON_RESTAMP_INTERVAL`] already wakes the announcer
+/// on.
+///
+/// Derived, not chosen. The panel draws a found row's awake dot while the
+/// row's age is under `PeerFormat.awakeWindowSeconds`, 30 s, and a row's
+/// worst age at the moment it is drawn is this interval, plus
+/// [`BROWSE_WINDOW`], plus the panel's own 3 s poll: 20 + 1.5 + 3 = 24.5 s,
+/// inside 30 with margin. At 30 s the dot would blink on and off every cycle
+/// on a Mac that is perfectly healthy; at 20 s it stays steady while beacons
+/// land and dims for exactly one missed scan, which is honest.
+///
+/// [`FOUND_TTL_MS`] is three of these, so two missed scans cost nothing; see
+/// `found_ttl_covers_three_browses` (`tests/peer_discovery.rs`), which is the
+/// test and not this comment that holds the relation.
+pub const BROWSE_INTERVAL: Duration = Duration::from_secs(20);
+
 /// The whole beacon payload, as key/value pairs, built in ONE place so the gate
 /// that asserts what it does not contain has something to read.
 ///
@@ -1070,9 +1087,19 @@ fn admissible_weak_endpoints(
 /// to prevent: the number a reader should have in mind is "two per address
 /// that announced in the last minute".
 ///
-/// **Nothing an announcement says is written to disk.** This type is process
-/// state, held by whatever is rendering; there is no found-list file, which is
-/// why a flood costs memory bounded by the two caps above and nothing else.
+/// **What this type shows is written to disk; what it drops is not.** The
+/// serving process holds one of these in memory across browses and, after
+/// each scan, writes [`Self::shown`] and [`Self::not_shown`] into
+/// `peer-state.json` (`crate::peer::state::PeerState::found`,
+/// `found_not_shown`) so a second process, `tcr peer ls --json`, can answer
+/// with what this Mac has found. The memory bound this paragraph used to
+/// promise is unchanged: a flood still costs at most
+/// `MAX_FOUND_PER_ADDRESS` rows per source address inside one `FOUND_TTL_MS`
+/// window, held in THIS type, in memory, for exactly as long as the beacons
+/// keep coming. What changed is that the bounded, capped, masked projection
+/// this type already computes now reaches disk, and only that projection:
+/// the twelfth row and beyond, and the dropped rows a flood produced past
+/// the per-address cap, never leave this process at all.
 #[derive(Debug, Clone, Default)]
 pub struct FoundList {
     rows: Vec<(Discovered, i64)>,

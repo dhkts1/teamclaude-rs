@@ -180,6 +180,23 @@ pub struct PeerState {
     /// last mapping ended at 18:04" and "nothing ever mapped anything".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<MappingRecord>,
+    /// Macs heard announcing on the LAN in the last
+    /// [`crate::peer::discovery::FOUND_TTL_MS`], not trusted, not pinned. See
+    /// [`Found`]. Written by the serving process's browse task and read by
+    /// `tcr peer ls --json`, the same split `pending` already draws between a
+    /// writer that runs continuously and a reader that runs once per
+    /// invocation.
+    ///
+    /// `FORMAT_VERSION` is **not** bumped for this field: see the module
+    /// docs. An older build reading this file simply does not know the key
+    /// and the `rest` map below carries it forward unread.
+    #[serde(default)]
+    pub found: Vec<Found>,
+    /// How many rows [`Self::found`] is holding back past
+    /// `crate::peer::discovery::MAX_FOUND_ROWS`, the footer line's number.
+    /// Zero when nothing was held back.
+    #[serde(default)]
+    pub found_not_shown: usize,
     /// Every key in this file that this build does not know.
     ///
     /// Kept so a read/modify/write here, `tcr peer pair` opening a two-minute
@@ -398,11 +415,69 @@ impl Knock {
         let Some(port) = self.listen_port else {
             return self.addr.clone();
         };
-        match self.addr.parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V6(host)) => format!("[{host}]:{port}"),
-            Ok(std::net::IpAddr::V4(host)) => format!("{host}:{port}"),
-            Err(_) => self.addr.clone(),
-        }
+        bracketed_dial_address(&self.addr, port)
+    }
+}
+
+/// The one IPv6-bracket rule for turning a bare host and a port into
+/// something `tcr peer pair` can dial: `[host]:port` for IPv6, `host:port`
+/// for IPv4, and the bare host when it parses as neither.
+///
+/// Shared by [`Knock::dial_address`] and [`Found::dial_address`] so the
+/// bracket rule is written once. [`Knock`] has an optional port (a knock from
+/// a build that predates the field carries none); [`Found`] does not, because
+/// the beacon it comes from always carries one.
+fn bracketed_dial_address(addr: &str, port: u16) -> String {
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(host)) => format!("[{host}]:{port}"),
+        Ok(std::net::IpAddr::V4(host)) => format!("{host}:{port}"),
+        Err(_) => addr.to_string(),
+    }
+}
+
+/// One Mac this node heard announce on the LAN: not trusted, not pinned, and
+/// carrying no key to become either. [`Knock`]'s twin for the found list, and
+/// with `Knock`'s own doc discipline: [`Self::addr`] is the key in
+/// [`knock_address`] form, and [`Self::instance_id`] is ephemeral, per boot,
+/// and never identity.
+///
+/// A found row has no field for a static key because a beacon carries none
+/// (`crate::peer::discovery::Discovered`): the six-digit compare on Trust is
+/// what a key comes from, never an announcement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Found {
+    /// Where it announced from, [`knock_address`] form: the bare IP. The key,
+    /// the same way [`Knock::addr`] is: the muted and blocked filters compare
+    /// against this.
+    pub addr: String,
+    /// The ephemeral per-boot id it announced. Never identity. See
+    /// [`tcr_peer_wire::InstanceId`].
+    pub instance_id: InstanceId,
+    /// The name it announced, already whitelisted on arrival by
+    /// `discovery::sanitize_name` and masked again on the way out, the same
+    /// two passes [`Knock::proposed_name`] gets. `None` when it announced no
+    /// name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announced_name: Option<String>,
+    /// The port its beacon said its listener is bound to. Never absent: a
+    /// beacon that carries none is dropped before it reaches this type.
+    pub listen_port: u16,
+    /// When this address and instance id were first observed together, Unix
+    /// milliseconds. Preserved across scans by [`PeerState::observe_found`]
+    /// so a row's age is honest rather than reset every browse.
+    pub first_seen_ms: i64,
+    /// When it was last heard. A row is dropped
+    /// [`crate::peer::discovery::FOUND_TTL_MS`] after this.
+    pub last_seen_ms: i64,
+}
+
+impl Found {
+    /// `host:port`, with the IPv6 bracket rule. The one place a found row's
+    /// dial address is built, the same rule [`Knock::dial_address`] uses and
+    /// the same free function under it: see [`bracketed_dial_address`].
+    pub fn dial_address(&self) -> String {
+        bracketed_dial_address(&self.addr, self.listen_port)
     }
 }
 
@@ -587,10 +662,18 @@ impl PeerState {
     /// Bans are NOT touched: a ban has no deadline by design, and only
     /// `tcr peer unblock` clears one.
     pub fn expire(&mut self, now_ms: i64) -> usize {
-        let before = self.pending.len() + self.muted.len() + self.accepted.len();
+        let before = self.pending.len() + self.muted.len() + self.accepted.len() + self.found.len();
         self.pending
             .retain(|knock| now_ms.saturating_sub(knock.last_seen_ms) < KNOCK_TTL_MS);
         self.muted.retain(|mute| mute.until_ms > now_ms);
+        // A found row is a beacon this node heard, and it ages out on the
+        // same TTL the browse task uses to decide what to show: a Mac whose
+        // beacon stopped is gone from `tcr peer ls --json` within
+        // `FOUND_TTL_MS` of its last announcement, never restored across a
+        // boot older than its TTL.
+        self.found.retain(|row| {
+            now_ms.saturating_sub(row.last_seen_ms) < crate::peer::discovery::FOUND_TTL_MS
+        });
         // A closed window whose handshake LEARNED A STATIC KEY is kept as a
         // record, and it authorizes nothing: [`Self::accepted_window`] reads
         // the clock, so an expired row admits no pairing either way.
@@ -632,7 +715,7 @@ impl PeerState {
                 keep
             });
         }
-        before - (self.pending.len() + self.muted.len() + self.accepted.len())
+        before - (self.pending.len() + self.muted.len() + self.accepted.len() + self.found.len())
     }
 
     /// Whether `addr` is muted right now.
@@ -822,6 +905,53 @@ impl PeerState {
         self.pending
             .iter()
             .filter(|knock| !knock.is_reservation_placeholder())
+            .cloned()
+            .collect()
+    }
+
+    /// Fold one browse's rows into [`Self::found`], preserving each row's
+    /// [`Found::first_seen_ms`] across scans.
+    ///
+    /// `rows` carries whatever the caller just saw, with `first_seen_ms` set
+    /// to `now_ms` on every row: this function is the one place that knows
+    /// better, matching each incoming row against the previous list by
+    /// [`Found::addr`] and [`Found::instance_id`] together (the same pair
+    /// [`crate::peer::discovery::FoundList`] coalesces on) and carrying the
+    /// earlier timestamp forward when it finds one. A row this scan did not
+    /// see is dropped: this is a replace, not a merge, because a Mac that
+    /// stopped announcing must leave, and [`Self::expire`] is the TTL path
+    /// for the ordinary case of a scan simply landing late.
+    pub fn observe_found(&mut self, rows: Vec<Found>, now_ms: i64) {
+        let previous = std::mem::take(&mut self.found);
+        self.found = rows
+            .into_iter()
+            .map(|mut row| {
+                row.first_seen_ms = previous
+                    .iter()
+                    .find(|seen| seen.addr == row.addr && seen.instance_id == row.instance_id)
+                    .map_or(now_ms, |seen| seen.first_seen_ms);
+                row.last_seen_ms = now_ms;
+                row
+            })
+            .collect();
+    }
+
+    /// The found rows an OPERATOR should see: [`Self::found`] minus any row
+    /// whose address is muted or blocked.
+    ///
+    /// Filtered on the way OUT, exactly as [`Self::visible_pending`] filters
+    /// a reservation placeholder: a mute or a ban applies to an address, the
+    /// found list is written by a task that does not consult either, and
+    /// unblocking an address restores its row on the very next read, with no
+    /// wait for another scan. The same key, [`knock_address`] form, that the
+    /// listener already compares an inbound connection against.
+    pub fn visible_found(&self) -> Vec<Found> {
+        self.found
+            .iter()
+            .filter(|row| {
+                !self.muted.iter().any(|mute| mute.addr == row.addr)
+                    && !self.banned.iter().any(|ban| ban.addr == row.addr)
+            })
             .cloned()
             .collect()
     }
@@ -1378,6 +1508,25 @@ pub fn save_paths(path: &Path, paths: &[crate::peer::probe::PathStat]) -> Result
     })
 }
 
+/// Fold one browse's rows into the found list, keeping every other key.
+///
+/// The same locked read-modify-write as [`save_paths`], and its own section
+/// for the same reason: the browse task writes this every
+/// `crate::peer::discovery::BROWSE_INTERVAL` while a knock or an Accept may
+/// be writing the same file, and a whole-state `save` from here would
+/// publish the knock queue as it looked when this browse started.
+///
+/// Read-then-merge, not overwrite: the read this locked call does is what
+/// lets [`PeerState::observe_found`] see the PREVIOUS scan's rows and carry
+/// `first_seen_ms` forward, so a Mac that has been announcing steadily for
+/// ten minutes does not read as freshly found on every browse.
+pub fn save_found(path: &Path, rows: Vec<Found>, not_shown: usize, now_ms: i64) -> Result<()> {
+    replace_section(path, "the found list", move |state| {
+        state.observe_found(rows, now_ms);
+        state.found_not_shown = not_shown;
+    })
+}
+
 /// Replace ONLY the held-mapping record, keeping every other key.
 ///
 /// The same locked read-modify-write as [`save_paths`], and its own section
@@ -1582,6 +1731,48 @@ mod tests {
             capture.count(tracing::Level::INFO, "peer state restored"),
             2,
             "a tick whose numbers moved must log again at INFO, not stay quiet"
+        );
+    }
+
+    fn fixture_found(addr: &str, last_seen_ms: i64) -> Found {
+        Found {
+            addr: addr.to_string(),
+            instance_id: InstanceId([7_u8; tcr_peer_wire::INSTANCE_ID_BYTES]),
+            announced_name: Some("studio-mac".to_string()),
+            listen_port: 7755,
+            first_seen_ms: last_seen_ms,
+            last_seen_ms,
+        }
+    }
+
+    /// **A found row leaves the list once its TTL has passed, and `pending`
+    /// is untouched by the same sweep.**
+    ///
+    /// Watch it fail by removing the `self.found.retain(..)` line from
+    /// [`PeerState::expire`]: the row then survives past
+    /// `discovery::FOUND_TTL_MS` and this assertion catches it still present.
+    #[test]
+    fn a_found_row_leaves_after_its_ttl() {
+        let now = 1_000_000_i64;
+        let mut state = PeerState::default();
+        state.observe_found(vec![fixture_found("198.51.100.7", now)], now);
+        state
+            .reserve_knock_slot("198.51.100.9:5150", now)
+            .expect("reserve a knock slot for the fixture");
+        assert_eq!(state.found.len(), 1, "the found row was written");
+        assert_eq!(state.pending.len(), 1, "the pending row was written");
+
+        let past_ttl = now + crate::peer::discovery::FOUND_TTL_MS + 1;
+        state.expire(past_ttl);
+
+        assert!(
+            state.found.is_empty(),
+            "a found row must leave once its TTL has passed"
+        );
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "the found sweep must not touch pending, which has its own TTL"
         );
     }
 }
