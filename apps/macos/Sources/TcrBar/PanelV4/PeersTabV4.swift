@@ -1195,6 +1195,15 @@ struct PeersTabV4: View {
     /// closure that does nothing, which is a control that lies. So the card
     /// offers it exactly when a caller has handed it a way to perform it.
     var onCheckForUpdates: (() -> Void)?
+    /// Run when **Find Macs on this network** is switched ON, and only then.
+    ///
+    /// The shell asks for notification permission here, which is the first
+    /// moment a knock is possible at all: asking at launch would ask about a
+    /// feature most people never turn on, and asking when a knock arrives
+    /// would put a system prompt on screen at the one moment somebody is
+    /// trying to read a request. Injected, and `{}` in the render harness, so
+    /// a rendered fixture cannot raise a permission prompt.
+    var onFindingTurnedOn: () -> Void = {}
     /// Draw the refusal banner with its raw line already showing.
     ///
     /// `--render-states` only, and it exists because the toggle below it is
@@ -1589,7 +1598,13 @@ struct PeersTabV4: View {
                 : "On announces only that a tcr is here, and this Mac's name if you allow it "
                     + "in Settings. Never its id or its keys. A Mac that appears can do "
                     + "nothing at all until you press Trust on both screens.",
-            yesRole: .plain
+            yesRole: .plain,
+            // Turning finding ON is the moment a knock becomes possible, so it
+            // is the moment this app asks whether it may tell somebody about
+            // one. Off carries nothing: there is nothing to ask about, and a
+            // prompt on the way out would be this app asking for a permission
+            // as the operator shuts the feature down.
+            onTurnedOn: onFindingTurnedOn
         )
         // The strip's own margin collapses into this one only when this card
         // is the FIRST thing under the tabs. A refusal banner or the egress
@@ -1646,7 +1661,8 @@ struct PeersTabV4: View {
         enabled: Bool,
         argv: [String],
         yes: String,
-        yesRole: YesRole
+        yesRole: YesRole,
+        onTurnedOn: (() -> Void)? = nil
     ) -> some View {
         V4Card {
             V4Row {
@@ -1660,7 +1676,14 @@ struct PeersTabV4: View {
                     enabled: enabled && !controller.isPending(argv),
                     label: title,
                     help: yes
-                ) { controller.run(argv) }
+                ) {
+                    controller.run(argv)
+                    // `!isOn` is the state the press MOVES to, which is what
+                    // this card's argv already means (the mockup's rule 4).
+                    // Reading the switch back here would ask a snapshot that
+                    // the verb has not landed in yet.
+                    if !isOn { onTurnedOn?() }
+                }
             }
             yesBlock(yes, role: yesRole)
         }

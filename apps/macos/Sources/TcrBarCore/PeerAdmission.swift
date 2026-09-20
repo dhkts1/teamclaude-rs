@@ -375,6 +375,56 @@ public enum PeerAdmission {
         return "\(count) Macs are asking to connect. Open the Peers tab to answer them."
     }
 
+    /// A notification's title over the Macs it is about: `loft-mini wants to
+    /// connect` for one, `2 Macs want to connect` for several.
+    ///
+    /// One Mac gets ``knockNameLine(_:)``, the card's own headline, so the
+    /// banner and the card a click lands on say the same thing. Several get a
+    /// count and no names: a banner has one line for a title and a list of
+    /// proposed names is the half an operator cannot check.
+    public static func knockNoticeTitle(_ knocks: [PeerKnock]) -> String? {
+        guard let first = knocks.first else { return nil }
+        guard knocks.count > 1 else { return knockNameLine(first) }
+        return "\(knocks.count) Macs want to connect"
+    }
+
+    /// The banner's body: which addresses, how long they stand, and what is
+    /// shared meanwhile.
+    ///
+    /// **The deadline is described here and counted everywhere else**, and
+    /// that contradiction is deliberate. A banner is written once and then
+    /// sits in Notification Centre beside the arrival time macOS keeps for it,
+    /// so `expires in ten minutes` is still true an hour later while `9m`
+    /// would be a lie the moment the user looked away. The figure is
+    /// ``knockExpirySeconds``, said in words in this one place.
+    ///
+    /// Above three addresses the list becomes `<first> and 3 others`, the
+    /// shape the tab's own held-back footer already uses: a banner listing
+    /// eight addresses is a banner nobody reads.
+    public static func knockNoticeBody(_ knocks: [PeerKnock]) -> String? {
+        guard let first = knocks.first else { return nil }
+        let promise =
+            "Nothing is shared until you accept and both screens show the same six digits."
+
+        func addressPhrase(_ knock: PeerKnock) -> String {
+            let named = !(knock.proposedName ?? "").isEmpty
+            return named ? knock.addr : "No name sent"
+        }
+
+        guard knocks.count > 1 else {
+            return "\(addressPhrase(first)) · expires in ten minutes. \(promise)"
+        }
+        let addresses = knocks.map(\.addr)
+        let list: String
+        if knocks.count <= 3 {
+            list = PeerFormat.list(addresses)
+        } else {
+            let others = knocks.count - 1
+            list = "\(first.addr) and \(others) others"
+        }
+        return "\(list) · each expires in ten minutes. \(promise)"
+    }
+
     /// `12 shown, 3 more not shown`, or `nil` when nothing was held back.
     ///
     /// Both numbers, because either alone is a different question: the cap is

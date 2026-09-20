@@ -112,6 +112,87 @@ final class MenuBarKnockWiringTests: XCTestCase {
                 + "draw the knock segment two ways")
     }
 
+    // MARK: - The notification
+
+    /// The centre is built lazily behind the bundle-identifier guard, and the
+    /// probe is what proves the guard is what stops it. `current()` TRAPS in a
+    /// process without one, and three of this app's own entry points run the
+    /// raw binary.
+    func testTheNotificationCentreIsBuiltOnlyBehindTheBundleGuard() throws {
+        let notifier = try source("apps/macos/Sources/TcrBar/KnockNotifier.swift")
+        XCTAssertTrue(
+            notifier.contains("var deliversNotifications: Bool { Bundle.main.bundleIdentifier != nil }"),
+            "the bundle-identifier guard is gone, and UNUserNotificationCenter.current() traps "
+                + "without one")
+        let centre = try slice(
+            notifier, from: "private func centre() -> UNUserNotificationCenter? {",
+            to: "private func post(")
+        XCTAssertTrue(
+            centre.contains("guard deliversNotifications else { return nil }"),
+            "the centre can now be constructed in a process with no bundle identifier")
+        // The BINDING and not the bare name: this file's own doc comments name
+        // `UNUserNotificationCenter.current()` twice while explaining the trap,
+        // and a count of the bare word would be counting prose.
+        XCTAssertEqual(
+            notifier.components(separatedBy: "= UNUserNotificationCenter.current()").count - 1, 1,
+            "a second call site for the centre: one of them will forget the guard")
+        let probe = try source("apps/macos/Sources/TcrBar/ShellProbe.swift")
+        XCTAssertTrue(
+            probe.contains("builtCentre=\\(builtCentre)"),
+            "the shell probe no longer reports whether the render paths built a centre")
+    }
+
+    /// No Accept and no Ignore on the banner: the press that opens a window to
+    /// a stranger's Mac happens on the surface showing the address it is
+    /// opening to. The click opens the Peers tab instead.
+    func testTheBannerCarriesNoAnswersAndOpensTheTab() throws {
+        let notifier = try source("apps/macos/Sources/TcrBar/KnockNotifier.swift")
+        for answer in ["UNNotificationAction", "UNNotificationCategory", "PeerCommand.accept"] {
+            XCTAssertFalse(
+                notifier.contains(answer),
+                "the banner grew an answer button (\(answer)): a misclick there opens a "
+                    + "window to a stranger's Mac from a surface that scrolled the address "
+                    + "out of sight")
+        }
+        XCTAssertTrue(
+            notifier.contains("openPeersTab()"),
+            "a click on the banner no longer opens the tab that can answer it")
+        let shell = try source("apps/macos/Sources/TcrBar/MenuBarShell.swift")
+        XCTAssertTrue(
+            shell.contains("openPeersTab: { [weak self] in self?.openPanel(on: .peers) }"),
+            "the click route no longer opens the panel on the Peers tab")
+        XCTAssertTrue(
+            shell.contains("initialTab: tab"),
+            "opening on a named tab no longer goes through the seam DefaultTabPreference "
+                + "uses, so it would open wherever the panel last was")
+    }
+
+    /// Permission is asked once, at the one moment a knock becomes possible:
+    /// the first time Find Macs is switched ON. Not at launch, and never on
+    /// the way out.
+    func testPermissionIsAskedWhenFindingIsSwitchedOn() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let card = try slice(tab, from: "private var findCard: some View {", to: "private var shareCard")
+        XCTAssertTrue(
+            card.contains("onTurnedOn: onFindingTurnedOn"),
+            "the Find switch no longer asks for notification permission, so the first knock "
+                + "arrives with nothing allowed to say so")
+        let switchCard = try slice(
+            tab, from: "onTurnedOn: (() -> Void)? = nil", to: "// MARK: A peer row")
+        XCTAssertTrue(
+            switchCard.contains("if !isOn { onTurnedOn?() }"),
+            "the ask fires on the state the switch is IN rather than the one it moves to, "
+                + "so turning finding OFF would raise a permission prompt")
+        let notifier = try source("apps/macos/Sources/TcrBar/KnockNotifier.swift")
+        XCTAssertTrue(
+            notifier.contains("guard !askedForPermission"),
+            "the ask is no longer once per process")
+        let app = try source("apps/macos/Sources/TcrBar/TcrBarApp.swift")
+        XCTAssertFalse(
+            app.contains("requestAuthorizationOnce"),
+            "permission is asked at launch again, about a feature most people never turn on")
+    }
+
     // MARK: - The words
 
     /// One Mac and several, and nothing at all at zero.
