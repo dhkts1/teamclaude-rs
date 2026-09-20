@@ -189,6 +189,11 @@ enum RenderStates {
             // ``noRequestsBannerZeroSince`` and ``noRequestsBannerRoute`` for
             // the seeded clock and route.
             ("22-no-requests-banner", .loaded(fleet(zeroRequestsJSON)), false, nil),
+            // The tab strip at the widest counts this panel can reach, which
+            // no other scene draws: every existing fixture badges one or two
+            // digits by accident of its own subject, and the strip's failure
+            // is a width failure. See ``widestTabBadgesFleet``.
+            ("23-widest-tab-badges", .loaded(widestTabBadgesFleet), false, nil),
         ]
     }
 
@@ -2899,6 +2904,44 @@ enum RenderStates {
         )
         return Fleet(
             accounts: base.accounts, unreadable: base.unreadable, sessions: sessionsFixture,
+            sessionsSupported: true)
+    }
+
+    /// Both tab badges at the widest they go: 120 sessions, 12 of them with a
+    /// call running.
+    ///
+    /// The strip is the subject, not the sessions. `Sessions` plus a two-digit
+    /// badge already wants more than an equal quarter of the panel, and until
+    /// this scene existed the worst case any PNG carried was whatever counts a
+    /// fixture built for some other purpose happened to have. Three digits and
+    /// two is the width a real fleet can hand it, so that is what the picture
+    /// has to show.
+    ///
+    /// Deliberately NOT a Sessions-tab scene: it opens on Accounts, where the
+    /// strip sits above cards rather than above 120 rows, because what is being
+    /// reviewed is one line of chrome and a long list underneath it reviews
+    /// nothing.
+    private static var widestTabBadgesFleet: Fleet {
+        let base = fleet(healthyJSON)
+        let firstSeen = Int64(referenceDate.addingTimeInterval(-3600).timeIntervalSince1970 * 1000)
+        let lastSeen = Int64(referenceDate.timeIntervalSince1970 * 1000)
+        // Twelve of the 120 carry one running call each, so `toolsRunning`
+        // reads 12 without inventing a second fixture to count it from.
+        let sessions = (0..<120).map { index in
+            Session(
+                sessionId: String(format: "%08x-0000-0000-0000-000000000000", index),
+                account: base.accounts.first?.name, model: "claude-sonnet-5",
+                firstSeenMs: firstSeen, lastSeenMs: lastSeen, requests: 10,
+                tools: index < 12
+                    ? SessionTools(
+                        calls: 1, errors: 0, timeouts: 0,
+                        running: [
+                            ToolCall(tool: "Bash", commandHead: "cargo build", startedMs: lastSeen)
+                        ])
+                    : SessionTools())
+        }
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable, sessions: sessions,
             sessionsSupported: true)
     }
 

@@ -95,6 +95,30 @@ final class SegmentedTabsFitTests: XCTestCase {
                 + "nothing: it exists because it does not")
     }
 
+    /// The arithmetic above says the fit is AVAILABLE. Whether the strip takes
+    /// it is a property of the view, and only the view can be asked.
+    ///
+    /// Each item is `.frame(maxWidth: .infinity)`, so without these two the
+    /// label accepts an equal quarter of the strip and breaks in half rather
+    /// than asking for the width it needs: the released panel drew `Sess` over
+    /// `ions`. Pinned at the source, because a wrap is invisible to every
+    /// assertion that measures a string instead of a rendered line.
+    func testTheTabLabelAsksForItsOwnWidthAndNeverWraps() throws {
+        let source = try panelSource("PanelV4/SegmentedTabs.swift")
+        let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
+        let label = try XCTUnwrap(
+            squashed.range(of: "Text(tab.title)").map { String(squashed[$0.upperBound...]) },
+            "`Text(tab.title)` is no longer in SegmentedTabs in the shape this test reads")
+        let modifiers = String(label.prefix(300))
+        XCTAssertTrue(
+            modifiers.contains(".lineLimit(1)"),
+            "the tab label may wrap again: no `.lineLimit(1)` on it")
+        XCTAssertTrue(
+            modifiers.contains(".fixedSize(horizontal:true,vertical:false)"),
+            "the tab label takes an equal quarter of the strip again rather than its own "
+                + "width, which is what made \"Sessions\" break in two")
+    }
+
     /// `[label: idealWidth]` for the four segments — the three real tabs plus
     /// the literal "Peers" stand-in (see the class doc-comment).
     private func idealWidths(accountsLabel: String) throws -> [String: CGFloat] {
