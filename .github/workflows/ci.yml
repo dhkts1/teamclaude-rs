@@ -381,7 +381,7 @@ jobs:
     if: needs.changes.outputs.inert != 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 30
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v7
 
