@@ -1966,12 +1966,28 @@ enum RenderStates {
         [PeerListDocument.PeerEntry(id: exitPeerId, name: "studio-mac", trusted: true)]
     }
 
+    /// `healthyJSON`'s `alice` row, verbatim, except its three reset offsets
+    /// are measured from ``peerNow`` rather than the real clock, the one
+    /// difference `exitsCard` needs, since it is the one caller that draws
+    /// this account against a `now` that never moves.
+    private static var exitsAliceJSON: String {
+        let alice = account(
+            "alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130,
+            sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok",
+            sevenDayOiResetInMinutes: 6_498, plan: "Max 20x",
+            orgUuid: "11111111-1111-1111-1111-111111111111", now: peerNow)
+        return "[\(alice)]"
+    }
+
     @MainActor
     private static func exitsCard(_ exit: AccountExit) -> AnyView {
-        // The first row of the healthy fleet, which is `alice`. An empty fleet
-        // would mean this file's own fixture stopped decoding, so the scene
-        // draws nothing rather than a card invented here.
-        guard let account = fleet(healthyJSON).accounts.first else {
+        // `alice`, same figures `healthyJSON` draws elsewhere in this file,
+        // through ``exitsAliceJSON`` rather than `healthyJSON` itself so her
+        // reset captions are pinned to ``peerNow`` instead of the real clock
+        // this card is never drawn against. An empty fleet would mean this
+        // file's own fixture stopped decoding, so the scene draws nothing
+        // rather than a card invented here.
+        guard let account = fleet(exitsAliceJSON).accounts.first else {
             return AnyView(EmptyView())
         }
         return AnyView(
@@ -2230,11 +2246,22 @@ enum RenderStates {
         // Every existing call site keeps the measured 102 it always had;
         // only the no-requests banner scene passes 0, which is the whole
         // fact ``NoRequestsBanner`` reads off this field.
-        requests: Int = 102
+        requests: Int = 102,
+        // What "NOW" means for the three `*ResetInMinutes` offsets above.
+        // Defaults to the real clock, which every existing call site keeps:
+        // those scenes draw through `FleetView`, whose own `now:` is also
+        // the real clock (`AccountsTabV4`'s `now: Date()`), so fixture and
+        // consumer read the same moving instant and the caption stays
+        // correct. `exitsCard` is the one consumer pinned to `peerNow`
+        // instead: it passes `now: peerNow` here so its own fixture's
+        // reset offsets are measured from the same fixed instant its card
+        // renders against, rather than a real `Date()` that keeps moving
+        // out from under a `now` that does not.
+        now: Date = Date()
     ) -> String {
         func resetAtMs(_ minutes: Int?) -> String {
             guard let minutes else { return "null" }
-            let at = Date().addingTimeInterval(Double(minutes) * 60)
+            let at = now.addingTimeInterval(Double(minutes) * 60)
             return "\(Int64(at.timeIntervalSince1970 * 1000))"
         }
         func jsonArray(_ values: [String]) -> String {
