@@ -34,6 +34,26 @@ services:
       internet:
         ipv4_address: 198.51.100.20
 
+  # The wire itself, on home-a: one multicast PTR query for the service type
+  # and every answer that comes back. Run with `docker compose run --rm -T
+  # observer`, not brought up with the cast, because it asks once and exits.
+  #
+  # It exists because nothing in the CLI renders a discovered node: `find on`
+  # browses once and discards the rows, and `peer ls` lists pinned peers. A
+  # discovery assertion that waited for a row in `tcr peer ls --json` would
+  # wait forever.
+  observer:
+    image: python:3.12-alpine
+    # The window, then the address to ask on: home-a is `internal: true`, so
+    # this container has no default route and INADDR_ANY would pick no
+    # interface at all.
+    command: ["python3", "/mdns-observe.py", "10", "10.77.1.20"]
+    volumes:
+      - ./mdns-observe.py:/mdns-observe.py:ro
+    networks:
+      home-a:
+        ipv4_address: 10.77.1.20
+
   router-a:
     image: tcr-harness/router:dev
     cap_add: [NET_ADMIN]

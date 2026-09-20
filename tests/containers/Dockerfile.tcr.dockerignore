@@ -9,3 +9,4 @@
 !assets
 !scripts/install-tcrbar-from-dmg.sh
 !tests/containers/node-entrypoint.sh
+!tests/containers/node-driver.sh

@@ -40,6 +40,10 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates iproute2
 COPY --from=builder /out-tcr /usr/local/bin/tcr
 COPY tests/containers/node-entrypoint.sh /usr/local/bin/node-entrypoint.sh
+# The pairing driver, in the image rather than copied in per run: `tcr peer
+# pair` reads its six digits off a standard input that has to stay open across
+# the far side's Accept, and no sequence of `docker exec` calls can hold one.
+COPY tests/containers/node-driver.sh /usr/local/bin/node-driver.sh
 # Every container HOME is scratch: nothing here ever reads a real config
 # directory, a real cache directory or a real credential.
 ENV HOME=/scratch \
