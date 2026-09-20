@@ -1967,7 +1967,7 @@ enum RenderStates {
     }
 
     /// `healthyJSON`'s `alice` row, verbatim, except its three reset offsets
-    /// are measured from ``peerNow`` rather than the real clock — the one
+    /// are measured from ``peerNow`` rather than the real clock, the one
     /// difference `exitsCard` needs, since it is the one caller that draws
     /// this account against a `now` that never moves.
     private static var exitsAliceJSON: String {
@@ -2253,7 +2253,7 @@ enum RenderStates {
         // the real clock (`AccountsTabV4`'s `now: Date()`), so fixture and
         // consumer read the same moving instant and the caption stays
         // correct. `exitsCard` is the one consumer pinned to `peerNow`
-        // instead — it passes `now: peerNow` here so its own fixture's
+        // instead: it passes `now: peerNow` here so its own fixture's
         // reset offsets are measured from the same fixed instant its card
         // renders against, rather than a real `Date()` that keeps moving
         // out from under a `now` that does not.
