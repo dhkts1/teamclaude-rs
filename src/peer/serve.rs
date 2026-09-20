@@ -2542,6 +2542,64 @@ pub async fn dial_peer_reaching_within(
         }
     }
 
+    // The dead drop, only after every endpoint already on the row (direct or
+    // `Via`) failed, and only for a peer this Mac is allowed to trade
+    // addresses with. Nothing in this build writes a `Via` endpoint onto a
+    // row (see this function's own doc), so trying it here, before a punch or
+    // a third Mac's carried bytes are spent, is equivalent to the design's
+    // "before Via" for every row this build can produce.
+    let dead_drop_file = store.file();
+    if dead_drop_file.dead_drop.is_live() && row.allow.control.drop {
+        let now_s = now_unix_seconds();
+        let drop_slot = crate::peer::drop::current_slot(now_s);
+        if !crate::peer::drop::fetched_this_slot(&row.node, drop_slot) {
+            match dead_drop_file.dead_drop.open_store() {
+                Ok(drop_store) => {
+                    match crate::peer::drop::fetch_for(&drop_store, store.path(), &row.node, now_s)
+                        .await
+                    {
+                        Ok(written) if written > 0 => {
+                            // A write landed on the row: retry the direct
+                            // endpoints once, the design's flowchart. A dead-drop
+                            // record never carries a `Via` endpoint, so there is
+                            // nothing else new to try.
+                            store.reload_if_changed();
+                            if let Some(fresh) = store.row(&row.node) {
+                                for endpoint in dial_order(&fresh) {
+                                    if let Locator::Direct { addr } = endpoint.locator {
+                                        if let Some((reached, stream)) = try_direct_endpoint(
+                                            &fresh,
+                                            addr,
+                                            &rendezvous,
+                                            per_attempt,
+                                        )
+                                        .await
+                                        {
+                                            return Some((Reached::Direct(reached), stream));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => tracing::debug!(
+                            peer = %row.node.display(),
+                            error = %err,
+                            "peer serve: dead drop fetch failed; the dial continues to Via exactly \
+                             as it does today"
+                        ),
+                    }
+                }
+                Err(refusal) => tracing::debug!(
+                    peer = %row.node.display(),
+                    error = %refusal,
+                    "peer serve: dead drop store did not open; the dial continues as it does \
+                     today"
+                ),
+            }
+        }
+    }
+
     // Step 2 of the dial order: a hole punched straight through both routers.
     // Before the carry below and after the row's own endpoints, because a
     // direct socket that works is the better answer and a carry spends a THIRD

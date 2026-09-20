@@ -168,6 +168,14 @@ mod peer_cli {
         Lend(PeerLendArgs),
         /// Choose how this Mac reaches the internet.
         Via(PeerViaArgs),
+        /// Turn this Mac's dead drop on or off: leaving a friend that has also
+        /// moved this Mac's current address on an HTTPS surface you own, and
+        /// reading theirs back. Needs a store (`tcr peer drop-store set`) and
+        /// `control-drop` granted per peer (`tcr peer allow`).
+        Drop(PeerDropArgs),
+        /// Point the dead drop at an HTTPS surface, or show or clear the one
+        /// already set.
+        DropStore(PeerDropStoreArgs),
         /// Show the Macs asking to connect with this one, and nothing else about
         /// them: a request is a row, never a trust decision.
         Pending(PeerPendingArgs),
@@ -270,6 +278,49 @@ mod peer_cli {
         /// `on` or `off`.
         #[arg(value_enum)]
         pub state: Switch,
+    }
+
+    #[derive(clap::Args)]
+    pub struct PeerDropArgs {
+        /// Path to the peers file (default: `tcr-peers.json` in the config directory).
+        #[arg(long)]
+        pub peers: Option<PathBuf>,
+        /// `on` or `off`.
+        #[arg(value_enum)]
+        pub state: Switch,
+    }
+
+    /// `tcr peer drop-store set|show|clear [value]`.
+    ///
+    /// A flat args struct with the action as a positional value, `PeerNetworkKeyArgs`'s
+    /// shape and for the same measured reason: a nested subcommand refuses `--peers`
+    /// placed before the action.
+    #[derive(clap::Args)]
+    pub struct PeerDropStoreArgs {
+        /// Path to the peers file (default: `tcr-peers.json` in the config directory).
+        #[arg(long)]
+        pub peers: Option<PathBuf>,
+        /// Point the store at a template, print what is set, or clear it.
+        #[arg(value_enum)]
+        pub action: PeerDropStoreAction,
+        /// For `set`: the URL template containing `{name}`, used for both the
+        /// publish and the fetch.
+        pub value: Option<String>,
+        /// For `set`: the bearer token. Give the flag with no value to read it
+        /// from standard input instead, so it never enters this process's argv
+        /// or the shell history.
+        #[arg(long, num_args = 0..=1)]
+        pub token: Option<Option<String>>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+    pub enum PeerDropStoreAction {
+        /// Point the store at a template, or a token, or both.
+        Set,
+        /// Print the kind and the template, token redacted.
+        Show,
+        /// Forget the store. Does not turn `peer.drop` off by itself.
+        Clear,
     }
 
     #[derive(clap::Args)]
@@ -507,6 +558,11 @@ mod peer_cli {
         ControlLendable,
         /// Tell this peer this Mac's build and boot id.
         ControlDiag,
+        /// Leave this peer this Mac's current address at the dead drop, and
+        /// apply the address it leaves back. Read on both sides: a peer this
+        /// Mac does not publish for does not get to write endpoints onto its
+        /// row either.
+        ControlDrop,
     }
 
     /// `--peers <path>`, on every verb, for the same reason `--config` is on
@@ -2560,6 +2616,11 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                      makes revocation mesh-wide again"
                 );
             }
+            println!(
+                "peer forget: WARNING if a dead drop was ever on for this peer, it still holds \
+                 the pair's rendezvous secret and can read and write the drop until a re-pair \
+                 mints a new one"
+            );
             Ok(())
         }
         PeerAction::Hello(a) => {
@@ -2630,6 +2691,10 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 peer_cli::PeerGrant::ControlDiag => {
                     row.allow.control.diag = on;
                     "control-diag"
+                }
+                peer_cli::PeerGrant::ControlDrop => {
+                    row.allow.control.drop = on;
+                    "control-drop"
                 }
             };
             peer::config::save(&peers_path, &file)?;
@@ -3271,6 +3336,126 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 }
             }
             Ok(())
+        }
+        PeerAction::Drop(a) => {
+            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let _lock = peer::config::FileLock::acquire(&peers_path)?;
+            let mut file = peer::config::read_or_default(&peers_path)?;
+            let on = matches!(a.state, peer_cli::Switch::On);
+            // Same shape `tcr peer find on` uses when `listen` is absent: say
+            // what to run first and change nothing, rather than writing a
+            // switch that starts no task because `DeadDropConfig::is_live`
+            // needs a store too.
+            if on && file.dead_drop.store.is_none() {
+                println!(
+                    "peer.drop: not turned on, no store is configured yet; run \
+                     `tcr peer drop-store set <url>` first, or `tcr peer drop-store set \
+                     https://paste.example/{{name}}` for the shape it expects"
+                );
+                return Ok(());
+            }
+            file.dead_drop.enabled = on;
+            peer::config::save(&peers_path, &file)?;
+            println!("peer.drop: {}", if on { "on" } else { "off" });
+            if on {
+                println!(
+                    "peer.drop: publishes and fetches only for peers with `control-drop` \
+                     granted (`tcr peer allow <peer> control-drop on`, both Macs); the running \
+                     proxy re-reads this file whenever its mtime moves, so no restart is needed"
+                );
+            }
+            Ok(())
+        }
+        PeerAction::DropStore(a) => {
+            let peers_path = a.peers.clone().unwrap_or_else(peer::config::default_path);
+            let _lock = peer::config::FileLock::acquire(&peers_path)?;
+            let mut file = peer::config::read_or_default(&peers_path)?;
+            match a.action {
+                peer_cli::PeerDropStoreAction::Show => {
+                    match &file.dead_drop.store {
+                        Some(peer::config::StoreConfig::Https { url, token }) => println!(
+                            "peer drop-store: https {url} token={}",
+                            if token.is_some() { "set" } else { "not-set" }
+                        ),
+                        Some(peer::config::StoreConfig::Gist { gist_id, .. }) => println!(
+                            "peer drop-store: gist {gist_id} (this build does not ship a gist \
+                             backend; `tcr peer drop on` refuses with not-configured)"
+                        ),
+                        None => println!("peer drop-store: not-set"),
+                    }
+                    Ok(())
+                }
+                peer_cli::PeerDropStoreAction::Clear => {
+                    let had = file.dead_drop.store.take().is_some();
+                    peer::config::save(&peers_path, &file)?;
+                    println!(
+                        "peer drop-store: {}",
+                        if had {
+                            "cleared"
+                        } else {
+                            "was already not-set"
+                        }
+                    );
+                    Ok(())
+                }
+                peer_cli::PeerDropStoreAction::Set => {
+                    let Some(value) = a.value.clone() else {
+                        anyhow::bail!(
+                            "peer drop-store set: give the url template as an argument, \
+                             containing {{name}}, for example \
+                             `tcr peer drop-store set https://paste.example/{{name}}`"
+                        );
+                    };
+                    if value.starts_with("gist:") {
+                        anyhow::bail!(
+                            "peer drop-store set: this build does not ship a gist backend, \
+                             use an https template instead"
+                        );
+                    }
+                    let token = match a.token {
+                        None => None,
+                        Some(Some(given)) => Some(given),
+                        Some(None) => {
+                            let mut line = String::new();
+                            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+                                .context(
+                                    "peer drop-store set: could not read the token from \
+                                     standard input",
+                                )?;
+                            let trimmed = line.trim().to_string();
+                            if trimmed.is_empty() {
+                                anyhow::bail!(
+                                    "peer drop-store set: --token was given with nothing on \
+                                     standard input"
+                                );
+                            }
+                            Some(trimmed)
+                        }
+                    };
+                    // The construction itself is the refusal for a template
+                    // with no `{name}` placeholder: `DeadDropConfig::open_store`'s
+                    // own doc says this verb should have refused it first, and
+                    // building the real client here is one value read by every
+                    // consumer rather than a second, divergent check.
+                    peer::drop::HttpsTemplateStore::new(&value, token.as_deref())
+                        .map_err(|err| anyhow::anyhow!("peer drop-store set: {err}"))?;
+                    file.dead_drop.store = Some(peer::config::StoreConfig::Https {
+                        url: value.clone(),
+                        token,
+                    });
+                    peer::config::save(&peers_path, &file)?;
+                    println!("peer drop-store: set https {value}");
+                    if file.dead_drop.enabled {
+                        println!(
+                            "peer drop-store: peer.drop is already on, this Mac starts \
+                             publishing to it the next time the proxy starts"
+                        );
+                    } else {
+                        println!("peer drop-store: turn it on with `tcr peer drop on`");
+                    }
+                    Ok(())
+                }
+            }
         }
         PeerAction::Account(a) => run_peer_account(a),
         PeerAction::Status(a) => run_peer_status(a).await,
@@ -3933,6 +4118,31 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     let internal_port = file.listen.map(|listen| listen.port());
     let slot = reach::current_slot(now_unix_secs());
 
+    // The dead drop's own readout: no `drop-status` verb (the design rules
+    // one out), the current answer goes here where an operator already
+    // looks. `lastFetchedAt` is the most recent `EndpointSource::Drop`
+    // endpoint this peer's row holds, the one thing a fetch that actually
+    // wrote something leaves on disk: nothing local records a publish, that
+    // write lands on the store and never on this file, so no publish time is
+    // printed rather than one invented.
+    let drop_slot = peer::drop::current_slot(now_unix_secs());
+    let drop_rows: Vec<(String, tcr_peer_wire::PeerId, String, Option<i64>)> = rows
+        .iter()
+        .filter(|row| row.allow.control.drop)
+        .filter_map(|row| {
+            let secret = row.rendezvous_secret?;
+            let keys = peer::drop::DropKeys::derive(&secret);
+            let name = peer::drop::DropName::for_slot(&keys, &row.node, drop_slot).to_wire();
+            let last_fetched_ms = row
+                .endpoints
+                .iter()
+                .filter(|ep| ep.source == peer::config::EndpointSource::Drop)
+                .map(|ep| ep.observed_at_ms)
+                .max();
+            Some((row.label.clone(), row.node, name, last_fetched_ms))
+        })
+        .collect();
+
     // What a SERVING process recorded, read off the state file and never asked
     // of the router: a probe would change the mapping table it is reporting
     // on, and the keeper inside a running `tcr` already knows the answer.
@@ -4029,6 +4239,17 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
                 })
             })
             .collect();
+        let drop_peers: Vec<serde_json::Value> = drop_rows
+            .iter()
+            .map(|(label, node, name, last_fetched_ms)| {
+                serde_json::json!({
+                    "label": masked_label(label),
+                    "node": node.display(),
+                    "dropName": name,
+                    "lastFetchedAtMs": last_fetched_ms,
+                })
+            })
+            .collect();
         let payload = serde_json::json!({
             "ipv6": v6.iter().map(|addr| addr.to_string()).collect::<Vec<_>>(),
             "gateway": gateway,
@@ -4039,6 +4260,12 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
             "slot": slot,
             "slotSeconds": reach::SLOT_SECONDS,
             "peers": peers,
+            "deadDrop": {
+                "on": file.dead_drop.is_live(),
+                "slot": drop_slot,
+                "slotSeconds": file.dead_drop.slot_seconds,
+                "peers": drop_peers,
+            },
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -4098,6 +4325,32 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
             "{}",
             reach::reach_punch_line(&masked_label(&row.label), &row.node)
         );
+    }
+    if file.dead_drop.is_live() {
+        println!(
+            "reach: dead-drop: on, slot {drop_slot} ({}s each)",
+            file.dead_drop.slot_seconds
+        );
+        if drop_rows.is_empty() {
+            println!(
+                "reach: dead-drop: no peer has both `control-drop` and a completed session yet"
+            );
+        }
+        for (label, node, name, last_fetched_ms) in &drop_rows {
+            println!(
+                "reach: dead-drop: peer: {} {}: name-this-slot: {name}",
+                masked_label(label),
+                node.display()
+            );
+            match last_fetched_ms {
+                Some(ms) => println!("reach: dead-drop: last-fetch-wrote: {ms}"),
+                None => {
+                    println!("reach: dead-drop: last-fetch-wrote: never (or nothing new to write)")
+                }
+            }
+        }
+    } else {
+        println!("reach: dead-drop: off");
     }
     Ok(())
 }

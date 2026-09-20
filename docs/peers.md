@@ -347,6 +347,16 @@ Reaching it tries a few things, in order:
 - **A friend forwards for you.** If both Macs moved, or one sits behind carrier-grade NAT that
   no router mapping can open, a third Mac you have both pinned can pass the encrypted bytes
   between you. It cannot read them, only carry them, and only for one hop.
+- **A dead drop, if you set one up.** If nothing above answers, and you turned this on
+  (`tcr peer drop on`, after pointing it at an HTTPS surface you already own with
+  `tcr peer drop-store set`), each Mac leaves the other its current address there, sealed under
+  a key only the two of you can derive from pairing. The store sees a random name holding random
+  bytes and nothing else: it is not a server of ours and it learns nothing about who talks to
+  whom. Off by default, and both Macs must grant each other `control-drop`
+  (`tcr peer allow <peer> control-drop on`) for it to do anything, the same "read on both sides"
+  rule `briefs` uses. A forgotten Mac keeps its copy of the pair secret until a re-pair mints a
+  new one, so it can still read and write this drop until then; a forged or stale address from
+  it costs one connect timeout, and the pinned static key still refuses the handshake either way.
 
 All of this is opt-in per Mac, off by default, and only for a Mac you have already paired with.
 Over the internet, this Mac never answers a bare knock: only a handshake proving the peer holds
