@@ -502,11 +502,18 @@ fn host_addresses() -> Vec<HostAddress> {
 
 /// [`dial_addresses`] against this Mac's real interfaces and whatever mapping
 /// it is holding right now.
-pub fn local_dial_addresses(listen: SocketAddr) -> Vec<DialAddress> {
+///
+/// `external` overrides [`crate::peer::reach::external_socket`] when given: a
+/// process minting an invite from a shell has run no keeper of its own, so
+/// that register is always empty there, and the caller has already read the
+/// state file a serving process's keeper wrote
+/// ([`crate::peer::reach::recorded_external_socket`]). Only a process that
+/// IS the keeper (the register is non-empty) ever needs the fallback.
+pub fn local_dial_addresses(listen: SocketAddr, external: Option<SocketAddr>) -> Vec<DialAddress> {
     dial_addresses(
         listen,
         &host_addresses(),
-        crate::peer::reach::external_socket(),
+        external.or_else(crate::peer::reach::external_socket),
     )
 }
 
@@ -520,10 +527,11 @@ pub fn mint_invite(
     label: &str,
     ttl_secs: u32,
     uses: u8,
+    external: Option<SocketAddr>,
 ) -> Result<(PendingInvite, JoinToken)> {
     let node = NodeKey::load_or_mint(&default_config_dir())
         .context("peer invite: this node has no keypair to invite anyone to")?;
-    mint_invite_as(store, &node, label, ttl_secs, uses)
+    mint_invite_as(store, &node, label, ttl_secs, uses, external)
 }
 
 /// [`mint_invite`], against an explicit [`NodeKey`].
@@ -538,6 +546,7 @@ pub fn mint_invite_as(
     label: &str,
     ttl_secs: u32,
     uses: u8,
+    external: Option<SocketAddr>,
 ) -> Result<(PendingInvite, JoinToken)> {
     if uses == 0 {
         bail!("peer invite: an invite with zero uses admits nobody");
@@ -559,7 +568,7 @@ pub fn mint_invite_as(
     };
     // Derived BEFORE the invite row is written: a mint that is going to refuse
     // must not leave a live PSK on disk behind it.
-    let addrs = local_dial_addresses(listen);
+    let addrs = local_dial_addresses(listen, external);
     if addrs.is_empty() {
         bail!(
             "peer invite: this Mac listens on {listen} and holds no address a friend could \
@@ -1926,5 +1935,57 @@ mod tests {
             format!("{refusal:#}").contains("not a join key"),
             "the refusal is about the VERSION and not about a field further in"
         );
+    }
+
+    /// **A recorded mapping the caller hands over reaches the token as an
+    /// Internet entry, ranked ahead of every LAN address** this test machine
+    /// happens to hold, not a second guess `mint_invite_as` makes on its own.
+    ///
+    /// The whole reason `external` is a parameter rather than another read of
+    /// `reach::external_socket` inside this function: `tcr peer invite` runs
+    /// as its own process, with no keeper thread to fill that register, so the
+    /// only way a live router mapping ever reaches this token is a caller that
+    /// already read it off the state file and handed it in. The rank check
+    /// stops at "ahead of every LAN entry" rather than "position zero"
+    /// because a real interface list is not this test's to control: a Mac
+    /// running Tailscale ranks its tailnet address first regardless, by
+    /// [`dial_addresses`]'s own documented order.
+    #[test]
+    fn mint_invite_carries_a_handed_in_mapping_as_an_internet_entry() {
+        let dir = tempfile::TempDir::new().expect("a scratch dir");
+        let peers_path = dir.path().join("tcr-peers.json");
+        let file = PeerFile {
+            listen: Some(socket("0.0.0.0:7755")),
+            ..PeerFile::default()
+        };
+        save(&peers_path, &file).expect("the peers file writes");
+
+        let store = PeerStore::open(&peers_path).expect("the store opens");
+        let node = NodeKey::load_or_mint(dir.path()).expect("a node key");
+        let external = socket("198.51.100.9:7755");
+
+        let (_invite, token) = mint_invite_as(&store, &node, "laptop-2", 600, 1, Some(external))
+            .expect("an invite is minted");
+
+        let internet_rank = token
+            .addrs
+            .iter()
+            .position(|entry| entry.addr == external && entry.kind == DialAddressKind::Internet)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the handed-in socket is missing or not marked Internet: {:?}",
+                    token.addrs
+                )
+            });
+        for (rank, entry) in token.addrs.iter().enumerate() {
+            if entry.kind == DialAddressKind::Lan {
+                assert!(
+                    internet_rank < rank,
+                    "the recorded mapping must outrank every LAN address, the one a friend \
+                     off this LAN cannot dial: {:?}",
+                    token.addrs
+                );
+            }
+        }
     }
 }

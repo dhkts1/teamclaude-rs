@@ -1057,6 +1057,77 @@ pub fn record_mappings_at(path: std::path::PathBuf) {
     *held = Some(path);
 }
 
+/// The external socket a live, unexpired mapping in the state file at
+/// `state_path` records, read cold rather than off [`external_socket`].
+///
+/// `tcr peer invite` and `tcr peer moved mint` both run as their own,
+/// short-lived process: neither spawns the keeper that fills
+/// [`mapped_external`], so [`external_socket`] would read `None` in either
+/// one every time, even with a mapping alive on the router right now. The
+/// state file is the one place that mapping is written down for a process
+/// that is not the one holding it, `Manager`'s own keeper saves it there on
+/// every renewal, so this is the single place both verbs read it back from.
+///
+/// The second element is the sentence to say when a record exists but yields
+/// no socket to dial, in the caller's own voice: this function only ever
+/// returns the fact, never prints it, so `mint`'s wording and `invite`'s stay
+/// two calls of the one function, not two copies of the one sentence.
+pub fn recorded_external_socket(
+    state_path: &Path,
+    now_ms: i64,
+) -> (Option<SocketAddr>, Option<String>) {
+    let Some(record) = crate::peer::state::load(state_path, now_ms)
+        .ok()
+        .and_then(|state| state.mapping)
+        .filter(|record| record.expires_at_ms > now_ms)
+    else {
+        return (None, None);
+    };
+
+    match record.external_address.as_deref() {
+        Some(text) => match text.parse::<SocketAddr>() {
+            Ok(addr) => (Some(addr), None),
+            Err(why) => (
+                None,
+                Some(format!(
+                    "the held mapping's external address did not parse ({why})"
+                )),
+            ),
+        },
+        None => (
+            None,
+            Some(
+                "the router mapped a port and would not name its own external address".to_string(),
+            ),
+        ),
+    }
+}
+
+/// The gateway's view of this Mac's address on the internet, NAT-PMP first
+/// and UPnP IGD when NAT-PMP refuses: the same fallback order
+/// [`MappingKeeper::map`] runs for the mapping itself, so `tcr peer reach`
+/// never claims a router answers nothing when it answers over the one
+/// protocol NAT-PMP is not.
+///
+/// The label says which protocol answered, because a router that answers
+/// only one of the two is exactly the case an operator runs this verb to
+/// find out about.
+pub fn external_address_report(
+    client: &NatPmp,
+    discoverer: &crate::peer::reach_upnp::Discoverer,
+) -> String {
+    let nat_pmp_err = match client.external_address() {
+        Ok(found) => return format!("{} (nat-pmp)", found.addr),
+        Err(err) => err,
+    };
+    match crate::peer::reach_upnp::UpnpClient::discover(discoverer)
+        .and_then(|upnp| upnp.get_external_address())
+    {
+        Ok(addr) => format!("{addr} (upnp)"),
+        Err(upnp_err) => format!("unavailable: {nat_pmp_err} (nat-pmp), {upnp_err} (upnp)"),
+    }
+}
+
 /// Publish (or withdraw) the external socket [`external_socket`] reports, and
 /// record it where a CLI can read it.
 ///
@@ -3135,4 +3206,98 @@ pub fn reach_no_mapping_line(failure: &ReachError, listen_port: Option<u16>) -> 
          are left: forward {port} to this Mac by hand in the router's own settings, or put both \
          Macs on one private network (Tailscale, or any VPN they both join) and pair over that"
     ))
+}
+
+#[cfg(test)]
+mod recorded_external_socket_tests {
+    use super::*;
+
+    fn state_path() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().expect("a scratch dir");
+        let path = dir.path().join("peer-state.json");
+        (dir, path)
+    }
+
+    fn record(
+        external_address: Option<&str>,
+        expires_at_ms: i64,
+    ) -> crate::peer::state::MappingRecord {
+        crate::peer::state::MappingRecord {
+            external_address: external_address.map(str::to_string),
+            external_port: 7_755,
+            internal_port: 41_234,
+            expires_at_ms,
+        }
+    }
+
+    /// A live record yields the socket, and nothing to say about it.
+    #[test]
+    fn a_live_record_yields_the_socket() {
+        let (_dir, path) = state_path();
+        let now = 1_000;
+        crate::peer::state::save_mapping(
+            &path,
+            Some(record(Some("198.51.100.9:7755"), now + 120_000)),
+        )
+        .expect("the record writes");
+        let (socket, reason) = recorded_external_socket(&path, now);
+        assert_eq!(socket, Some("198.51.100.9:7755".parse().expect("a socket")));
+        assert_eq!(
+            reason, None,
+            "a live, well-formed record has nothing to explain"
+        );
+    }
+
+    /// A record whose deadline has passed is no mapping, the same rule
+    /// `tcr peer moved mint` already enforced before this function existed.
+    #[test]
+    fn an_expired_record_yields_neither_socket_nor_reason() {
+        let (_dir, path) = state_path();
+        let now = 1_000;
+        crate::peer::state::save_mapping(&path, Some(record(Some("198.51.100.9:7755"), now - 1)))
+            .expect("the record writes");
+        let (socket, reason) = recorded_external_socket(&path, now);
+        assert_eq!(
+            socket, None,
+            "a lapsed deadline is not a mapping to advertise"
+        );
+        assert_eq!(
+            reason, None,
+            "an expired record is silently no mapping, not a mapping this Mac failed to read"
+        );
+    }
+
+    /// The router mapped a port but would not name its own external address:
+    /// nothing to dial, and a sentence saying so.
+    #[test]
+    fn a_record_with_no_external_address_yields_a_reason() {
+        let (_dir, path) = state_path();
+        let now = 1_000;
+        crate::peer::state::save_mapping(&path, Some(record(None, now + 120_000)))
+            .expect("the record writes");
+        let (socket, reason) = recorded_external_socket(&path, now);
+        assert_eq!(socket, None);
+        assert_eq!(
+            reason.as_deref(),
+            Some("the router mapped a port and would not name its own external address")
+        );
+    }
+
+    /// A recorded string that does not parse as a socket is said out loud,
+    /// never silently dropped: it is the difference between a link a friend
+    /// off the LAN can act on and one they cannot.
+    #[test]
+    fn a_record_that_does_not_parse_yields_a_reason() {
+        let (_dir, path) = state_path();
+        let now = 1_000;
+        crate::peer::state::save_mapping(&path, Some(record(Some("not-a-socket"), now + 120_000)))
+            .expect("the record writes");
+        let (socket, reason) = recorded_external_socket(&path, now);
+        assert_eq!(socket, None);
+        let reason = reason.expect("an unparseable record explains itself");
+        assert!(
+            reason.starts_with("the held mapping's external address did not parse ("),
+            "the reason names what went wrong: {reason}"
+        );
+    }
 }

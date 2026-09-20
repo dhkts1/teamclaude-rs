@@ -1712,6 +1712,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
         "laptop-2",
         600,
         1,
+        None,
     )
     .expect("an invite is minted");
 
@@ -1859,7 +1860,7 @@ fn a_one_use_invite_refuses_its_second_joiner() {
     let store = PeerStore::open(&peers).expect("the file opens");
 
     let (invite, _token) =
-        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1)
+        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None)
             .expect("an invite is minted");
     let enroll = Enroll {
         invite_id: 0,
@@ -1916,7 +1917,7 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
     let node = NodeKey::load_or_mint(dir.path()).expect("a keypair");
     let store = PeerStore::open(&peers).expect("the file opens");
     let (invite, _token) =
-        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1)
+        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "laptop-2", 600, 1, None)
             .expect("an invite is minted");
 
     for hostile in ["alice@example.com", "laptop\u{1b}[31m2", "laptop\n2"] {
@@ -2222,7 +2223,7 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
     let node = teamclaude_rs::peer::id::NodeKey::load_or_mint(dir.path())
         .expect("a node key for the registrar");
     let (invite, _token) =
-        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "attic-nuc", 600, 1)
+        teamclaude_rs::peer::pair::mint_invite_as(&store, &node, "attic-nuc", 600, 1, None)
             .expect("an invite is minted");
     let row = teamclaude_rs::peer::pair::accept_enrolment(
         &peers,

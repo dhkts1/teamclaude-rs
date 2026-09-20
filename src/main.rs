@@ -2242,8 +2242,23 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 return Ok(());
             }
             let label = a.label.clone().unwrap_or_else(|| "joining-mac".to_string());
+            // This process runs no keeper of its own, so a live mapping is not
+            // sitting in `reach::external_socket`; it is read off the state
+            // file a serving process wrote, the same reader `peer moved mint`
+            // uses (`peer::reach::recorded_external_socket`).
+            let now_ms = teamclaude_rs::peer::pair::now_ms();
+            let (external, reason) = teamclaude_rs::peer::reach::recorded_external_socket(
+                &peer_state_path(&path),
+                now_ms,
+            );
+            if let Some(reason) = reason {
+                println!(
+                    "peer invite: {reason}, so this key carries what this Mac answers on here \
+                     alone"
+                );
+            }
             let (invite, token) =
-                teamclaude_rs::peer::pair::mint_invite(&store, &label, a.ttl, a.uses)?;
+                teamclaude_rs::peer::pair::mint_invite(&store, &label, a.ttl, a.uses, external)?;
             println!(
                 "peer invite: ok id={} label={} ttl_s={} uses={}",
                 invite.id, invite.label, a.ttl, a.uses
@@ -3029,6 +3044,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     &label,
                     peer::pair::INVITE_DEFAULT_TTL_SECS,
                     1,
+                    None,
                 )?;
                 Some(token)
             } else {
@@ -3480,35 +3496,17 @@ fn run_peer_moved_mint(args: &peer_cli::PeerMovedArgs, peers_path: &Path) -> any
         .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
 
     let now_ms = peer::pair::now_ms();
-    let held = peer::state::load(&peer_state_path(peers_path), now_ms)
-        .ok()
-        .and_then(|state| state.mapping)
-        .filter(|record| record.expires_at_ms > now_ms);
-
-    let external = held.as_ref().and_then(|record| {
-        match record.external_address.as_deref() {
-            Some(text) => match text.parse::<std::net::SocketAddr>() {
-                Ok(addr) => Some(addr),
-                // Said out loud rather than skipped: a held mapping this verb
-                // could not read is the difference between a link a friend off
-                // the LAN can act on and one they cannot.
-                Err(why) => {
-                    println!(
-                        "peer moved: the held mapping's external address did not parse ({why}), \
-                         so this link carries what this Mac answers on here alone"
-                    );
-                    None
-                }
-            },
-            None => {
-                println!(
-                    "peer moved: the router mapped a port and would not name its own external \
-                     address, so this link carries what this Mac answers on here alone"
-                );
-                None
-            }
-        }
-    });
+    // Read off the state file a keeper wrote, not off `reach::external_socket`:
+    // this process has run no keeper of its own, and the reader both `mint`
+    // and `tcr peer invite` share is `peer::reach::recorded_external_socket`.
+    let (external, reason) =
+        peer::reach::recorded_external_socket(&peer_state_path(peers_path), now_ms);
+    // Said out loud rather than skipped: a held mapping this verb could not
+    // read is the difference between a link a friend off the LAN can act on
+    // and one they cannot.
+    if let Some(reason) = reason {
+        println!("peer moved: {reason}, so this link carries what this Mac answers on here alone");
+    }
 
     // The interfaces this Mac holds, in the shape the ranking takes them. The
     // live half of `dial_addresses` reads the external socket off a register a
@@ -3809,10 +3807,6 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
     let mut no_mapping: Option<String> = None;
     let (gateway, external, mapping) = match &client {
         Ok(client) => {
-            let external = match client.external_address() {
-                Ok(found) => format!("{}", found.addr),
-                Err(err) => format!("unavailable: {err}"),
-            };
             let mapping = match (args.map, internal_port) {
                 (false, _) => "not asked for (pass --map)".to_string(),
                 (true, None) => {
@@ -3854,6 +3848,11 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
                     }
                 }
             };
+            // Computed AFTER the mapping attempt above: the same UPnP
+            // discovery the mapping arm just ran, run again this line's own
+            // way, so this probe never contends with the one that actually
+            // grants the lease.
+            let external = reach::external_address_report(client, &reach::upnp_discoverer());
             (format!("{}", client.gateway()), external, mapping)
         }
         Err(err) => (
