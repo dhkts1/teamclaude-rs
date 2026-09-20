@@ -84,19 +84,96 @@ final class AccountCardNameRoomTests: XCTestCase {
 
     /// Which piece gives way is a priority order, not an arithmetic fact, so
     /// the arithmetic above cannot see it. Pinned at the source: strictly
-    /// descending down the row, name first.
-    func testTheNameOutranksTheDomainAndThePlanInTheRowItself() throws {
+    /// descending down the row, name first, then the plan, then the handle.
+    ///
+    /// The plan sits ABOVE the handle because it is drawn only when it has
+    /// been measured to fit beside a handle at its floor. Below it, the plan is
+    /// squeezed first and a card with room for both draws a one-letter plan
+    /// over a barely-shortened handle, which is what shipped for one commit.
+    func testTheNameOutranksThePlanAndThePlanOutranksTheHandle() throws {
         let source = try panelSource("PanelV4/AccountCard.swift")
         let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
         let name = try priority(after: "Text(localPart)", in: squashed)
         let domain = try priority(after: "Text(domain)", in: squashed)
         let plan = try priority(after: "MuteText(text:plan)", in: squashed)
         XCTAssertGreaterThan(
-            name, domain,
-            "the domain no longer gives way before the name (name \(name), domain \(domain))")
+            name, plan,
+            "the plan no longer gives way before the name (name \(name), plan \(plan))")
         XCTAssertGreaterThan(
-            domain, plan,
-            "the plan no longer gives way before the domain (domain \(domain), plan \(plan))")
+            plan, domain,
+            "the handle no longer gives way before the plan, so a plan this row measured room "
+                + "for can still be cut to a letter (plan \(plan), handle \(domain))")
+    }
+
+    // MARK: - Whole or not at all
+
+    /// The card that drew `T`. Measured, it was never short of room: a grouped
+    /// card with a short name has 148.3 pt and needs 113.2 beside a handle at
+    /// its floor. What cut the plan was the layout order, not the width, so the
+    /// plan is drawn here and the handle is what gives way.
+    func testTheGroupedCardThatDrewOneLetterHasTheRoomForItsWholePlan() throws {
+        let available = try nameRoom(pills: ["Group only", "OK"], compact: true)
+        XCTAssertTrue(
+            try drawsPlan(name: "bob@example.com", plan: "Team 5x", available: available),
+            "a grouped card with \(pt(available)) draws no plan, though a whole one fits "
+                + "beside a truncated handle")
+    }
+
+    /// The other arm, and a real card rather than a contrived one: the same
+    /// grouped width with a longer name and a longer plan genuinely does not
+    /// fit, so nothing is drawn rather than a piece of something.
+    func testAGroupedCardWithNoRoomDrawsNoPlanAtAll() throws {
+        let available = try nameRoom(pills: ["Group only", "OK"], compact: true)
+        XCTAssertFalse(
+            try drawsPlan(
+                name: "member2@example.com", plan: "Team Standard", available: available),
+            "the card still draws a plan it would have to cut: \(pt(available)) available")
+    }
+
+    /// The loose card in the same fixture has the room, so it keeps its plan
+    /// whole. Both halves of the rule in two tests, because a rule that only
+    /// ever hides things is indistinguishable from deleting the plan.
+    func testALooseCardWithRoomDrawsItsPlanWhole() throws {
+        let available = try nameRoom(pills: ["OK"])
+        XCTAssertTrue(
+            try drawsPlan(name: "alice@example.com", plan: "Max 20x", available: available),
+            "the ordinary healthy card no longer draws its plan: \(pt(available)) available")
+    }
+
+    /// A short name with nothing beside it is the easiest case there is, and a
+    /// rule that got it wrong would be hiding the plan on every card.
+    func testAShortNameWithNoPillsDrawsItsPlan() throws {
+        XCTAssertTrue(
+            try drawsPlan(
+                name: "gil@example.com", plan: "Team 5x", available: try nameRoom(pills: [])))
+    }
+
+    /// The handle is the piece that still truncates, so the plan is judged
+    /// against a handle shrunk to its floor rather than its full width. Without
+    /// that, a long domain would take the plan down with it even on a card with
+    /// room for both.
+    func testThePlanIsJudgedAgainstATruncatedHandleNotAFullOne() throws {
+        let available = try nameRoom(pills: ["OK"])
+        let nameSize = try densityToken("nameSize")
+        XCTAssertLessThan(
+            NameRowFit.handleFloorWidth(size: nameSize),
+            measure("@a-very-long-domain-name.example.com", size: nameSize, weight: .medium),
+            "the handle floor is not below a full long domain, so it is not a floor")
+        XCTAssertTrue(
+            try drawsPlan(
+                name: "gil@a-very-long-domain-name.example.com", plan: "Team 5x",
+                available: available),
+            "a long handle took the plan down with it, though the handle is the piece that "
+                + "gives way first")
+    }
+
+    private func drawsPlan(name: String, plan: String, available: CGFloat) throws -> Bool {
+        let at = name.firstIndex(of: "@")
+        return NameRowFit.drawsPlan(
+            localPart: at.map { String(name[name.startIndex..<$0]) } ?? name,
+            domain: at.map { String(name[$0...]) }, plan: plan, available: available,
+            nameSize: try densityToken("nameSize"), planSize: try densityToken("muteSize"),
+            gap: try token("tabGap"))
     }
 
     /// The first `.layoutPriority(<n>)` after a marker, in whitespace-squashed
@@ -121,17 +198,21 @@ final class AccountCardNameRoomTests: XCTestCase {
     /// trailing: { pills } ; actions() }`, `V4Row` itself an `HStack(spacing:
     /// rowGap)` whose trailing column is `fixedSize()`, so every term below is
     /// a width the name row can never take back.
-    private func nameRoom(pills: [String]) throws -> CGFloat {
+    private func nameRoom(pills: [String], compact: Bool = false) throws -> CGFloat {
         let panelWidth = try token("panelWidth")
         let panelPaddingSide = try token("panelPaddingSide")
         let cardInsetH = try densityToken("cardPaddingH") + (try token("panelBorderWidth"))
         let rowGap = try densityToken("rowGap")
         let pillGap = try token("pillGap")
-        let inner = panelWidth - 2 * panelPaddingSide - 2 * cardInsetH
+        // A card inside a group box loses that box's side padding and stroke
+        // on both edges before it starts.
+        let groupInset =
+            compact ? 2 * ((try token("groupPaddingSide")) + (try token("groupStroke"))) : 0
+        let inner = panelWidth - 2 * panelPaddingSide - groupInset - 2 * cardInsetH
         let block =
             try pills.map { try pillWidth($0) }.reduce(0, +)
-            + pillGap * CGFloat(pills.count - 1)
-        return inner - pillGap - (try gearWidth()) - rowGap - block
+            + pillGap * CGFloat(max(pills.count - 1, 0))
+        return inner - pillGap - NameRowFit.actionsSlotWidth - rowGap - block
     }
 
     /// An outlined `V4Pill`: the word uppercased at the pill font, its tracking
@@ -167,21 +248,11 @@ final class AccountCardNameRoomTests: XCTestCase {
         return width
     }
 
-    /// The actions gear, at the body size ``AccountRow`` draws it in. An
-    /// `Image(systemName:)` is the one term here with no token to read, so it
-    /// is measured as the symbol itself rather than guessed at.
-    private func gearWidth() throws -> CGFloat {
-        let configured = try XCTUnwrap(
-            NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil),
-            "the gearshape symbol did not resolve, so the header's trailing width is unknown"
-        )
-        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
-        return try XCTUnwrap(configured).size.width
-    }
-
+    /// The card's own measurement, not a second copy of it: the card decides
+    /// what to draw with ``NameRowFit``, and a test that measured strings its
+    /// own way would agree with the card only until one of them was edited.
     private func measure(_ string: String, size: CGFloat, weight: NSFont.Weight) -> CGFloat {
-        (string as NSString)
-            .size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: weight)]).width
+        NameRowFit.textWidth(string, size: size, weight: weight)
     }
 
     private func pt(_ value: CGFloat) -> String {
