@@ -63,6 +63,55 @@ final class AccountCardNameRoomTests: XCTestCase {
         XCTAssertLessThan(reserved, healthy)
     }
 
+    /// The control account's card is the crowded one: it carries a second pill
+    /// that no ordinary card does, and it is the account every quota figure on
+    /// the panel is measured through, so it is the worst card to be unable to
+    /// name. Its whole name fits; its plan is what gives way.
+    func testTheControlCardKeepsItsWholeNameAndGivesUpThePlanInstead() throws {
+        let room = try nameRoom(pills: ["Control", "OK"])
+        let nameOnly = try nameRowIdealWidth(name: accountName, plan: nil)
+        let withPlan = try nameRowIdealWidth(name: accountName, plan: planLabel)
+
+        XCTAssertLessThanOrEqual(
+            nameOnly, room,
+            "the control card cannot draw \"\(accountName)\" whole: it wants "
+                + "\(pt(nameOnly)) and the header leaves \(pt(room))")
+        XCTAssertGreaterThan(
+            withPlan, room,
+            "name and plan both fit here, so nothing has to give way and this test is "
+                + "measuring nothing")
+    }
+
+    /// Which piece gives way is a priority order, not an arithmetic fact, so
+    /// the arithmetic above cannot see it. Pinned at the source: strictly
+    /// descending down the row, name first.
+    func testTheNameOutranksTheDomainAndThePlanInTheRowItself() throws {
+        let source = try panelSource("PanelV4/AccountCard.swift")
+        let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
+        let name = try priority(after: "Text(localPart)", in: squashed)
+        let domain = try priority(after: "Text(domain)", in: squashed)
+        let plan = try priority(after: "MuteText(text:plan)", in: squashed)
+        XCTAssertGreaterThan(
+            name, domain,
+            "the domain no longer gives way before the name (name \(name), domain \(domain))")
+        XCTAssertGreaterThan(
+            domain, plan,
+            "the plan no longer gives way before the domain (domain \(domain), plan \(plan))")
+    }
+
+    /// The first `.layoutPriority(<n>)` after a marker, in whitespace-squashed
+    /// source.
+    private func priority(after marker: String, in squashed: String) throws -> Double {
+        let tail = try XCTUnwrap(
+            squashed.range(of: marker).map { String(squashed[$0.upperBound...]) },
+            "`\(marker)` is no longer in AccountCard's name row in the shape this test reads")
+        let value = try XCTUnwrap(
+            firstCapture(of: "^[\\s\\S]{0,400}?\\.layoutPriority\\((-?[0-9.]+)\\)", in: tail),
+            "`\(marker)` carries no `.layoutPriority(...)` within the row, so the order the "
+                + "card documents is not the order it lays out")
+        return try XCTUnwrap(Double(value))
+    }
+
     // MARK: - The header's own arithmetic
 
     /// What is left of the card's inner width for the name row, once the
@@ -194,6 +243,10 @@ final class AccountCardNameRoomTests: XCTestCase {
     }
 
     private func v4Source() throws -> String {
+        try panelSource("PanelV4/V4.swift")
+    }
+
+    private func panelSource(_ relative: String) throws -> String {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // -> TcrBarTests
             .deletingLastPathComponent()  // -> Tests
@@ -201,7 +254,7 @@ final class AccountCardNameRoomTests: XCTestCase {
             .deletingLastPathComponent()  // -> apps
             .deletingLastPathComponent()  // -> repo root
         return try String(
-            contentsOf: repoRoot.appendingPathComponent(
-                "apps/macos/Sources/TcrBar/PanelV4/V4.swift"), encoding: .utf8)
+            contentsOf: repoRoot.appendingPathComponent("apps/macos/Sources/TcrBar/\(relative)"),
+            encoding: .utf8)
     }
 }

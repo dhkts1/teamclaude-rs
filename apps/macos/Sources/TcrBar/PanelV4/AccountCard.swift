@@ -217,25 +217,33 @@ struct AccountCard<Actions: View>: View {
     /// Round 1 gave `.compact` a `ViewThatFits` that wrapped the plan onto a
     /// second line when the pair did not fit — that is what the mockup's own
     /// `henry1@example.com` / `Team Standard` two-line card shows, because
-    /// round 1 did not restructure those two rows. Round 2 does: the mockup's
-    /// `.name .dom` gives way FIRST, so the card never grows a line for the
-    /// plan, in either shape — Gil approved the render this way 2026-09-13.
+    /// round 1 did not restructure those two rows. Round 2 does: the card
+    /// never grows a line for the plan, in either shape.
+    ///
+    /// WHICH piece gives way was decided on a render on 2026-09-13, the domain
+    /// first and the plan never, and reopened by the owner on 2026-09-20 asking
+    /// for the name's room back. The order is now plan, then domain, then the
+    /// name: the name is the only piece that says WHICH account this card is,
+    /// the plan is repeated across most of the fleet, and the domain is
+    /// usually the same one twice over. A control account's card carries a
+    /// second pill and is the case where the difference shows.
     @ViewBuilder
     private var nameRow: some View {
         HStack(alignment: .firstTextBaseline, spacing: V4.tabGap) {
-            // NEITHER of these two takes `.fixedSize()` — that forces a view
+            // NONE of these three takes `.fixedSize()` — that forces a view
             // to its ideal width regardless of what the row can actually
             // give it, which is the opposite of "never truncated": measured
             // on `01g-widest-row`, it overflowed the row's whole HStack and
-            // corrupted the layout above it. `layoutPriority` is what the
-            // mockup's "domain gives way FIRST" needs: default priority
-            // (0) here beats the domain's lowered one below, so `HStack`
-            // asks the domain to shrink before it asks either of these to.
+            // corrupted the layout above it. `layoutPriority` is what orders
+            // the three instead: `HStack` asks the lowest priority to shrink
+            // first, so the plan gives way, then the domain, and the name
+            // last.
             Text(localPart)
                 .font(V4.font(V4.nameSize, .semibold))
                 .tracking(V4.nameTracking)
                 .foregroundStyle(Tok.ink)
                 .lineLimit(1)
+                .layoutPriority(1)
             if let domain {
                 Text(domain)
                     .font(V4.font(V4.nameSize, .medium))
@@ -246,6 +254,7 @@ struct AccountCard<Actions: View>: View {
             }
             if let plan = planName {
                 MuteText(text: plan)
+                    .layoutPriority(-2)
             }
         }
         .frame(minHeight: V4.lineHeight(V4.nameSize), alignment: .leading)
