@@ -100,6 +100,70 @@ wait_for_log() {
   return 1
 }
 
+# wait_router_log <service> <regex> [seconds]
+# The router image's entrypoint prints to its own stdout, never to a
+# /scratch/boot.log file the way a node's server does, so a router's readiness
+# is read off `docker logs` and not `wait_for_log`. Same shape otherwise:
+# prints the newest matching line, or nothing after the deadline.
+wait_router_log() {
+  service="$1"
+  pattern="$2"
+  seconds="${3:-30}"
+  i=0
+  while [ "$i" -lt "$seconds" ]; do
+    line="$("$DOCKER" logs "$(cname "$service")" 2>&1 | grep -E "$pattern" | tail -1)"
+    if [ -n "$line" ]; then
+      echo "$line"
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# up_with_routers <router...> -- <node...>
+# The three router-free scenarios use `up`, which waits for "peer listener up"
+# on every service it is handed; a router never prints that line, so a
+# scenario that casts one brings it up separately and waits on
+# `wait_router_log` instead. Routers first: a node's boot writes a default
+# route through its router, and NAT-PMP's probe needs somewhere to land from
+# the moment the node's listener opens.
+up_with_routers() {
+  routers=""
+  nodes=""
+  side=routers
+  for arg in "$@"; do
+    if [ "$arg" = "--" ]; then
+      side=nodes
+      continue
+    fi
+    if [ "$side" = routers ]; then
+      routers="$routers $arg"
+    else
+      nodes="$nodes $arg"
+    fi
+  done
+  # shellcheck disable=SC2086 # a deliberately space-separated list of names
+  dc up -d $routers $nodes >/dev/null 2>&1 || {
+    fail "compose up $routers $nodes refused"
+    return 1
+  }
+  for router in $routers; do
+    if ! wait_router_log "$router" "^router: up:" 60 >/dev/null; then
+      fail "$router: no 'router: up:' in its log within 60s"
+      return 1
+    fi
+  done
+  for node in $nodes; do
+    if ! wait_for_log "$node" "peer listener up" 90 >/dev/null; then
+      fail "$node: no 'peer listener up' in its boot log within 90s"
+      return 1
+    fi
+  done
+  return 0
+}
+
 # This node's own peer id, in the SHORT form `tcr peer id` prints, `tcr-` plus
 # the first ten characters of the wire form.
 #
