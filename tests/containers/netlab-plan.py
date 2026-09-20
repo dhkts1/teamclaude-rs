@@ -8,15 +8,25 @@ that executes it is a POSIX shell.
 
 Lines, in the order they must be applied:
 
-    lan   <name> <bridge> <cidr>
-    host  <name> <lan> <ip> <prefixlen> <gw|-> <role> <listen-port> <proxy-port> <find> <announce>
-    extra <name> <lan> <ip> <prefixlen>
+    lan    <name> <bridge> <cidr>
+    host   <name> <lan> <ip> <prefixlen> <gw|-> <role> <listen-port> <proxy-port> <find> <announce> <upnp>
+    extra  <name> <lan> <ip> <prefixlen>
+    client <name> <node> <rate> <bodyBytes> <count>
 
 A host's `extra` list is a second (or third) veth into a namespace `host`
 already created, for the one cast namespace membership does not cover: a Mac
 with a LAN address and an overlay address at once. The primary line still
 carries the role, the ports and the discovery opt-ins; an extra line carries
 nothing but where the wire goes.
+
+`upnp` is read only for `role: router`: `on` starts miniupnpd on the router's
+outside interface, lifted from `router-entrypoint.sh`. A router's own outside
+network is its one `extra` entry; the inside network is its primary `lan`.
+
+`clients` is a separate top-level list, not a host: a client is a process
+inside a node's OWN namespace, not a Mac of its own, because the proxy binds
+loopback and nothing outside that namespace could reach it
+(`src/server.rs:1977-1979`).
 """
 
 import json
@@ -29,7 +39,7 @@ def main(path):
         print(f"lan {lan['name']} {lan['bridge']} {lan['cidr']}")
     for host in topo["hosts"]:
         print(
-            "host {name} {lan} {ip} {prefix} {gw} {role} {listen} {proxy} {find} {announce}".format(
+            "host {name} {lan} {ip} {prefix} {gw} {role} {listen} {proxy} {find} {announce} {upnp}".format(
                 name=host["name"],
                 lan=host["lan"],
                 ip=host["ip"],
@@ -40,6 +50,7 @@ def main(path):
                 proxy=host.get("proxy", 8088),
                 find=host.get("find", "off"),
                 announce=host.get("announceName", "off"),
+                upnp=host.get("upnp", "off"),
             )
         )
         for net in host.get("extra", []):
@@ -51,6 +62,16 @@ def main(path):
                     prefix=net.get("prefix", 24),
                 )
             )
+    for client in topo.get("clients", []):
+        print(
+            "client {name} {node} {rate} {body} {count}".format(
+                name=client["name"],
+                node=client["node"],
+                rate=client.get("rate", 1),
+                body=client.get("bodyBytes", 256),
+                count=client.get("count", 10),
+            )
+        )
 
 
 if __name__ == "__main__":

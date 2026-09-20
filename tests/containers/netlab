@@ -74,8 +74,25 @@ attach_host() {
   echo 1 > "$LAB/$name/.ifcount"
 }
 
+# True when $1 is a dotted address in 100.64.0.0/10, the tailnet-shaped range
+# `pair::is_tailnet` (src/peer/pair.rs) reads. Read as two fields rather than
+# matched against a case glob, because a glob covering 64-127 in the second
+# octet is the kind of pattern nobody rereads correctly a year later.
+is_overlay_addr() {
+  addr="$1"
+  first="$(echo "$addr" | awk -F. '{print $1}')"
+  second="$(echo "$addr" | awk -F. '{print $2}')"
+  [ "$first" = "100" ] && [ "$second" -ge 64 ] 2>/dev/null && [ "$second" -le 127 ] 2>/dev/null
+}
+
 # A second (or third) interface into a namespace `attach_host` already made.
-# Numbered eth1, eth2, ... because eth0 is the primary attach_host gave it.
+# Numbered eth1, eth2, ... because eth0 is the primary attach_host gave it,
+# UNLESS the address is in the tailnet-shaped overlay range: `node-entrypoint.sh`
+# (the compose harness) attaches that wire as an ordinary bridge interface and
+# then renames it to utun0, because `pair::is_tailnet` ranks an address first
+# only when the interface holding it is also named that. A namespace lab
+# creates the wire after `next_wire`, so it can give it the right name up
+# front and skip the rename dance entirely.
 attach_extra() {
   # $1 name, $2 bridge, $3 ip, $4 prefix
   name="$1"; bridge="$2"; addr="$3"; prefix="$4"
@@ -83,12 +100,17 @@ attach_extra() {
   idx="$(cat "$LAB/$name/.ifcount" 2>/dev/null || echo 1)"
   idx=$((idx + 1))
   echo "$idx" > "$LAB/$name/.ifcount"
+  if is_overlay_addr "$addr"; then
+    ifname="utun0"
+  else
+    ifname="eth$idx"
+  fi
   ip link add "h$w" type veth peer name "p$w"
   ip link set "p$w" master "$bridge" up
   ip link set "h$w" netns "$name"
-  ip -n "$name" link set "h$w" name "eth$idx"
-  ip -n "$name" addr add "$addr/$prefix" dev "eth$idx"
-  ip -n "$name" link set "eth$idx" up
+  ip -n "$name" link set "h$w" name "$ifname"
+  ip -n "$name" addr add "$addr/$prefix" dev "$ifname"
+  ip -n "$name" link set "$ifname" up
 }
 
 # The node recipe, lifted from tests/containers/node-entrypoint.sh: the same
@@ -101,7 +123,7 @@ start_node() {
   peers="$home/.config/tcr-peers.json"
   cat > "$config" <<JSON
 {
-  "proxy": { "port": $proxy },
+  "proxy": { "port": $proxy, "apiKey": "fake-netlab-proxy-key" },
   "upstream": "$UPSTREAM_URL",
   "quotaProbeSeconds": 0,
   "warmupSeconds": 0,
@@ -148,12 +170,136 @@ start_upstream() {
   echo "$!" > "$home/pid"
 }
 
-wait_listener() {
-  # $1 name, $2 seconds
-  name="$1"; seconds="${2:-60}"
+# A client is a process, never a Mac: it runs inside a NODE's own namespace
+# (netlab-client.py, the "run as a process in the node's OWN namespace"
+# reason is in its own header) rather than getting a namespace of its own, so
+# there is no bridge wire for it and its home directory holds only its log
+# and pid, never an addr file. Backgrounded, bounded by <count>, so `netlab
+# up` returns as soon as every role has STARTED rather than waiting for every
+# client's run to finish.
+start_client() {
+  # $1 client name, $2 target node, $3 rate/sec, $4 body bytes, $5 count
+  name="$1"; node="$2"; rate="$3"; body="$4"; count="$5"
+  home="$LAB/$node"
+  client_home="$LAB/$name"
+  mkdir -p "$client_home"
+  ip netns exec "$node" env HOME="$home" python3 "$SRC/netlab-client.py" \
+    "$home/.config/teamclaude.json" "$rate" "$body" "$count" \
+    >"$client_home/client.log" 2>&1 &
+  echo "$!" > "$client_home/pid"
+}
+
+# The interface INSIDE namespace $1 holding an address in $2 (a bare dotted
+# prefix such as "10.77.1"), derived rather than assumed. Lifted from
+# router-entrypoint.sh's `iface_for`: Docker's interface order was the reason
+# there; here the reason is that `attach_host` gives the primary wire eth0 and
+# `attach_extra` gives the next one eth1, eth2, ..., and deriving from the
+# address rather than trusting that numbering is the same fact either harness
+# needs proven, not assumed.
+iface_for_ns() {
+  ns="$1"; want="$2."
+  ip -n "$ns" -o -4 addr show | awk -v want="$want" '$4 ~ "^"want {print $2; exit}'
+}
+
+# The router role: NAT between an inside LAN (this namespace's primary wire)
+# and an outside one (its one `extra` wire), and optionally miniupnpd.
+# Lifted from router-entrypoint.sh, keeping its interface derivation and its
+# iptables-legacy reasoning for miniupnpd's chains; the parts that do not
+# carry over are the ones that were about Docker, not about NAT: no
+# `wait_for_iface` (attach_host and attach_extra already ran before this is
+# called), no `docker run --sysctl` (there is no per-namespace equivalent, so
+# ip_forward is written here directly), and no shared /etc/miniupnpd/ (a mount
+# namespace is not per network-namespace, so two routers in one container
+# would collide on one file; each writes its own under /lab/<name>/).
+start_router() {
+  # $1 name, $2 inside cidr, $3 outside cidr, $4 upnp (on/off)
+  name="$1"; inside_cidr="$2"; outside_cidr="$3"; upnp="$4"
+  home="$LAB/$name"
+  mkdir -p "$home"
+  inside_prefix="${inside_cidr%.*/*}"
+  outside_prefix="${outside_cidr%.*/*}"
+  inside_if="$(iface_for_ns "$name" "$inside_prefix")"
+  outside_if="$(iface_for_ns "$name" "$outside_prefix")"
+  if [ -z "$inside_if" ] || [ -z "$outside_if" ]; then
+    echo "router: FAIL: $name: no interface for inside=$inside_cidr($inside_if) outside=$outside_cidr($outside_if)" >> "$home/boot.log"
+    return 1
+  fi
+  ip netns exec "$name" sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  ip netns exec "$name" iptables -t nat -A POSTROUTING -s "$inside_cidr" -o "$outside_if" -j MASQUERADE
+  ip netns exec "$name" iptables -A FORWARD -i "$inside_if" -o "$outside_if" -j ACCEPT
+  ip netns exec "$name" iptables -A FORWARD -i "$outside_if" -o "$inside_if" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  echo "router: up: inside=$inside_if($inside_cidr) outside=$outside_if($outside_cidr) upnp=$upnp natpmp=off" >> "$home/boot.log"
+
+  if [ "$upnp" = "on" ]; then
+    conf="$home/miniupnpd.conf"
+    cat > "$conf" <<CONF
+ext_ifname=${outside_if}
+listening_ip=${inside_if}
+enable_natpmp=no
+enable_upnp=yes
+secure_mode=yes
+system_uptime=yes
+CONF
+    # miniupnpd does not create its own chains; see router-entrypoint.sh for
+    # the full reasoning. iptables-legacy, not the plain iptables above, for
+    # the same reason: miniupnpd links against libip4tc, this image's plain
+    # `iptables` is the nft-compat build, and the two do not share state.
+    ip netns exec "$name" iptables-legacy -t nat -N MINIUPNPD
+    ip netns exec "$name" iptables-legacy -t nat -A PREROUTING -i "$outside_if" -j MINIUPNPD
+    ip netns exec "$name" iptables-legacy -t filter -N MINIUPNPD
+    ip netns exec "$name" iptables-legacy -t filter -A FORWARD -i "$outside_if" ! -o "$outside_if" -j MINIUPNPD
+    ip netns exec "$name" iptables-legacy -t nat -N MINIUPNPD-POSTROUTING
+    ip netns exec "$name" iptables-legacy -t nat -A POSTROUTING -o "$outside_if" -j MINIUPNPD-POSTROUTING
+    ip netns exec "$name" miniupnpd -d -f "$conf" >>"$home/boot.log" 2>&1 &
+    echo "$!" > "$home/pid"
+    echo "router: upnp: miniupnpd serving on ${inside_if}, natpmp refused" >> "$home/boot.log"
+  fi
+}
+
+# $1 name, $2 the line to wait for, $3 seconds. A namespace's boot log is a
+# plain file, so this polls it directly rather than shelling out per try.
+wait_for_boot_line() {
+  name="$1"; pattern="$2"; seconds="${3:-60}"
   i=0
   while [ "$i" -lt "$((seconds * 10))" ]; do
-    if grep -q "peer listener up" "$LAB/$name/boot.log" 2>/dev/null; then
+    if grep -q "$pattern" "$LAB/$name/boot.log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_listener() {
+  # $1 name, $2 seconds
+  wait_for_boot_line "$1" "peer listener up" "${2:-60}"
+}
+
+# A REAL connect probe, from the SAME namespace a client role will send from,
+# at the SAME address it will send to. Not a boot-log line: the upstream
+# stub's own "listening" line lands in its boot log the moment python calls
+# `bind`+`listen`, which measurably is not the same instant a bridged peer
+# elsewhere in the lab can complete a TCP handshake to it. Under load this
+# gap was measured past 4.5s, and the proxy's own transport-failure backoff
+# (`retry_after`, `src/proxy.rs`) then holds a 503 for a further ~5s once the
+# FIRST attempt fails, so the fix is upstream of that: never let a client's
+# first request BE the first attempt.
+wait_reachable() {
+  # $1 namespace to probe FROM, $2 host, $3 port, $4 seconds
+  ns="$1"; host="$2"; port="$3"; seconds="${4:-30}"
+  i=0
+  while [ "$i" -lt "$((seconds * 10))" ]; do
+    if ip netns exec "$ns" python3 -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(0.3)
+try:
+    s.connect(('$host', $port))
+except OSError:
+    sys.exit(1)
+s.close()
+" 2>/dev/null; then
       return 0
     fi
     sleep 0.1
@@ -201,12 +347,21 @@ cmd_up() {
   t1="$(now_ms)"
   echo "netlab: wired $(grep -c '^host ' "$LAB/.plan") hosts in $((t1 - t0))ms"
 
-  # The find/announce columns are read a second time here, past the eight
-  # positional fields `read` splits into.
-  grep '^host ' "$LAB/.plan" | while read -r _ name _ _ _ _ role listen proxy find announce; do
+  # The find/announce/upnp columns are read a second time here, past the eight
+  # positional fields the first `read` splits into.
+  grep '^host ' "$LAB/.plan" | while read -r _ name lan _ _ _ role listen proxy find announce upnp; do
     case "$role" in
       node) start_node "$name" "$listen" "$proxy" "$find" "$announce" ;;
       upstream) start_upstream "$name" "$listen" ;;
+      router)
+        # A router's inside network is its primary lan; its outside network is
+        # its one `extra` wire. Both cidrs come from the lan table already in
+        # this same plan, never re-typed.
+        inside_cidr="$(awk -v want="$lan" '$1=="lan" && $2==want {print $4}' "$LAB/.plan")"
+        outside_lan="$(awk -v want="$name" '$1=="extra" && $2==want {print $3; exit}' "$LAB/.plan")"
+        outside_cidr="$(awk -v want="$outside_lan" '$1=="lan" && $2==want {print $4}' "$LAB/.plan")"
+        start_router "$name" "$inside_cidr" "$outside_cidr" "$upnp"
+        ;;
       observer) : ;;
     esac
   done
@@ -222,11 +377,48 @@ cmd_up() {
   done || return 1
   t3="$(now_ms)"
   echo "netlab: every listener up in $((t3 - t2))ms (total $((t3 - t0))ms)"
+
+  # Only when a client role is about to fire straight at it: every scenario
+  # that ran before clients existed never needed the upstream stub provably
+  # reachable, only reachable by the time a `tcr` process's own retry loop
+  # got to it.
+  if grep -q '^client ' "$LAB/.plan" 2>/dev/null; then
+    upstream_host="$(echo "$UPSTREAM_URL" | sed -E 's#^https?://([^:/]+).*#\1#')"
+    upstream_port="$(echo "$UPSTREAM_URL" | sed -E 's#^https?://[^:/]+:([0-9]+).*#\1#')"
+    grep '^client ' "$LAB/.plan" | while read -r _ name node rate body count; do
+      wait_reachable "$node" "$upstream_host" "$upstream_port" 30 \
+        || echo "netlab: WARN: $node could not reach $upstream_host:$upstream_port within 30s"
+      start_client "$name" "$node" "$rate" "$body" "$count"
+    done
+  fi
 }
 
 cmd_add() {
-  name="$1"; lan="$2"; addr="$3"
+  # netlab add <name> --lan <lan>: the address is not the caller's to pick,
+  # because the caller does not know what a running lab already handed out.
+  # A per-lan counter file does, starting past every address the topology's
+  # own hosts and their `extra` wires could plausibly hold.
+  name=""; lan=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --lan) lan="$2"; shift 2 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  : "${name:?netlab add: a node name is required}"
+  : "${lan:?netlab add: --lan <lan> is required}"
   bridge="$(awk -v want="$lan" '$1=="lan" && $2==want {print $3}' "$LAB/.plan")"
+  cidr="$(awk -v want="$lan" '$1=="lan" && $2==want {print $4}' "$LAB/.plan")"
+  if [ -z "$bridge" ] || [ -z "$cidr" ]; then
+    echo "netlab: FAIL: no lan named $lan in this lab's plan" >&2
+    return 1
+  fi
+  prefix="${cidr%.*/*}"
+  counter="$LAB/.addnum-$lan"
+  n=50
+  [ -f "$counter" ] && n="$(cat "$counter")"
+  addr="$prefix.$n"
+  echo "$((n + 1))" > "$counter"
   t0="$(now_ms)"
   attach_host "$name" "$bridge" "$addr" 24 -
   echo "node 7755 8088" > "$LAB/$name/role"
@@ -236,14 +428,31 @@ cmd_add() {
   echo "netlab: added $name at $addr in $((t1 - t0))ms"
 }
 
+# One row per node, including a live read of `tcr status --json` for every
+# node whose role file names it a `node` (a router or the upstream stub has
+# no `tcr` inside it to ask). `tcr status` reads the port out of the node's
+# OWN config and asks its OWN loopback, so this is the same call a person
+# would run on their own Mac, over `ip netns exec` rather than `ssh`.
 cmd_ps() {
-  printf '%-12s %-16s %-8s %s\n' NODE ADDRESS PID LISTENER
+  printf '%-18s %-16s %-8s %-8s %-6s %-8s %s\n' NODE ADDRESS PID ROLE SRC STATUS ACCOUNT
   for dir in "$LAB"/*/; do
     name="$(basename "$dir")"
     [ -f "$dir/role" ] || continue
+    role="$(awk '{print $1}' "$dir/role")"
     pid="$(cat "$dir/pid" 2>/dev/null || echo -)"
-    line="$(grep -o 'node=tcr-[A-Z0-9]*' "$dir/boot.log" 2>/dev/null | tail -1 || true)"
-    printf '%-12s %-16s %-8s %s\n' "$name" "$(cat "$dir/addr")" "$pid" "${line:--}"
+    addr="$(cat "$dir/addr" 2>/dev/null || echo -)"
+    src="-"; status="-"; account="-"
+    if [ "$role" = "node" ]; then
+      row="$(ip netns exec "$name" env HOME="$dir" XDG_CACHE_HOME="$dir/.cache" \
+        tcr status --json --config "$dir/.config/teamclaude.json" 2>/dev/null \
+        | python3 "$SRC/netlab-ps-row.py" || true)"
+      if [ -n "$row" ]; then
+        src="$(echo "$row" | cut -d' ' -f1)"
+        status="$(echo "$row" | cut -d' ' -f2)"
+        account="$(echo "$row" | cut -d' ' -f3)"
+      fi
+    fi
+    printf '%-18s %-16s %-8s %-8s %-6s %-8s %s\n' "$name" "$addr" "$pid" "$role" "$src" "$status" "$account"
   done
 }
 

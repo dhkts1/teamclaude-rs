@@ -47,54 +47,66 @@ SCENARIO="sealed-invite"
 export SCENARIO
 # shellcheck source=../lib/assert.sh
 . "$HERE/../lib/assert.sh"
-# shellcheck source=../lib/compose.sh
-. "$HERE/../lib/compose.sh"
 
-SERVICES="node-a1-overlay node-b1-overlay router-a router-b"
-export SERVICES
-
-B1_OVERLAY="100.64.99.12:$LISTEN_PORT"
+B1_OVERLAY="100.64.99.12:7755"
 
 # A dotted-quad IPv4 address, or a bracketed run of hex and colons (an IPv6
 # one): what a person reading a chat window would recognise as "an address",
 # the same shape the design's own contract names.
 ADDR_RE='[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|\[[0-9a-fA-F:]+\]'
 
-# The routers first, `overlay-invite`'s own order: home-a and home-b are
-# `internal: true`, so each node's default route goes through its router, and
-# `reach.rs` reads that route to find the gateway it probes. Neither router is
-# asked for a mapping here; the overlay is what carries this scenario's join.
-wait_for_router_log() {
-  service="$1"
-  seconds="${2:-30}"
-  i=0
-  while [ "$i" -lt "$seconds" ]; do
-    if "$DOCKER" logs "$(cname "$service")" 2>&1 | grep -q "router: up:"; then
-      return 0
-    fi
-    sleep 1
-    i=$((i + 1))
-  done
-  return 1
-}
-dc up -d router-a router-b >/dev/null 2>&1 || {
-  fail "compose up router-a router-b refused"
-  finish
-  exit 1
-}
-if ! wait_for_router_log router-a 30; then
-  fail "router-a: no 'router: up:' on its stdout within 30s"
-  finish
-  exit 1
-fi
-if ! wait_for_router_log router-b 30; then
-  fail "router-b: no 'router: up:' on its stdout within 30s"
-  finish
-  exit 1
-fi
-pass "both routers are up, no mapping asked of either"
+if [ "${NETLAB:-0}" = "1" ]; then
+  TOPOLOGY="$HERE/../topologies/two-homes-overlay.json"
+  export TOPOLOGY
+  NETLAB_UPSTREAM="http://5.5.5.20:8080"
+  export NETLAB_UPSTREAM
+  # shellcheck source=../lib/netlab.sh
+  . "$HERE/../lib/netlab.sh"
+  up_with_routers router-a router-b -- node-a1-overlay node-b1-overlay || { finish; exit 1; }
+  pass "both routers are up, no mapping asked of either"
+else
+  # shellcheck source=../lib/compose.sh
+  . "$HERE/../lib/compose.sh"
 
-up node-a1-overlay node-b1-overlay || { finish; exit 1; }
+  SERVICES="node-a1-overlay node-b1-overlay router-a router-b"
+  export SERVICES
+
+  # The routers first, `overlay-invite`'s own order: home-a and home-b are
+  # `internal: true`, so each node's default route goes through its router, and
+  # `reach.rs` reads that route to find the gateway it probes. Neither router is
+  # asked for a mapping here; the overlay is what carries this scenario's join.
+  wait_for_router_log() {
+    service="$1"
+    seconds="${2:-30}"
+    i=0
+    while [ "$i" -lt "$seconds" ]; do
+      if "$DOCKER" logs "$(cname "$service")" 2>&1 | grep -q "router: up:"; then
+        return 0
+      fi
+      sleep 1
+      i=$((i + 1))
+    done
+    return 1
+  }
+  dc up -d router-a router-b >/dev/null 2>&1 || {
+    fail "compose up router-a router-b refused"
+    finish
+    exit 1
+  }
+  if ! wait_for_router_log router-a 30; then
+    fail "router-a: no 'router: up:' on its stdout within 30s"
+    finish
+    exit 1
+  fi
+  if ! wait_for_router_log router-b 30; then
+    fail "router-b: no 'router: up:' on its stdout within 30s"
+    finish
+    exit 1
+  fi
+  pass "both routers are up, no mapping asked of either"
+
+  up node-a1-overlay node-b1-overlay || { finish; exit 1; }
+fi
 
 # --- mint an ask -----------------------------------------------------------
 asked="$SCRATCH/asked.txt"

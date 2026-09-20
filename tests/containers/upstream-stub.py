@@ -1,39 +1,171 @@
 #!/usr/bin/env python3
-"""The stub upstream: one canned 200, and a record of which credential asked.
+"""The stub upstream: one canned 200, a per-request ledger, and a lever to
+make it misbehave on command.
 
 The in-process end-to-end answers with an axum router in the test binary
 (`tests/peer_e2e.rs`). Containers need the same answer from a separate address,
-so this is that router with nothing else in it: every request gets the canned
-message body and the rate-limit headers the proxy reads, and every request's
-Authorization / x-api-key is appended to a log the scenarios read back to prove
-whose credential served a borrow.
+so this is that router with nothing else in it.
 
-Stdlib only, so the image is the stock python alpine and there is nothing to
-build. Listens on 0.0.0.0:8080.
+Two endpoints beside the canned one:
+
+    GET  /_ledger   the whole request ledger, as a JSON array
+    POST /_lever     {"account": "<credential>", "mode": "429"|"stall"|"drop",
+                       "retryAfter": N}   arms a misbehaviour for the next
+                       request(s) that carry that credential; {"mode": "off"}
+                       clears it
+
+Every ordinary request is recorded as one row: `{account, node, request_id,
+status, tokens, ms}`. `account` is the credential this request carried
+(`authorization` or `x-api-key`, whichever is set, the same value a lever is
+armed against), `node` is the `x-netlab-node` header the client sent (measured:
+`build_upstream_headers`, src/proxy.rs, forwards it, it is not in that
+function's drop list, which is `x-api-key`, `authorization`,
+`accept-encoding`, hop-by-hop headers and the mesh's own routing marker), and
+`request_id` is the `x-netlab-request-id` header the client sent, or a counter
+when a caller does not set one. `tokens` is not a real usage count, nothing
+here runs a model, it is `len(body) // 4`, a fixed and documented estimate a
+scenario can use to tell "some request landed" from "no request landed",
+never to check real billing.
+
+Stdlib only, so the image is the stock python and there is nothing to build:
+the stub runs in a namespace of the one netlab image, so a dependency here
+would be a dependency in the node image too.
+
+Listens on 0.0.0.0:8080.
 """
 
+import itertools
 import json
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SEEN = "/seen.log"
 BODY = json.dumps({"type": "message", "id": "msg_fake"}).encode()
+
+LOCK = threading.Lock()
+LEDGER = []
+LEVERS = {}
+REQUEST_IDS = itertools.count(1)
 
 
 class Stub(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _record(self):
-        credential = self.headers.get("authorization", "") or self.headers.get("x-api-key", "")
-        with open(SEEN, "a", encoding="utf-8") as log:
-            log.write(f"{self.command} {self.path} credential={credential}\n")
-        print(f"upstream: {self.command} {self.path} credential={credential}", flush=True)
+    # --- the ledger and the lever, read and armed by a scenario ------------
+
+    def _serve_ledger(self):
+        with LOCK:
+            body = json.dumps(LEDGER).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_lever(self, raw):
+        # `raw` is the body `_answer` already read off `self.rfile` before it
+        # knew which endpoint this was: a second `rfile.read()` here would
+        # block waiting for bytes the client already sent and is not sending
+        # again, which is exactly the hang a lever call produced before this
+        # took a parameter instead of reading twice.
+        try:
+            req = json.loads(raw)
+        except json.JSONDecodeError:
+            req = {}
+        account = req.get("account", "")
+        mode = req.get("mode", "off")
+        with LOCK:
+            if mode == "off" or not account:
+                LEVERS.pop(account, None)
+            else:
+                LEVERS[account] = {
+                    "mode": mode,
+                    "retryAfter": int(req.get("retryAfter", 1)),
+                }
+        body = json.dumps({"ok": True, "account": account, "mode": mode}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # --- the ordinary canned answer, and what a lever does to it -----------
+
+    def _credential(self):
+        return self.headers.get("authorization", "") or self.headers.get("x-api-key", "")
+
+    def _record(self, account, node, request_id, status, tokens, ms):
+        row = {
+            "account": account,
+            "node": node,
+            "request_id": request_id,
+            "status": status,
+            "tokens": tokens,
+            "ms": ms,
+        }
+        with LOCK:
+            LEDGER.append(row)
+        print(
+            f"upstream: {self.command} {self.path} account={account} node={node} "
+            f"request_id={request_id} status={status} tokens={tokens} ms={ms}",
+            flush=True,
+        )
 
     def _answer(self):
+        start = time.monotonic()
         length = int(self.headers.get("content-length", "0") or 0)
-        if length:
-            self.rfile.read(length)
-        self._record()
+        body_in = self.rfile.read(length) if length else b""
+        account = self._credential()
+        node = self.headers.get("x-netlab-node", "-")
+        request_id = self.headers.get("x-netlab-request-id") or f"gen-{next(REQUEST_IDS)}"
+        tokens = len(body_in) // 4
+
+        if self.path.startswith("/_ledger") and self.command == "GET":
+            self._serve_ledger()
+            return
+        if self.path.startswith("/_lever") and self.command == "POST":
+            self._serve_lever(body_in)
+            return
+
+        with LOCK:
+            lever = LEVERS.get(account)
+
+        if lever and lever["mode"] == "drop":
+            # A connection closed without a response: no send_response, no
+            # headers, just stop. The client sees a reset, never a status.
+            self._record(account, node, request_id, "dropped", tokens, self._ms(start))
+            self.close_connection = True
+            return
+
+        if lever and lever["mode"] == "429":
+            body = json.dumps(
+                {"type": "error", "error": {"type": "rate_limit_error", "message": "stubbed 429"}}
+            ).encode()
+            self.send_response(429)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.send_header("retry-after", str(lever["retryAfter"]))
+            self.end_headers()
+            self.wfile.write(body)
+            self._record(account, node, request_id, 429, tokens, self._ms(start))
+            return
+
+        if lever and lever["mode"] == "stall":
+            # A stream that stalls mid-body: headers and half the canned body
+            # go out, then nothing more, ever. The connection stays open
+            # rather than closing, which is the one thing that tells a client
+            # timeout apart from a drop.
+            half = BODY[: len(BODY) // 2]
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(half)
+            self.wfile.flush()
+            self._record(account, node, request_id, "stalled", tokens, self._ms(start))
+            while True:
+                time.sleep(3600)
+
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(BODY)))
@@ -43,6 +175,11 @@ class Stub(BaseHTTPRequestHandler):
         self.send_header("anthropic-ratelimit-unified-7d_oi-utilization", "0.10")
         self.end_headers()
         self.wfile.write(BODY)
+        self._record(account, node, request_id, 200, tokens, self._ms(start))
+
+    @staticmethod
+    def _ms(start):
+        return int((time.monotonic() - start) * 1000)
 
     do_GET = _answer
     do_POST = _answer

@@ -36,55 +36,70 @@ SCENARIO="overlay-invite"
 export SCENARIO
 # shellcheck source=../lib/assert.sh
 . "$HERE/../lib/assert.sh"
-# shellcheck source=../lib/compose.sh
-. "$HERE/../lib/compose.sh"
 
-# The compose services this scenario needs, for the runner and for a reader.
-SERVICES="node-a1-overlay node-b1-overlay router-a router-b"
-export SERVICES
+A1_OVERLAY="100.64.99.11:7755"
 
-A1_OVERLAY="100.64.99.11:$LISTEN_PORT"
+if [ "${NETLAB:-0}" = "1" ]; then
+  TOPOLOGY="$HERE/../topologies/two-homes-overlay.json"
+  export TOPOLOGY
+  NETLAB_UPSTREAM="http://5.5.5.20:8080"
+  export NETLAB_UPSTREAM
+  # shellcheck source=../lib/netlab.sh
+  . "$HERE/../lib/netlab.sh"
+  # The lab names the overlay interface utun0 the moment it creates the wire
+  # (`is_overlay_addr` in netlab), so there is no rename to wait on: the router
+  # wait below is the only startup ordering this scenario needs under netlab.
+  up_with_routers router-a router-b -- node-a1-overlay node-b1-overlay || { finish; exit 1; }
+  pass "both routers are up, no mapping asked of either"
+else
+  # shellcheck source=../lib/compose.sh
+  . "$HERE/../lib/compose.sh"
 
-# The routers first: home-a and home-b are `internal: true`, so each node's
-# route to anything off its own home network goes through its router, and
-# node-b1-overlay's attempt at node-a1's LAN address (which this scenario
-# expects to lose to the overlay one) has to fail on a router that exists,
-# not hang on ARP for one that does not.
-dc up -d router-a router-b >/dev/null 2>&1 || {
-  fail "compose up router-a router-b refused"
-  finish
-  exit 1
-}
-# The router's own boot line goes to stdout, never to a file under /scratch:
-# `wait_for_log` (compose.sh) greps a boot log inside the container, which is
-# a node convention the router image does not share, so this scenario reads
-# its line off `docker logs` instead.
-wait_for_router_log() {
-  service="$1"
-  seconds="${2:-30}"
-  i=0
-  while [ "$i" -lt "$seconds" ]; do
-    if "$DOCKER" logs "$(cname "$service")" 2>&1 | grep -q "router: up:"; then
-      return 0
-    fi
-    sleep 1
-    i=$((i + 1))
-  done
-  return 1
-}
-if ! wait_for_router_log router-a 30; then
-  fail "router-a: no 'router: up:' on its stdout within 30s"
-  finish
-  exit 1
+  # The compose services this scenario needs, for the runner and for a reader.
+  SERVICES="node-a1-overlay node-b1-overlay router-a router-b"
+  export SERVICES
+
+  # The routers first: home-a and home-b are `internal: true`, so each node's
+  # route to anything off its own home network goes through its router, and
+  # node-b1-overlay's attempt at node-a1's LAN address (which this scenario
+  # expects to lose to the overlay one) has to fail on a router that exists,
+  # not hang on ARP for one that does not.
+  dc up -d router-a router-b >/dev/null 2>&1 || {
+    fail "compose up router-a router-b refused"
+    finish
+    exit 1
+  }
+  # The router's own boot line goes to stdout, never to a file under /scratch:
+  # `wait_for_log` (compose.sh) greps a boot log inside the container, which is
+  # a node convention the router image does not share, so this scenario reads
+  # its line off `docker logs` instead.
+  wait_for_router_log() {
+    service="$1"
+    seconds="${2:-30}"
+    i=0
+    while [ "$i" -lt "$seconds" ]; do
+      if "$DOCKER" logs "$(cname "$service")" 2>&1 | grep -q "router: up:"; then
+        return 0
+      fi
+      sleep 1
+      i=$((i + 1))
+    done
+    return 1
+  }
+  if ! wait_for_router_log router-a 30; then
+    fail "router-a: no 'router: up:' on its stdout within 30s"
+    finish
+    exit 1
+  fi
+  if ! wait_for_router_log router-b 30; then
+    fail "router-b: no 'router: up:' on its stdout within 30s"
+    finish
+    exit 1
+  fi
+  pass "both routers are up, no mapping asked of either"
+
+  up node-a1-overlay node-b1-overlay || { finish; exit 1; }
 fi
-if ! wait_for_router_log router-b 30; then
-  fail "router-b: no 'router: up:' on its stdout within 30s"
-  finish
-  exit 1
-fi
-pass "both routers are up, no mapping asked of either"
-
-up node-a1-overlay node-b1-overlay || { finish; exit 1; }
 
 # --- mint ---------------------------------------------------------------
 minted="$SCRATCH/minted.txt"
