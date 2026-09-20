@@ -81,23 +81,39 @@ pub fn any_usable(addrs: &[IpAddr]) -> bool {
     addrs.iter().copied().any(is_usable)
 }
 
-/// Every address a real, operationally-up interface holds right now, as
-/// `if-addrs` reports it. Loopback is excluded here rather than left to
-/// [`is_usable`], because [`if_addrs::Interface::is_oper_up`] is a fact about
-/// the INTERFACE and [`is_usable`] is a rule about the ADDRESS; keeping them
-/// apart is what lets a test hand [`any_usable`] addresses directly without
-/// building a fake interface. An interface whose operational status this
-/// platform cannot report reads as down rather than up, so an unreadable
-/// state can only ever make this Mac look OFFLINE, never falsely online.
-fn interface_addresses() -> Vec<IpAddr> {
+/// Every up, non-loopback interface right now, as `if-addrs` reports it: its
+/// name alongside the address it holds.
+///
+/// The one interface walk in this tree. Loopback is excluded here rather than
+/// left to [`is_usable`], because [`if_addrs::Interface::is_oper_up`] is a
+/// fact about the INTERFACE and [`is_usable`] is a rule about the ADDRESS;
+/// keeping them apart is what lets a test hand [`any_usable`] addresses
+/// directly without building a fake interface. An interface whose operational
+/// status this platform cannot report reads as down rather than up, so an
+/// unreadable state can only ever make this Mac look OFFLINE, never falsely
+/// online.
+///
+/// The name travels too, not just the address, because
+/// [`crate::peer::pair::host_addresses`] needs it to tell a tailnet address
+/// (on a `utun` interface) from a mobile hotspot's carrier-grade-NAT one (on
+/// anything else) and used to run this same walk a second time, by hand, to
+/// keep it.
+pub fn interfaces() -> Vec<(String, IpAddr)> {
     let Ok(interfaces) = if_addrs::get_if_addrs() else {
         return Vec::new();
     };
     interfaces
         .into_iter()
         .filter(|interface| interface.is_oper_up() && !interface.is_loopback())
-        .map(|interface| interface.ip())
+        .map(|interface| (interface.name.clone(), interface.ip()))
         .collect()
+}
+
+/// Every address a real, operationally-up interface holds right now. See
+/// [`interfaces`] for the walk; this drops the interface name
+/// [`network_present`] has no use for.
+fn interface_addresses() -> Vec<IpAddr> {
+    interfaces().into_iter().map(|(_, addr)| addr).collect()
 }
 
 /// Is this Mac on a network at all: does it have at least one non-loopback

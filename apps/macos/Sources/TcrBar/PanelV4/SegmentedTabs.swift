@@ -50,13 +50,44 @@ struct SegmentedTabs: View {
                 Image(systemName: tab.systemImage)
                     .font(.system(size: V4.tabLabelSize))
                     .frame(width: V4.tabIconBox, height: V4.tabIconBox)
+                // ONE line, at its own width, never a share of the strip.
+                //
+                // Each item carries `.frame(maxWidth: .infinity)` below, so
+                // four of them split the strip into equal 84.25 pt quarters.
+                // Measured at the system font, "Sessions" beside a two-digit
+                // badge wants 106.2 pt of that quarter and so broke into
+                // `Sess` over `ions` on the released panel. Nothing in the
+                // strip's own tokens can pay for it: taking `segGap` to zero
+                // returns 2.25 pt, and a smaller badge font is larger than
+                // the one already used.
+                //
+                // Their own widths fit with room to spare: the four together
+                // want 303.8 pt of the strip's 337, even at `Sessions 120`
+                // and `Tools 12`. `fixedSize` is what asks for that ideal
+                // width instead of accepting the quarter, `lineLimit(1)`
+                // is what makes a label that somehow still cannot fit
+                // ellipsise rather than grow the strip a second line, and
+                // `SegmentedTabsFitTests` is what fails if a longer label
+                // ever spends the slack.
                 Text(tab.title)
                     .font(V4.font(V4.tabLabelSize, .semibold))
                     .tracking(V4.tabLabelTracking)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 if let count = badges[tab], count > 0 {
+                    // The same rule as the label, and it is not optional once
+                    // the label has it. With only the label fixed, an item
+                    // still holds its equal quarter and the compression moves
+                    // to whatever can still give: rendered at `Sessions 120`
+                    // and `Tools 12`, the three-digit badge was squeezed to a
+                    // bare sliver and the two-digit one broke into `1` over
+                    // `2`. A count that cannot be read is the one thing a
+                    // badge is for.
                     Text("\(count)")
                         .font(V4.font(V4.badgeSize))
                         .foregroundStyle(Tok.ink)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                         .contentTransition(.numericText())
                         .padding(.horizontal, V4.badgePaddingH)
                         .background(

@@ -189,18 +189,24 @@ final class QuotaTailWidthTests: XCTestCase {
         // Round 2 deleted the other two uses `shape` used to gate here (the
         // name row's `ViewThatFits` fallback, and the tail's plan-name
         // fallback on row 1) — both the plan and the Fable figure now draw
-        // identically in both shapes. The ONE use left is a label choice,
-        // not a measurement: `rotationPillText` drops the redundant
-        // "Rotating" word on a grouped card, the group's own legend already
-        // saying whether the GROUP is parked.
+        // identically in both shapes.
+        //
+        // TWO uses are left, and neither skips a measurement. One is a label
+        // choice: `rotationPillText` drops the redundant "Rotating" word on a
+        // grouped card, the group's own legend already saying whether the
+        // GROUP is parked. The other is a width: a member card sits inside the
+        // group box's padding and stroke, so `nameRowWidth` subtracts them,
+        // and that width decides whether the PLAN is drawn whole or left off
+        // (`NameRowFit`). Raised from 1 to 2 on 2026-09-20 for that second
+        // one. A third still wants reading before this number moves again.
         let gates =
             source
             .split(separator: "\n")
             .filter { $0.contains("shape ==") && !$0.contains("//") }
             .map { $0.trimmingCharacters(in: .whitespaces) }
         XCTAssertEqual(
-            gates.count, 1,
-            "`shape` gates \(gates.count) branches now, not the 1 that is about a label:\n"
+            gates.count, 2,
+            "`shape` gates \(gates.count) branches now, not the 2 above:\n"
                 + gates.joined(separator: "\n")
                 + "\nA new one that skips a bar or a caption hides a measurement on every "
                 + "grouped card. Check what it removes before updating this count.")

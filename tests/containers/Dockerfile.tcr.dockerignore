@@ -1,0 +1,11 @@
+# BuildKit reads <dockerfile>.dockerignore before the context root's one, which
+# keeps this harness's exclusions out of the repository root.
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!crates
+!src
+!assets
+!scripts/install-tcrbar-from-dmg.sh
+!tests/containers/node-entrypoint.sh

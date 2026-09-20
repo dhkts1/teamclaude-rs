@@ -264,6 +264,15 @@ final class MenuBarShell {
             openPeersTab: { [weak self] in self?.openPanel(on: .peers) })
         notifier.watch(self.knocks)
         self.knockNotifier = notifier
+
+        // The same question the notifier above asks, answered for the Peers
+        // tab's own read. It is registered rather than passed down because the
+        // controller that reads it is built by the panel's view, several hops
+        // from here, and it is a pull rather than a flag this object sets
+        // because a `.transient` popover is dismissed by a click outside or by
+        // Escape without `closePanel()` ever running. `PeerPollGate` carries
+        // what was measured with the panel shut before it existed.
+        PeerPollGate.panelIsOnScreen = { [weak self] in self?.popover.isShown ?? false }
     }
 
     /// The panel's hosting controller, configured the one way it may be.

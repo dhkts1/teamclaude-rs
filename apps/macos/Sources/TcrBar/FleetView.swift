@@ -3538,11 +3538,16 @@ enum PanelTab: String, Equatable, CaseIterable {
 
     var title: String {
         switch self {
-        // Shortened from "Accounts" (`docs/design/panel-tabs.md` §0): at
-        // four tabs (this case plus the yet-to-land `feat/peers-panel`
-        // fourth tab) each segment gets ~85pt, and "Accounts" plus its own
-        // count badge is the one that overflows it; "Sessions" and "Tools"
-        // fit already.
+        // Shortened from "Accounts": at four tabs each segment gets an equal
+        // 84.25 pt of the 372 pt panel, and "Accounts" plus its own count
+        // badge overflowed it.
+        //
+        // Shortening is only half the fit, and this comment used to claim the
+        // other two "fit already". Measured at the real system font, an equal
+        // quarter share is 22 pt short of "Sessions" beside a two-digit badge,
+        // so that label WRAPS to two lines. The four segments together want
+        // 303.8 pt of the 337 pt the strip has, so the fix is the strip
+        // letting each segment take its own width rather than an equal share.
         case .accounts: return "Accts"
         case .sessions: return "Sessions"
         case .tools: return "Tools"
@@ -4866,6 +4871,13 @@ struct AccountRow: View {
                 accountActionsMenuLabel
             }
             .menuStyle(.borderlessButton)
+            // No disclosure chevron beside the gear. SwiftUI draws one on any
+            // `Menu` unless it is asked not to, and it made this control the
+            // only two-glyph button on the card: the header's own gear is a
+            // plain `Button` and carries none, so the pair read as two
+            // different kinds of control for no reason. The width it gives
+            // back goes to the account name, which truncates first.
+            .menuIndicator(.hidden)
             .controlSize(.small)
             .fixedSize()
             .accessibilityLabel("Account actions for \(account.name)")

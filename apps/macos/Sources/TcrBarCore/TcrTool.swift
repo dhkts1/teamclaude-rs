@@ -153,8 +153,27 @@ public enum TcrTool {
 
     /// Run `tcr` to completion and collect both streams.
     ///
-    /// Reads happen before `waitUntilExit()` because a pipe that fills while the
-    /// parent is blocked in `wait` deadlocks the child.
+    /// Reads happen before the wait because a pipe that fills while the parent
+    /// is blocked in `wait` deadlocks the child.
+    ///
+    /// # Why the wait is a semaphore and not `waitUntilExit()`
+    ///
+    /// `waitUntilExit()` waits by running the calling thread's run loop until
+    /// the process handle fires. On a thread that has no run loop that costs
+    /// nothing, which is where most of this app's reads happen. **On the main
+    /// thread it rounds every read up to the run loop's own step of about 62.5
+    /// milliseconds**, whatever the child actually cost: measured on this
+    /// machine, a child that does nothing but exit took 1.6 ms off the main
+    /// thread and 64.8 ms on it, and `peer ls --json` took 5.1 ms and 69.1 ms.
+    /// The child was the same child both times. The difference was entirely the
+    /// wait.
+    ///
+    /// A `terminationHandler` plus a semaphore ends the wait when the child
+    /// exits instead of on the next tick, so a main-thread read costs what the
+    /// child costs. The handler is installed BEFORE `run()` on purpose: set
+    /// afterwards it can be installed after the child has already been reaped,
+    /// and then it never fires and the semaphore is never signalled. Foundation
+    /// calls it on its own queue, so a blocked main thread cannot starve it.
     ///
     /// `stdin` is for the verbs whose input is a SECRET:
     /// ``PeerSecretInvocation`` is the only caller, and it is written and
@@ -201,6 +220,8 @@ public enum TcrTool {
         let input = stdin.map { _ in Pipe() }
         if let input { process.standardInput = input }
         if stdin != nil { ignoreSIGPIPE() }
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         try process.run()
         if let input, let stdin {
             // `try?` on both halves: the child may be gone, and both the write
@@ -211,7 +232,7 @@ public enum TcrTool {
         }
         let stdout = out.fileHandleForReading.readDataToEndOfFile()
         let stderr = err.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+        exited.wait()
         return Output(
             exitCode: process.terminationStatus,
             stdout: stdout,

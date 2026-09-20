@@ -117,10 +117,13 @@ struct MiniMeshCard: View {
     /// three loss bands. Nothing else on the card says what a line style or a
     /// dot colour means.
     private var legend: some View {
-        Text("solid: direct · dashed: carried by another Mac, or no path · grey: nothing measured")
-            .font(.system(size: V4.meshLegendSize))
-            .foregroundStyle(Tok.mute)
-            .padding(.top, V4.meshLegendMarginTop)
+        Text(
+            "solid: direct · dashed: carried by another Mac, no path now, or path not "
+                + "reported · grey: nothing measured"
+        )
+        .font(.system(size: V4.meshLegendSize))
+        .foregroundStyle(Tok.mute)
+        .padding(.top, V4.meshLegendMarginTop)
     }
 
     /// Above ``PeerMeshLayout/maxMacsForGraph`` trusted Macs: the same facts
@@ -148,6 +151,13 @@ struct MiniMeshCard: View {
     private var spokenSummary: String {
         let parts = peers.map { peer -> String in
             if peer.asleep { return "\(peer.name) is away" }
+            // The absence is spoken in the same words it is drawn in. Reading
+            // `not measured` over a tile whose plate says the path was never
+            // reported is the drawing and its spoken form disagreeing about
+            // which of the two absences this is.
+            if !peer.hasPath, let absent = peer.absence.plateSentence {
+                return "\(peer.name) \(absent)"
+            }
             let rtt = peer.rttMs.map { "\(Int($0.rounded())) milliseconds" } ?? "not measured"
             let via = peer.viaName.map { ", carried by \($0)" } ?? ""
             return "\(peer.name) \(rtt)\(via)"
@@ -251,6 +261,13 @@ struct MiniMeshCard: View {
             }
         }
         .lineLimit(1)
+        // The plate was measured with CoreText and the label is drawn by
+        // SwiftUI. They agree on this font, and a hair of disagreement on some
+        // string nobody tried would spend the plate's whole right margin and
+        // print an ellipsis where the last characters belong. Shrinking a
+        // fraction is the smaller failure, and this never engages while the
+        // two agree.
+        .minimumScaleFactor(0.9)
         .frame(width: pill.frame.width - V4.meshPillLabelInset, alignment: .leading)
         .position(x: pill.frame.midX + 8, y: pill.frame.midY)
     }

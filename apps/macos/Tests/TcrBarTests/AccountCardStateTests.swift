@@ -26,8 +26,29 @@ final class AccountCardStateTests: XCTestCase {
 
     // MARK: - The rotation pill (review #7)
 
-    func testAHealthyUngroupedAccountRotates() {
-        XCTAssertEqual(stateAccount("alice@example.com").rotationLabel, "Rotating")
+    /// The state is real; the pill is not. A healthy ungrouped account IS
+    /// rotating and every exclusion is already `nil`, so drawing the word here
+    /// put it on every healthy card at once, where it separated none of them
+    /// and spent a pill's width on the card's only identifying line.
+    func testAHealthyUngroupedAccountRotatesAndSaysSoWithNoPill() {
+        let healthy = stateAccount("alice@example.com")
+        XCTAssertEqual(healthy.rotation, .rotating)
+        XCTAssertNil(
+            healthy.rotationLabel,
+            "the ordinary rotating account draws no pool pill; a card with no pool word IS "
+                + "the card the pool is sending traffic to")
+        XCTAssertNil(
+            healthy.rotationHelp,
+            "a sentence behind a pill nothing draws is a sentence no hover can reach")
+    }
+
+    /// The other half of the same rule, in one test so the two cannot be
+    /// updated apart: the rare state keeps its word.
+    func testTheReservedStateKeepsItsPillWhileTheRotatingOneDoesNot() {
+        let reserved = stateAccount(
+            "irene@example.com", groups: ["research"], reservedGroups: ["research"])
+        XCTAssertNil(stateAccount("ivan@example.com").rotationLabel)
+        XCTAssertEqual(reserved.rotationLabel, "Group only")
     }
 
     func testADeadCredentialNeverClaimsToBeRotating() {
@@ -66,16 +87,16 @@ final class AccountCardStateTests: XCTestCase {
         XCTAssertNil(stateAccount("frank@example.com", disabled: true).rotationLabel)
     }
 
-    /// The card drops `.rotating` on a compact row — the group box's legend
-    /// carries that context once for every member — and keeps `.groupOnly`,
-    /// which the legend never says. Suppressing both left `01-healthy`'s
-    /// reserved `research` member with no word for the state at all.
+    /// The two states stay distinguishable as CASES even though only one of
+    /// them has a word: a caller that needs to know whether the pool is
+    /// sending traffic asks `rotation`, never the pill string it used to
+    /// compare against.
     func testTheTwoRotationStatesAreDistinguishableWithoutReadingTheirWords() {
         let reserved = stateAccount(
             "gwen@example.com", groups: ["research"], reservedGroups: ["research"])
         XCTAssertEqual(reserved.rotation, .groupOnly)
         XCTAssertEqual(stateAccount("hal@example.com").rotation, .rotating)
-        XCTAssertEqual(RotationState.rotating.label, "Rotating")
+        XCTAssertNil(RotationState.rotating.label)
         XCTAssertEqual(RotationState.groupOnly.label, "Group only")
     }
 
