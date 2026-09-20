@@ -281,7 +281,7 @@ Advanced > Show…` opens the same sheet on the key segment, for a headless Mac'
 from that pane. The friend's own paste field, `Settings > Peers > Paste a key or a link`, takes
 an ask too: pasting one runs `tcr peer join --stdin` and, instead of closing the way a key or a
 link does, keeps the sheet open to show the sealed reply with a `Copy reply` button, because an
-ask does not join anything by itself — the reply is what has to be sent back.
+ask does not join anything by itself: the reply is what has to be sent back.
 
 A Mac that already has a network key **refuses a link that carries a different one**, and says
 what accepting it would cut this Mac off from. Pasting a second office's key over the first is
