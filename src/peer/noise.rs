@@ -161,6 +161,18 @@ pub const PATTERN_KNOCK: &str = "Noise_NN_25519_ChaChaPoly_SHA256";
 /// nothing and can send nothing that reaches the UI".
 pub const PATTERN_KNOCK_PSK: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
 
+/// `N`, a one-way seal to a bare public key: `e, es`
+/// (`snow-0.10.0/src/params/patterns.rs:311`). The sender has no static key of
+/// its own and is never authenticated; the recipient is known only by the
+/// public half of a keypair minted for this one exchange
+/// (`src/peer/ask.rs`).
+///
+/// There is no second message because there is no channel to carry one: the
+/// wire is a chat window a person pastes into by hand, and Noise `N` is the
+/// pattern built for exactly that shape, one message, one direction, one
+/// known recipient.
+pub const PATTERN_SEAL: &str = "Noise_N_25519_ChaChaPoly_SHA256";
+
 /// The PSK position `IKpsk1` mixes the join secret into: before message 1, so a
 /// wrong secret fails while the responder is still reading it.
 const PSK_POSITION_ONE: u8 = 1;
@@ -820,7 +832,10 @@ pub fn random_secret() -> Result<[u8; KEY_BYTES]> {
 }
 
 /// Generate a static keypair, for a first boot and for a test that needs two
-/// identities in one process.
+/// identities in one process. `src/peer/ask.rs` calls this too, for the
+/// one-time keypair each side of a sealed exchange mints: the same generator,
+/// the same two length checks, a different name for what the pattern that
+/// consumes it turns the pair into.
 pub fn generate_static() -> Result<([u8; KEY_BYTES], [u8; KEY_BYTES])> {
     let params = PATTERN_PAIR
         .parse()
@@ -841,6 +856,55 @@ pub fn generate_static() -> Result<([u8; KEY_BYTES], [u8; KEY_BYTES])> {
         )
     })?;
     Ok((secret, public))
+}
+
+/// Seal `plaintext` to `recipient_pub` under [`PATTERN_SEAL`]: one `N`
+/// initiator, one message. The output is snow's own shape, a fresh ephemeral
+/// public key followed by the ciphertext and its tag; the caller frames it
+/// (`src/peer/ask.rs`).
+///
+/// The initiator here has no static key of its own: `N` authenticates the
+/// recipient to the sender and says nothing about who the sender is, which is
+/// the whole point of a chat message nobody can be made to sign.
+pub fn seal_to(recipient_pub: &[u8; KEY_BYTES], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let params = PATTERN_SEAL
+        .parse()
+        .context("peer seal: snow rejected the seal pattern")?;
+    let mut initiator = Builder::new(params)
+        .remote_public_key(recipient_pub)
+        .context("peer seal: snow rejected the recipient's public key")?
+        .build_initiator()
+        .context("peer seal: snow refused to build an initiator for the seal pattern")?;
+    let mut message = vec![0_u8; MAX_FRAME_BYTES];
+    let len = initiator
+        .write_message(plaintext, &mut message)
+        .context("peer seal: snow refused to seal this message")?;
+    message.truncate(len);
+    Ok(message)
+}
+
+/// Open a message [`seal_to`] produced, under this Mac's half of the one-time
+/// keypair it minted. One `N` responder, one message.
+///
+/// A message that fails here is either sealed to a different public key or
+/// truncated in transit; both read as the same refusal to `snow`, which is why
+/// `src/peer/ask.rs` checks the length before ever calling this, so a chat
+/// client's truncation is never told apart from a forgery by name.
+pub fn open_sealed(own_private: &[u8; KEY_BYTES], message: &[u8]) -> Result<Vec<u8>> {
+    let params = PATTERN_SEAL
+        .parse()
+        .context("peer seal: snow rejected the seal pattern")?;
+    let mut responder = Builder::new(params)
+        .local_private_key(own_private)
+        .context("peer seal: snow rejected this Mac's one-time secret")?
+        .build_responder()
+        .context("peer seal: snow refused to build a responder for the seal pattern")?;
+    let mut plaintext = vec![0_u8; MAX_FRAME_BYTES];
+    let len = responder
+        .read_message(message, &mut plaintext)
+        .context("peer seal: this did not open against this ask")?;
+    plaintext.truncate(len);
+    Ok(plaintext)
 }
 
 /// Read one `u16`-length-prefixed frame.

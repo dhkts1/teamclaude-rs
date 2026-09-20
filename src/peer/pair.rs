@@ -295,10 +295,44 @@ impl JoinToken {
         let mut body = Vec::new();
         body.extend_from_slice(&TOKEN_V3_MAGIC);
         body.push(TOKEN_V3_VERSION);
+        body.extend_from_slice(&self.to_v3_body());
+        format!("{TOKEN_PREFIX_V3}{}", encode_bytes(&body))
+    }
+
+    /// The three fields, in v3's compact spelling, with no magic and no
+    /// version: the address list through [`dialaddrs::encode`], the
+    /// registrar's 32 bytes, the secret's 32 bytes.
+    ///
+    /// [`Self::to_token_v3`] wraps this in a magic, a version and a base32
+    /// prefix for a pasted key. `src/peer/ask.rs` seals it directly instead:
+    /// its own frame already carries a magic and a version, and wrapping the
+    /// key's again would be the same fact spelled twice.
+    pub fn to_v3_body(&self) -> Vec<u8> {
+        let mut body = Vec::new();
         body.extend_from_slice(&dialaddrs::encode(&self.sockets().collect::<Vec<_>>()));
         body.extend_from_slice(&self.registrar.0);
         body.extend_from_slice(&self.secret);
-        format!("{TOKEN_PREFIX_V3}{}", encode_bytes(&body))
+        body
+    }
+
+    /// The inverse of [`Self::to_v3_body`]: the three fields back out of the
+    /// same compact spelling, with no magic or version to check (the caller
+    /// already checked its own).
+    pub fn from_v3_body(bytes: &[u8]) -> Result<Self> {
+        let (addrs, rest) =
+            dialaddrs::decode_prefix(bytes).map_err(|refusal| anyhow!("peer join: {refusal}"))?;
+        if rest.len() != 64 {
+            bail!(
+                "peer join: this key has the wrong number of bytes left after its address \
+                 list, which is what a paste cut short or padded looks like"
+            );
+        }
+        if addrs.is_empty() {
+            bail!("peer join: this key carries no address to dial");
+        }
+        let registrar = PeerId(rest[..32].try_into().expect("checked length"));
+        let secret: [u8; 32] = rest[32..64].try_into().expect("checked length");
+        Ok(Self::new(addrs, registrar, secret))
     }
 
     /// Parse a pasted key, v3, v2 or v1. Refuses an unknown version rather
@@ -389,23 +423,7 @@ impl JoinToken {
             bail!("peer join: this v3 key names format version {version}, which this build does not know");
         }
         let rest = &bytes[TOKEN_V3_MAGIC.len() + 1..];
-        // The address list is self-delimiting on its own count byte, so what
-        // `decode_prefix` leaves unconsumed is exactly the registrar and the
-        // secret.
-        let (addrs, rest) =
-            dialaddrs::decode_prefix(rest).map_err(|refusal| anyhow!("peer join: {refusal}"))?;
-        if rest.len() != 64 {
-            bail!(
-                "peer join: this v3 key has the wrong number of bytes left after its address \
-                 list, which is what a paste cut short or padded looks like"
-            );
-        }
-        if addrs.is_empty() {
-            bail!("peer join: this key carries no address to dial");
-        }
-        let registrar = PeerId(rest[..32].try_into().expect("checked length"));
-        let secret: [u8; 32] = rest[32..64].try_into().expect("checked length");
-        Ok(Self::new(addrs, registrar, secret))
+        Self::from_v3_body(rest)
     }
 }
 
@@ -1694,14 +1712,18 @@ pub enum JoinInput {
     Link(ShareLink),
     /// A bare `tcr-join:…` key, as `tcr peer invite` prints it.
     Key(JoinToken),
+    /// A `tcr-invite:…` ask: names no address, carries no key, and grants
+    /// nothing. Answered with `tcr peer join --stdin`, which seals this Mac's
+    /// addresses to it and prints a reply, rather than joined.
+    Ask(crate::peer::ask::Ask),
 }
 
 impl JoinInput {
-    /// Decide which of the two this string is, by its own prefix.
+    /// Decide which of the three this string is, by its own prefix.
     ///
-    /// The prefixes are disjoint and both are checked, so an input that is
-    /// neither gets a refusal naming both shapes rather than whichever error
-    /// the first parser happened to produce.
+    /// The prefixes are disjoint and all three are checked, so an input that
+    /// is none of them gets a refusal naming every shape rather than
+    /// whichever error the first parser happened to produce.
     pub fn parse(raw: &str) -> Result<Self> {
         let raw = raw.trim();
         if raw.starts_with(LINK_PREFIX) {
@@ -1710,7 +1732,12 @@ impl JoinInput {
         if raw.starts_with(KEY_PREFIX) {
             return JoinToken::parse(raw).map(Self::Key);
         }
-        // The third shape names itself and stops there. `tcr peer moved open`
+        if raw.starts_with(crate::peer::ask::ASK_PREFIX) {
+            return crate::peer::ask::Ask::parse(raw)
+                .map(Self::Ask)
+                .map_err(|refusal| anyhow!("peer join: {refusal}"));
+        }
+        // The fourth shape names itself and stops there. `tcr peer moved open`
         // is the OTHER link under this scheme, and the two are easy to confuse
         // in a chat window where both are one opaque line: a person who pasted
         // the wrong one is told which verb reads it rather than left to read
@@ -1725,16 +1752,21 @@ impl JoinInput {
         }
         bail!(
             "peer join: this is neither a share link ({LINK_PREFIX}…) nor a join key \
-             ({KEY_PREFIX}…). Nothing is printed back, because a paste that failed to \
-             parse is still a live secret and a terminal keeps scrollback"
+             ({KEY_PREFIX}…) nor an invite ({}…). Nothing is printed back, because a \
+             paste that failed to parse is still a live secret and a terminal keeps \
+             scrollback",
+            crate::peer::ask::ASK_PREFIX
         )
     }
 
-    /// The join key to enrol with, if this input carries one.
+    /// The join key to enrol with, if this input carries one. An ask carries
+    /// neither a key nor a network key: that is the honest answer, not a
+    /// missing case.
     pub fn join_token(&self) -> Option<&JoinToken> {
         match self {
             Self::Link(link) => link.join.as_ref(),
             Self::Key(token) => Some(token),
+            Self::Ask(_) => None,
         }
     }
 
@@ -1742,7 +1774,7 @@ impl JoinInput {
     pub fn network_key(&self) -> Option<crate::peer::config::NetworkKey> {
         match self {
             Self::Link(link) => Some(link.network_key),
-            Self::Key(_) => None,
+            Self::Key(_) | Self::Ask(_) => None,
         }
     }
 }
