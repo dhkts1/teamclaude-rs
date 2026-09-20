@@ -28,17 +28,27 @@ SCENARIO="nat-upnp-mapping"
 export SCENARIO
 # shellcheck source=../lib/assert.sh
 . "$HERE/../lib/assert.sh"
-# shellcheck source=../lib/compose.sh
-. "$HERE/../lib/compose.sh"
-
-# The compose services this scenario needs, for the runner and for a reader.
-SERVICES="node-a1 node-b1 router-a router-b"
-export SERVICES
 
 ROUTER_A_OUTSIDE=5.5.5.2
 
-ROUTER_A_UPNP=on
-export ROUTER_A_UPNP
+if [ "${NETLAB:-0}" = "1" ]; then
+  TOPOLOGY="$HERE/../topologies/two-homes-two-routers-upnp.json"
+  export TOPOLOGY
+  NETLAB_UPSTREAM="http://5.5.5.20:8080"
+  export NETLAB_UPSTREAM
+  # shellcheck source=../lib/netlab.sh
+  . "$HERE/../lib/netlab.sh"
+else
+  # shellcheck source=../lib/compose.sh
+  . "$HERE/../lib/compose.sh"
+
+  # The compose services this scenario needs, for the runner and for a reader.
+  SERVICES="node-a1 node-b1 router-a router-b"
+  export SERVICES
+
+  ROUTER_A_UPNP=on
+  export ROUTER_A_UPNP
+fi
 
 up_with_routers router-a router-b -- node-a1 node-b1 || { finish; exit 1; }
 pass "router-a router-b node-a1 node-b1 all reported up"

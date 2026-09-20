@@ -148,6 +148,73 @@ start_upstream() {
   echo "$!" > "$home/pid"
 }
 
+# The interface INSIDE namespace $1 holding an address in $2 (a bare dotted
+# prefix such as "10.77.1"), derived rather than assumed. Lifted from
+# router-entrypoint.sh's `iface_for`: Docker's interface order was the reason
+# there; here the reason is that `attach_host` gives the primary wire eth0 and
+# `attach_extra` gives the next one eth1, eth2, ..., and deriving from the
+# address rather than trusting that numbering is the same fact either harness
+# needs proven, not assumed.
+iface_for_ns() {
+  ns="$1"; want="$2."
+  ip -n "$ns" -o -4 addr show | awk -v want="$want" '$4 ~ "^"want {print $2; exit}'
+}
+
+# The router role: NAT between an inside LAN (this namespace's primary wire)
+# and an outside one (its one `extra` wire), and optionally miniupnpd.
+# Lifted from router-entrypoint.sh, keeping its interface derivation and its
+# iptables-legacy reasoning for miniupnpd's chains; the parts that do not
+# carry over are the ones that were about Docker, not about NAT: no
+# `wait_for_iface` (attach_host and attach_extra already ran before this is
+# called), no `docker run --sysctl` (there is no per-namespace equivalent, so
+# ip_forward is written here directly), and no shared /etc/miniupnpd/ (a mount
+# namespace is not per network-namespace, so two routers in one container
+# would collide on one file; each writes its own under /lab/<name>/).
+start_router() {
+  # $1 name, $2 inside cidr, $3 outside cidr, $4 upnp (on/off)
+  name="$1"; inside_cidr="$2"; outside_cidr="$3"; upnp="$4"
+  home="$LAB/$name"
+  mkdir -p "$home"
+  inside_prefix="${inside_cidr%.*/*}"
+  outside_prefix="${outside_cidr%.*/*}"
+  inside_if="$(iface_for_ns "$name" "$inside_prefix")"
+  outside_if="$(iface_for_ns "$name" "$outside_prefix")"
+  if [ -z "$inside_if" ] || [ -z "$outside_if" ]; then
+    echo "router: FAIL: $name: no interface for inside=$inside_cidr($inside_if) outside=$outside_cidr($outside_if)" >> "$home/boot.log"
+    return 1
+  fi
+  ip netns exec "$name" sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  ip netns exec "$name" iptables -t nat -A POSTROUTING -s "$inside_cidr" -o "$outside_if" -j MASQUERADE
+  ip netns exec "$name" iptables -A FORWARD -i "$inside_if" -o "$outside_if" -j ACCEPT
+  ip netns exec "$name" iptables -A FORWARD -i "$outside_if" -o "$inside_if" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  echo "router: up: inside=$inside_if($inside_cidr) outside=$outside_if($outside_cidr) upnp=$upnp natpmp=off" >> "$home/boot.log"
+
+  if [ "$upnp" = "on" ]; then
+    conf="$home/miniupnpd.conf"
+    cat > "$conf" <<CONF
+ext_ifname=${outside_if}
+listening_ip=${inside_if}
+enable_natpmp=no
+enable_upnp=yes
+secure_mode=yes
+system_uptime=yes
+CONF
+    # miniupnpd does not create its own chains; see router-entrypoint.sh for
+    # the full reasoning. iptables-legacy, not the plain iptables above, for
+    # the same reason: miniupnpd links against libip4tc, this image's plain
+    # `iptables` is the nft-compat build, and the two do not share state.
+    ip netns exec "$name" iptables-legacy -t nat -N MINIUPNPD
+    ip netns exec "$name" iptables-legacy -t nat -A PREROUTING -i "$outside_if" -j MINIUPNPD
+    ip netns exec "$name" iptables-legacy -t filter -N MINIUPNPD
+    ip netns exec "$name" iptables-legacy -t filter -A FORWARD -i "$outside_if" ! -o "$outside_if" -j MINIUPNPD
+    ip netns exec "$name" iptables-legacy -t nat -N MINIUPNPD-POSTROUTING
+    ip netns exec "$name" iptables-legacy -t nat -A POSTROUTING -o "$outside_if" -j MINIUPNPD-POSTROUTING
+    ip netns exec "$name" miniupnpd -d -f "$conf" >>"$home/boot.log" 2>&1 &
+    echo "$!" > "$home/pid"
+    echo "router: upnp: miniupnpd serving on ${inside_if}, natpmp refused" >> "$home/boot.log"
+  fi
+}
+
 wait_listener() {
   # $1 name, $2 seconds
   name="$1"; seconds="${2:-60}"
@@ -201,12 +268,21 @@ cmd_up() {
   t1="$(now_ms)"
   echo "netlab: wired $(grep -c '^host ' "$LAB/.plan") hosts in $((t1 - t0))ms"
 
-  # The find/announce columns are read a second time here, past the eight
-  # positional fields `read` splits into.
-  grep '^host ' "$LAB/.plan" | while read -r _ name _ _ _ _ role listen proxy find announce; do
+  # The find/announce/upnp columns are read a second time here, past the eight
+  # positional fields the first `read` splits into.
+  grep '^host ' "$LAB/.plan" | while read -r _ name lan _ _ _ role listen proxy find announce upnp; do
     case "$role" in
       node) start_node "$name" "$listen" "$proxy" "$find" "$announce" ;;
       upstream) start_upstream "$name" "$listen" ;;
+      router)
+        # A router's inside network is its primary lan; its outside network is
+        # its one `extra` wire. Both cidrs come from the lan table already in
+        # this same plan, never re-typed.
+        inside_cidr="$(awk -v want="$lan" '$1=="lan" && $2==want {print $4}' "$LAB/.plan")"
+        outside_lan="$(awk -v want="$name" '$1=="extra" && $2==want {print $3; exit}' "$LAB/.plan")"
+        outside_cidr="$(awk -v want="$outside_lan" '$1=="lan" && $2==want {print $4}' "$LAB/.plan")"
+        start_router "$name" "$inside_cidr" "$outside_cidr" "$upnp"
+        ;;
       observer) : ;;
     esac
   done
