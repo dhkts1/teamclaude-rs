@@ -29,10 +29,19 @@ public struct PeerMeshPeer: Equatable, Sendable {
     /// now` plate instead, never a reading: the row's own line one inch
     /// below already says there is nothing to report.
     public var hasPath: Bool
+    /// WHICH absence, when there is one, in the row's own words.
+    ///
+    /// Read only when ``hasPath`` is `false`; a Mac with a path has nothing to
+    /// name. The row has told these two apart since it grew the enum, and the
+    /// card said `no path now` for both, so one screen answered "did this Mac
+    /// look" two different ways an inch apart. Defaults to the case the card
+    /// used to assume, so a caller that has not been taught the real fact yet
+    /// draws exactly what it drew before this field existed.
+    public var absence: PeerPathAbsence
 
     public init(
         name: String, rttMs: Double? = nil, lossPct: Double? = nil, viaName: String? = nil,
-        asleep: Bool = false, hasPath: Bool = true
+        asleep: Bool = false, hasPath: Bool = true, absence: PeerPathAbsence = .measured
     ) {
         self.name = name
         self.rttMs = rttMs
@@ -40,6 +49,7 @@ public struct PeerMeshPeer: Equatable, Sendable {
         self.viaName = viaName
         self.asleep = asleep
         self.hasPath = hasPath
+        self.absence = absence
     }
 }
 
@@ -123,8 +133,8 @@ public struct PeerMeshLayout: Equatable, Sendable {
         /// Dashed because the bytes go through another Mac.
         public var carried: Bool
         /// Dashed because the row has no path at all right now. A separate
-        /// fact from ``carried``: the two share one dash style (the legend
-        /// reads "dashed: carried by another Mac, or no path"), but a
+        /// fact from ``carried``: the two share one dash style (so the legend
+        /// names every reason an edge dashes), but a
         /// no-path edge names no forwarder and its tone is always grey,
         /// which a carried edge's is not.
         public var noPath: Bool
@@ -142,7 +152,8 @@ public struct PeerMeshLayout: Equatable, Sendable {
     /// One reading, on an opaque plate, over the edge it describes.
     public struct Pill: Equatable, Sendable {
         public var frame: CGRect
-        /// `16 ms`, `not measured`, or `no path now`.
+        /// `16 ms`, `not measured`, or one of the absence sentences
+        /// (``PeerPathAbsence/plateSentence``).
         public var reading: String
         /// `via attic-nuc` on a carried path, and `nil` otherwise.
         public var via: String?
@@ -208,7 +219,10 @@ public struct PeerMeshLayout: Equatable, Sendable {
         var parts: [String] = []
         if peer.asleep { parts.append("asleep") }
         if !peer.hasPath {
-            parts.append("no path right now")
+            // The row's own sentence, not a copy of it: the list and the row
+            // are two printings of one fact, and the case that prints no line
+            // at all prints none here either.
+            if let sentence = peer.absence.sentence { parts.append(sentence) }
         } else {
             parts.append(peer.viaName.map { "via \($0)" } ?? "direct")
             if let rttMs = peer.rttMs { parts.append("\(Int(rttMs.rounded())) ms") }
@@ -338,10 +352,17 @@ public struct PeerMeshLayout: Equatable, Sendable {
             guard !peer.asleep else { continue }
 
             if noPath {
-                // No path draws a dotted grey plate saying so, never a
-                // reading: a round trip or a loss figure both claim
-                // something was measured, and nothing was.
-                let reading = "no path now"
+                // No path draws a dotted grey plate saying WHICH absence,
+                // never a reading: a round trip or a loss figure both claim
+                // something was measured, and nothing was. The words come off
+                // the row's own enum, so the plate and the line under it
+                // cannot answer "did this Mac look" differently.
+                //
+                // No plate at all for the absence that draws no line either:
+                // there, traffic is flowing over a path the row cannot name,
+                // and that is not an unplaced reading, so it is not counted as
+                // one.
+                guard let reading = peer.absence.plateSentence else { continue }
                 let plate = plateSize(reading: reading, via: nil)
                 guard
                     let frameForPill = place(
@@ -395,7 +416,14 @@ public struct PeerMeshLayout: Equatable, Sendable {
     /// this same value, which is why it lives here rather than in the number
     /// sheet: a plate sized without it and a label drawn inside it would be
     /// two numbers for one gap.
-    public static let pillLabelInset: CGFloat = 20
+    ///
+    /// 24 and not 20. The view draws the label 8 pt right of the plate's
+    /// centre to clear the dot, so a plate sized at text plus 20 left the last
+    /// character 2 pt from its own border while the dot side had 6: the room
+    /// was all spent on one edge. At `no path now` that read as tight; at
+    /// `path not reported` the final `d` sits on the dashed border and the
+    /// reading looks cut. 24 gives 4 pt past the text and 6 pt past the dot.
+    public static let pillLabelInset: CGFloat = 24
     /// One line, and two when a forwarder is named.
     public static let pillOneLineHeight: CGFloat = 20
     public static let pillTwoLineHeight: CGFloat = 30

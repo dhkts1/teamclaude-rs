@@ -239,6 +239,84 @@ final class PeerMeshLayoutTests: XCTestCase {
         XCTAssertEqual(layout.pills.first?.showsToneDot, false)
     }
 
+    /// The plate says WHICH absence, in the words the row under it uses.
+    ///
+    /// The row has told a measured absence from an unreported one since it
+    /// grew the enum; the card printed `no path now` over both, so one screen
+    /// answered "did this Mac look" two different ways an inch apart, and the
+    /// plate was the half making a claim it had not measured.
+    func testThePlateNamesWhichAbsenceTheRowNamed() {
+        let reported = PeerMeshLayout.layout(
+            size: small, root: "desk-mac",
+            peers: [PeerMeshPeer(name: "office-mini", hasPath: false, absence: .notReported)])
+        XCTAssertEqual(reported.pills.first?.reading, "path not reported")
+        XCTAssertEqual(reported.pills.first?.dashed, true)
+
+        let measured = PeerMeshLayout.layout(
+            size: small, root: "desk-mac",
+            peers: [PeerMeshPeer(name: "office-mini", hasPath: false, absence: .measured)])
+        XCTAssertEqual(measured.pills.first?.reading, "no path now")
+    }
+
+    /// The absence that draws no line draws no plate either, and that is not
+    /// a reading the card failed to place.
+    ///
+    /// Work is flowing over a path the row cannot name, which is why the row
+    /// prints nothing; a plate saying "no path now" over the same tile is the
+    /// card contradicting the row two inches below it.
+    func testTheSilentAbsenceDrawsNoPlateAndIsNotCountedUnplaced() {
+        let layout = PeerMeshLayout.layout(
+            size: small, root: "desk-mac",
+            peers: [PeerMeshPeer(name: "office-mini", hasPath: false, absence: .silent)])
+        XCTAssertEqual(layout.pills.count, 0)
+        XCTAssertEqual(layout.unplacedReadings, 0)
+        XCTAssertEqual(layout.edges.first?.noPath, true, "the edge still says there is no path")
+    }
+
+    /// The reading list above the graph cap names the absence too, in the
+    /// row's own longer sentence, since a list line has the room a plate does
+    /// not.
+    func testTheReadingsListNamesWhichAbsence() {
+        let readings = PeerMeshLayout.readings(for: [
+            PeerMeshPeer(name: "office-mini", hasPath: false, absence: .notReported),
+            PeerMeshPeer(name: "loft-mini", hasPath: false, absence: .measured),
+            PeerMeshPeer(name: "shed-mac", hasPath: false, absence: .silent),
+        ])
+        XCTAssertEqual(readings.map(\.text), ["path not reported", "no path right now", ""])
+    }
+
+    /// The widest plate the card can be asked to draw still gets placed at the
+    /// panel's own inner width.
+    ///
+    /// `path not reported` is half as wide again as `no path now`, and a plate
+    /// the placer cannot fit is a reading the card drops into its
+    /// "do not fit here" footer. Measured at the width `MiniMeshCard` lays the
+    /// card out at, 372 pt of panel less its 36 pt of gutters, on the shape
+    /// that crowds a plate most: two Macs, so both edges lean.
+    func testTheWidestAbsencePlateIsPlacedAtThePanelsOwnWidth() {
+        let cardWidth = CGSize(width: 336, height: 206)
+        let layout = PeerMeshLayout.layout(
+            size: cardWidth, root: "desk-mac",
+            peers: [
+                PeerMeshPeer(name: "attic-nuc", rttMs: 16, lossPct: 0.01),
+                PeerMeshPeer(name: "loft-mini", hasPath: false, absence: .notReported),
+            ])
+        XCTAssertEqual(layout.unplacedReadings, 0, "the widest absence plate had nowhere to go")
+        XCTAssertEqual(layout.pills.count, 2)
+        for pill in layout.pills {
+            XCTAssertGreaterThanOrEqual(pill.frame.minX, 0)
+            XCTAssertLessThanOrEqual(
+                pill.frame.maxX, cardWidth.width,
+                "the plate runs off the right edge of the card, which is where the reading is cut")
+        }
+        let plate = PeerMeshLayout.plateSize(reading: "path not reported", via: nil)
+        XCTAssertGreaterThanOrEqual(
+            plate.width,
+            PeerMeshLayout.textWidth("path not reported", size: PeerMeshLayout.pillReadingSize)
+                + PeerMeshLayout.pillLabelInset,
+            "the plate is narrower than the sentence on it")
+    }
+
     /// A row that does have a path draws neither dotted.
     func testAPathDrawsNeitherEdgeNorPlateDashed() {
         let layout = PeerMeshLayout.layout(
