@@ -1139,7 +1139,7 @@ until the next restart.
 
 ### `tcr peer pending`
 
-Shows the Macs asking to pair with this one, and nothing else about them: a request is a
+Shows the Macs asking to connect with this one, and nothing else about them: a request is a
 row, never a trust decision.
 
 | flag | type | default | effect |

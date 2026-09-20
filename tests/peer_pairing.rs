@@ -2006,7 +2006,9 @@ fn the_approval_verbs_and_ls_json_agree_about_one_pending_row() {
     let (out, err, ok) = run_tcr(&peers, &["pending"]);
     assert!(ok, "`tcr peer pending` must exit 0: {err}");
     assert!(
-        out.contains("studio-mac") && out.contains("192.0.2.24") && out.contains("wants to pair"),
+        out.contains("studio-mac")
+            && out.contains("192.0.2.24")
+            && out.contains("wants to connect"),
         "the pending row must name the Mac AND its address, because a name is a label and \
          never identity: {out}"
     );
