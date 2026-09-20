@@ -123,7 +123,7 @@ start_node() {
   peers="$home/.config/tcr-peers.json"
   cat > "$config" <<JSON
 {
-  "proxy": { "port": $proxy },
+  "proxy": { "port": $proxy, "apiKey": "fake-netlab-proxy-key" },
   "upstream": "$UPSTREAM_URL",
   "quotaProbeSeconds": 0,
   "warmupSeconds": 0,
@@ -168,6 +168,25 @@ start_upstream() {
   home="$LAB/$name"
   ip netns exec "$name" python3 "$SRC/upstream-stub.py" "$port" >>"$home/boot.log" 2>&1 &
   echo "$!" > "$home/pid"
+}
+
+# A client is a process, never a Mac: it runs inside a NODE's own namespace
+# (netlab-client.py, the "run as a process in the node's OWN namespace"
+# reason is in its own header) rather than getting a namespace of its own, so
+# there is no bridge wire for it and its home directory holds only its log
+# and pid, never an addr file. Backgrounded, bounded by <count>, so `netlab
+# up` returns as soon as every role has STARTED rather than waiting for every
+# client's run to finish.
+start_client() {
+  # $1 client name, $2 target node, $3 rate/sec, $4 body bytes, $5 count
+  name="$1"; node="$2"; rate="$3"; body="$4"; count="$5"
+  home="$LAB/$node"
+  client_home="$LAB/$name"
+  mkdir -p "$client_home"
+  ip netns exec "$node" env HOME="$home" python3 "$SRC/netlab-client.py" \
+    "$home/.config/teamclaude.json" "$rate" "$body" "$count" \
+    >"$client_home/client.log" 2>&1 &
+  echo "$!" > "$client_home/pid"
 }
 
 # The interface INSIDE namespace $1 holding an address in $2 (a bare dotted
@@ -237,12 +256,50 @@ CONF
   fi
 }
 
-wait_listener() {
-  # $1 name, $2 seconds
-  name="$1"; seconds="${2:-60}"
+# $1 name, $2 the line to wait for, $3 seconds. A namespace's boot log is a
+# plain file, so this polls it directly rather than shelling out per try.
+wait_for_boot_line() {
+  name="$1"; pattern="$2"; seconds="${3:-60}"
   i=0
   while [ "$i" -lt "$((seconds * 10))" ]; do
-    if grep -q "peer listener up" "$LAB/$name/boot.log" 2>/dev/null; then
+    if grep -q "$pattern" "$LAB/$name/boot.log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_listener() {
+  # $1 name, $2 seconds
+  wait_for_boot_line "$1" "peer listener up" "${2:-60}"
+}
+
+# A REAL connect probe, from the SAME namespace a client role will send from,
+# at the SAME address it will send to. Not a boot-log line: the upstream
+# stub's own "listening" line lands in its boot log the moment python calls
+# `bind`+`listen`, which measurably is not the same instant a bridged peer
+# elsewhere in the lab can complete a TCP handshake to it. Under load this
+# gap was measured past 4.5s, and the proxy's own transport-failure backoff
+# (`retry_after`, `src/proxy.rs`) then holds a 503 for a further ~5s once the
+# FIRST attempt fails, so the fix is upstream of that: never let a client's
+# first request BE the first attempt.
+wait_reachable() {
+  # $1 namespace to probe FROM, $2 host, $3 port, $4 seconds
+  ns="$1"; host="$2"; port="$3"; seconds="${4:-30}"
+  i=0
+  while [ "$i" -lt "$((seconds * 10))" ]; do
+    if ip netns exec "$ns" python3 -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(0.3)
+try:
+    s.connect(('$host', $port))
+except OSError:
+    sys.exit(1)
+s.close()
+" 2>/dev/null; then
       return 0
     fi
     sleep 0.1
@@ -320,6 +377,20 @@ cmd_up() {
   done || return 1
   t3="$(now_ms)"
   echo "netlab: every listener up in $((t3 - t2))ms (total $((t3 - t0))ms)"
+
+  # Only when a client role is about to fire straight at it: every scenario
+  # that ran before clients existed never needed the upstream stub provably
+  # reachable, only reachable by the time a `tcr` process's own retry loop
+  # got to it.
+  if grep -q '^client ' "$LAB/.plan" 2>/dev/null; then
+    upstream_host="$(echo "$UPSTREAM_URL" | sed -E 's#^https?://([^:/]+).*#\1#')"
+    upstream_port="$(echo "$UPSTREAM_URL" | sed -E 's#^https?://[^:/]+:([0-9]+).*#\1#')"
+    grep '^client ' "$LAB/.plan" | while read -r _ name node rate body count; do
+      wait_reachable "$node" "$upstream_host" "$upstream_port" 30 \
+        || echo "netlab: WARN: $node could not reach $upstream_host:$upstream_port within 30s"
+      start_client "$name" "$node" "$rate" "$body" "$count"
+    done
+  fi
 }
 
 cmd_add() {
