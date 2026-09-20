@@ -1,0 +1,524 @@
+{
+  "lans": [
+    {
+      "name": "home-a",
+      "bridge": "br-home-a",
+      "cidr": "10.77.1.0/24"
+    }
+  ],
+  "hosts": [
+    {
+      "name": "node-a1",
+      "lan": "home-a",
+      "ip": "10.77.1.11",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a2",
+      "lan": "home-a",
+      "ip": "10.77.1.12",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a3",
+      "lan": "home-a",
+      "ip": "10.77.1.13",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a4",
+      "lan": "home-a",
+      "ip": "10.77.1.14",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a5",
+      "lan": "home-a",
+      "ip": "10.77.1.15",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a6",
+      "lan": "home-a",
+      "ip": "10.77.1.16",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a7",
+      "lan": "home-a",
+      "ip": "10.77.1.17",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a8",
+      "lan": "home-a",
+      "ip": "10.77.1.18",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a9",
+      "lan": "home-a",
+      "ip": "10.77.1.19",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a10",
+      "lan": "home-a",
+      "ip": "10.77.1.20",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a11",
+      "lan": "home-a",
+      "ip": "10.77.1.21",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a12",
+      "lan": "home-a",
+      "ip": "10.77.1.22",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a13",
+      "lan": "home-a",
+      "ip": "10.77.1.23",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a14",
+      "lan": "home-a",
+      "ip": "10.77.1.24",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a15",
+      "lan": "home-a",
+      "ip": "10.77.1.25",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a16",
+      "lan": "home-a",
+      "ip": "10.77.1.26",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a17",
+      "lan": "home-a",
+      "ip": "10.77.1.27",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a18",
+      "lan": "home-a",
+      "ip": "10.77.1.28",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a19",
+      "lan": "home-a",
+      "ip": "10.77.1.29",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a20",
+      "lan": "home-a",
+      "ip": "10.77.1.30",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a21",
+      "lan": "home-a",
+      "ip": "10.77.1.31",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a22",
+      "lan": "home-a",
+      "ip": "10.77.1.32",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a23",
+      "lan": "home-a",
+      "ip": "10.77.1.33",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a24",
+      "lan": "home-a",
+      "ip": "10.77.1.34",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a25",
+      "lan": "home-a",
+      "ip": "10.77.1.35",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a26",
+      "lan": "home-a",
+      "ip": "10.77.1.36",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a27",
+      "lan": "home-a",
+      "ip": "10.77.1.37",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a28",
+      "lan": "home-a",
+      "ip": "10.77.1.38",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a29",
+      "lan": "home-a",
+      "ip": "10.77.1.39",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a30",
+      "lan": "home-a",
+      "ip": "10.77.1.40",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a31",
+      "lan": "home-a",
+      "ip": "10.77.1.41",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a32",
+      "lan": "home-a",
+      "ip": "10.77.1.42",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a33",
+      "lan": "home-a",
+      "ip": "10.77.1.43",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a34",
+      "lan": "home-a",
+      "ip": "10.77.1.44",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a35",
+      "lan": "home-a",
+      "ip": "10.77.1.45",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a36",
+      "lan": "home-a",
+      "ip": "10.77.1.46",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a37",
+      "lan": "home-a",
+      "ip": "10.77.1.47",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a38",
+      "lan": "home-a",
+      "ip": "10.77.1.48",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a39",
+      "lan": "home-a",
+      "ip": "10.77.1.49",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a40",
+      "lan": "home-a",
+      "ip": "10.77.1.50",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a41",
+      "lan": "home-a",
+      "ip": "10.77.1.51",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a42",
+      "lan": "home-a",
+      "ip": "10.77.1.52",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a43",
+      "lan": "home-a",
+      "ip": "10.77.1.53",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a44",
+      "lan": "home-a",
+      "ip": "10.77.1.54",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a45",
+      "lan": "home-a",
+      "ip": "10.77.1.55",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a46",
+      "lan": "home-a",
+      "ip": "10.77.1.56",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a47",
+      "lan": "home-a",
+      "ip": "10.77.1.57",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a48",
+      "lan": "home-a",
+      "ip": "10.77.1.58",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a49",
+      "lan": "home-a",
+      "ip": "10.77.1.59",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "node-a50",
+      "lan": "home-a",
+      "ip": "10.77.1.60",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "find": "on",
+      "announceName": "on"
+    },
+    {
+      "name": "observer",
+      "lan": "home-a",
+      "ip": "10.77.1.250",
+      "role": "observer"
+    },
+    {
+      "name": "upstream",
+      "lan": "home-a",
+      "ip": "10.77.1.253",
+      "role": "upstream",
+      "listen": 8080
+    }
+  ]
+}
