@@ -1930,6 +1930,32 @@ enum RenderStates {
                         + "or on another network; ask for a fresh key, or `tcr peer reach` "
                         + "on that Mac says whether its router forwards the port")
             ),
+            // Same refusal as `w15-sealed-no-answer`, drawn to show the
+            // swap it now offers: the sheet's own predicate reads this
+            // sentence the same way, so the ask field and `Answer invite`
+            // draw underneath it.
+            (
+                "w15-sealed-swap",
+                .sealed,
+                .refused(
+                    "Error: peer join: nothing answered at any address this key carries: "
+                        + "198.51.100.20:7755 (connection refused). That Mac may be asleep "
+                        + "or on another network; ask for a fresh key, or `tcr peer reach` "
+                        + "on that Mac says whether its router forwards the port")
+            ),
+            // This Mac answering the other side's invite: the arm that
+            // drew nothing before the swap shipped.
+            (
+                "w15-sealed-answered",
+                .sealed,
+                .answered(
+                    reply:
+                        "tcr-reply:v1:M9S346Q3D25VT4F5V37E3S3E28JT97KB6CQ643DZVMXXQKFBF5KZNWJ47TAN9ZT24MNPZX45HY43KWJRP1XPA7Z3DJ8FSSZ5AWSH8VHTPRE95B9EE0ZBGJ09TQM83XSSSS6YS3C4DWA7N36096Q14DR9GPQY77ZXYYK596NGYA1DQ91",
+                    sentences: "peer join: send this back to whoever sent you the invite; "
+                        + "nothing in it says where you are except to them\n"
+                        + "peer join: opening it joins you immediately, pinned and trusted "
+                        + "on both sides, the same as a pasted key")
+            ),
         ]
     }
 

@@ -1563,6 +1563,9 @@ struct PeersTabV4: View {
                 onOpenReply: { reply in
                     controller.openReply(reply) { sealedInvited = $0 }
                 },
+                onAnswerAsk: { ask in
+                    controller.answerAsk(ask) { sealedInvited = $0 }
+                },
                 onClose: { inviting = false })
         }
         // Block asks once, and the question names the address rather than the
@@ -2856,9 +2859,15 @@ struct PeerInviteSheet: View {
     /// lives here, not in the caller: it is UI state about a box on screen,
     /// not a fact ``PeerController`` needs to remember between presses.
     var onOpenReply: (String) -> Void = { _ in }
+    /// Answer an ask this sheet's paste field holds, on a spent dial. The
+    /// friend's own run, ``PeerController/answerAsk(_:into:)``, already
+    /// shipped for Settings; this sheet's field is a second caller of the
+    /// same verb, not a new one.
+    var onAnswerAsk: (String) -> Void = { _ in }
     var onClose: () -> Void = {}
 
     @State private var pastedReply = ""
+    @State private var pastedAsk = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: V4.buttonGap) {
@@ -3015,14 +3024,29 @@ struct PeerInviteSheet: View {
             if !sentences.isEmpty {
                 sentence(sentences, tint: Tok.mute)
             }
-        case .answered:
-            // Never produced by this sheet's own two verbs: minting an ask
-            // never answers one, and opening a reply never answers one
-            // either. The friend's side draws this case, in
-            // `PeersSettingsView.pasteKeySheet`.
-            EmptyView()
+        case .answered(let reply, let sentences):
+            // Produced by the swap below, running `tcr peer join --stdin`
+            // over an ask this Mac was pasted. `title` already draws the
+            // shared headline; this draws the shared sentence and the reply
+            // itself, `PeersSettingsView.pasteKeySheet`'s own two readings
+            // of ``PeerSealedMint``.
+            sentence(PeerSealedMint.sendThisBackBody, tint: Tok.inkDim)
+            box(reply, accessibilityLabel: "A reply to send back")
+            if !sentences.isEmpty {
+                sentence(sentences, tint: Tok.mute)
+            }
         case .refused(let said):
             sentence(said, tint: Tok.near)
+            if PeerSealedMint.theyDidNotAnswer(said) {
+                // The dial is spent, but the invite works the other way:
+                // whichever Mac could not be reached mints the ask this
+                // time, and this sheet is where the reply comes back.
+                sentence(
+                    "That exchange is spent. The invite works in the other direction too: "
+                        + "ask them to press Invite, Two pastes, sealed, and answer what "
+                        + "they send you.", tint: Tok.mute)
+                askField
+            }
         case .couldNotRun(let said):
             sentence(said, tint: Tok.near)
         }
@@ -3034,6 +3058,22 @@ struct PeerInviteSheet: View {
     /// thing asking them for a reply.
     private var replyField: some View {
         TextField("Paste what they send back", text: $pastedReply)
+            .textFieldStyle(.plain)
+            .font(V4.mono(V4.monoSize))
+            .padding(.vertical, V4.yesBlockPaddingV)
+            .padding(.horizontal, V4.yesBlockPaddingH)
+            .background(
+                RoundedRectangle(cornerRadius: V4.buttonRadius)
+                    .stroke(Tok.cardLine, lineWidth: 0.5)
+            )
+    }
+
+    /// The paste field for an invite, on a spent dial: the same field's
+    /// exact shape as ``replyField``, a second state rather than a rename,
+    /// because a shared field would carry a stale string between the two
+    /// exchanges a person can be mid-way through.
+    private var askField: some View {
+        TextField("Paste the invite they send you", text: $pastedAsk)
             .textFieldStyle(.plain)
             .font(V4.mono(V4.monoSize))
             .padding(.vertical, V4.yesBlockPaddingV)
@@ -3058,14 +3098,15 @@ struct PeerInviteSheet: View {
             }
         case .sealed:
             switch sealed {
-            case nil, .asked, .joined, .answered: return "Invite a Mac"
+            case nil, .asked, .joined: return "Invite a Mac"
+            case .answered: return PeerSealedMint.sendThisBackTitle
             case .refused(let said):
                 // Both refusals reach this sheet as the same case: one
                 // means the reply itself never opened, the other means it
                 // opened and the dial that followed found nobody. `tcr`'s
                 // own sentence in each carries the difference; this only
                 // has to head the reader to the right fix.
-                return said.contains("nothing answered at any address")
+                return PeerSealedMint.theyDidNotAnswer(said)
                     ? "They did not answer" : "That reply did not open"
             case .couldNotRun: return "That did not run"
             }
@@ -3096,6 +3137,22 @@ struct PeerInviteSheet: View {
                         .isEmpty
                 ) { onOpenReply(pastedReply.trimmingCharacters(in: .whitespacesAndNewlines)) }
             }
+            if mode == .sealed, case .refused(let said) = sealed,
+                PeerSealedMint.theyDidNotAnswer(said)
+            {
+                PeerActionButton(
+                    title: "Answer invite", systemImage: nil,
+                    help: "Seals a key for them to open. They dial this Mac, so nothing on "
+                        + "their side needs to be forwarded.",
+                    enabled: !pastedAsk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ) { onAnswerAsk(pastedAsk.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            }
+            if mode == .sealed, case .answered(let reply, _) = sealed {
+                PeerActionButton(
+                    title: "Copy reply", systemImage: nil,
+                    help: "Puts the reply on the pasteboard. Nothing else goes with it."
+                ) { copy(reply) }
+            }
         }
     }
 
@@ -3105,6 +3162,8 @@ struct PeerInviteSheet: View {
             return "Closes this. The key stays good whether this is open or not."
         case (.sealed, _, .asked):
             return "Closes this. The invite stays good whether this is open or not."
+        case (.sealed, _, .answered):
+            return "Closes this. The reply is only useful to the Mac that invited you."
         default:
             return "Closes this."
         }

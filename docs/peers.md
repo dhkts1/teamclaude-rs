@@ -271,6 +271,15 @@ and joins with the key it carried on the spot: pinned and trusted on both sides,
 no six-digit compare, the same as a pasted key would be. Both the ask and the reply are
 opaque, so the chat carries no address in either mode.
 
+Mode B runs in either direction, and which Mac mints the invite decides which one dials. The
+Mac that mints the ask with `tcr peer invite --sealed` is the one that opens the reply and
+dials; the Mac that answers with `tcr peer join --stdin` is the one that gets dialled. So when
+a dial finds nobody home, which is what happens when the answering Mac sits behind a router
+that forwards nothing, the two swap: the Mac that could not be reached mints the ask this
+time and the other one answers it. There is no second command and no third string shape, only
+the same two verbs with the people exchanged. The failed exchange is spent, both the ask and
+the reply, so a swap always starts with a fresh ask.
+
 In the panel, the Peers tab's footer carries an `Invite…` button beside `Settings…` that opens
 one sheet with a two-segment picker: `One paste` mints a key the way the button always has, and
 `Two pastes, sealed` mints an ask, shows it in a copyable box beside a paste field for the
@@ -282,6 +291,9 @@ from that pane. The friend's own paste field, `Settings > Peers > Paste a key or
 an ask too: pasting one runs `tcr peer join --stdin` and, instead of closing the way a key or a
 link does, keeps the sheet open to show the sealed reply with a `Copy reply` button, because an
 ask does not join anything by itself: the reply is what has to be sent back.
+
+When a dial finds nobody, the same sheet says the exchange is spent and takes their invite in a
+field of its own, so answering it never means leaving the sheet or opening Settings.
 
 A Mac that already has a network key **refuses a link that carries a different one**, and says
 what accepting it would cut this Mac off from. Pasting a second office's key over the first is

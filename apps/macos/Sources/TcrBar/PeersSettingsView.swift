@@ -1078,15 +1078,12 @@ struct PeersSettingsPane: View {
                         .disabled(trimmedPastedKey.isEmpty)
                 }
             case .answered(let reply, let sentences):
-                Text("Send this back")
+                Text(PeerSealedMint.sendThisBackTitle)
                     .font(.headline)
-                Text(
-                    "This carries your address, sealed so only the Mac that invited you can "
-                        + "open it. Nobody else who reads the message learns anything from it."
-                )
-                .font(.caption)
-                .foregroundStyle(Tok.inkFaint)
-                .fixedSize(horizontal: false, vertical: true)
+                Text(PeerSealedMint.sendThisBackBody)
+                    .font(.caption)
+                    .foregroundStyle(Tok.inkFaint)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(reply)
                     .font(.system(.body, design: .monospaced))
                     .textSelection(.enabled)

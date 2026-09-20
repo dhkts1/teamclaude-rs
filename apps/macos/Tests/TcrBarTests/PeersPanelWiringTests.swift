@@ -710,6 +710,70 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "(src/peer/ask.rs's own doc)")
     }
 
+    /// The finding: which of the two refusal screens a person sees is
+    /// decided inside a view body today, `PeerInviteSheet.title`'s own
+    /// `.contains("nothing answered at any address")`, and the reverse
+    /// direction swap needs the same answer from a second reader. A
+    /// predicate in a view body cannot be tested against the Rust sentence
+    /// it keys on; `PeerSealedMint.theyDidNotAnswer` is read out of the
+    /// source and fed the source's own text, so a reworded sentence on
+    /// either side is a red test rather than a wrong screen.
+    func testTheSwapScreenIsChosenByOneSentenceAndNotTwo() throws {
+        let pairRs = try source("src/peer/pair.rs")
+        let dialBail = try slice(
+            pairRs,
+            from: "async fn connect_in_key_order(token: &JoinToken)",
+            to: "/// How long the joiner waits")
+        XCTAssertTrue(
+            PeerSealedMint.theyDidNotAnswer(dialBail),
+            "connect_in_key_order's bail has moved or been reworded in src/peer/pair.rs; "
+                + "PeerSealedMint.theyDidNotAnswer no longer recognises it")
+
+        // The positive control: a predicate that matched everything would
+        // pass the assertion above alone. `DidNotOpen` is the sentence a
+        // reply that never opened prints, and it must read as the OTHER
+        // screen.
+        let askRs = try source("src/peer/ask.rs")
+        let didNotOpen = try slice(
+            askRs, from: "Self::DidNotOpen => write!(", to: "Self::UnknownPayload")
+        XCTAssertFalse(
+            PeerSealedMint.theyDidNotAnswer(didNotOpen),
+            "ReplyRefusal::DidNotOpen has moved or been reworded in src/peer/ask.rs, or now "
+                + "also reads as a spent dial")
+
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let sheet = try slice(
+            tab, from: "struct PeerInviteSheet: View {", to: "// MARK: - The link sheet")
+        XCTAssertFalse(
+            sheet.contains(#"contains("nothing answered"#),
+            "PeerInviteSheet spells the match itself somewhere outside title; it should read "
+                + "PeerSealedMint.theyDidNotAnswer instead")
+        for word in ["ten minutes", "one use", "expires", "internet address", "router"] {
+            XCTAssertFalse(
+                sheet.contains(word),
+                "PeerInviteSheet says \"\(word)\" itself, which is a second spelling of a "
+                    + "fact tcr already printed and free to drift from it")
+        }
+        XCTAssertFalse(
+            sheet.contains("six digit"),
+            "PeerInviteSheet promises a six-digit compare somewhere, and mode B has not "
+                + "compared digits since opening a reply started joining immediately "
+                + "(src/peer/ask.rs's own doc)")
+
+        // The swap: the `answered` arm used to be an `EmptyView()` because
+        // this sheet's own two verbs never produced that case. The swap
+        // makes `answerAsk` a third caller, so the arm has to draw
+        // something, and the button that runs it has to exist.
+        XCTAssertFalse(
+            sheet.contains("EmptyView()"),
+            "PeerInviteSheet's sealedModeContent still drops the answered arm on the floor; "
+                + "the swap's answerAsk press should have filled it in")
+        XCTAssertTrue(
+            sheet.contains("Answer invite"),
+            "PeerInviteSheet has no \"Answer invite\" control; the swap state should add one "
+                + "to the spent-dial screen")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
