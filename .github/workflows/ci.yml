@@ -375,6 +375,15 @@ jobs:
   # only on whatever machine someone remembers to run it on. continue-on-error
   # keeps a red scenario here from blocking a merge; promotion to the required
   # check list is a separate one-line branch-protection change, not this job.
+  #
+  # --native (scripts/peer-containers.sh --native) was measured here beside
+  # this run on 2026-09-20: 9/10 scenarios passed in 2m29s of scenario time,
+  # but nat-upnp-mapping's miniupnpd refused AddPortMapping with UPnP error
+  # 501 under a bare unshare namespace, on the same commit that scenario
+  # passes 10/10 under Docker. That is the one behaviour netlab-design.md
+  # section 10 already named as reasoned rather than observed, now observed
+  # and red, so this job stays on Docker only; --native remains available for
+  # a local Linux root run and carries the same header note.
   netlab:
     name: netlab
     needs: changes
