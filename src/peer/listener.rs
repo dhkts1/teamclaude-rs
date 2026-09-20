@@ -1157,6 +1157,20 @@ fn is_lan_scope_v4(addr: Ipv4Addr) -> bool {
     a == 10 || (a == 172 && (16..32).contains(&b)) || (a == 192 && b == 168)
 }
 
+/// Whether `addr` is in `100.64.0.0/10`, the range RFC 6598 set aside for
+/// carrier-grade NAT and the range Tailscale numbers a tailnet out of.
+///
+/// Public and beside [`is_lan_scope_v4`] rather than folded into it, because
+/// [`is_lan_scope_v4`]'s own doc explains why this range is deliberately NOT
+/// LAN scope here: answering "is this a tailnet address" is a different
+/// question from "is this a stranger's knock safe to answer", and
+/// `crate::peer::pair`'s dial rank needs the first one. One predicate, read
+/// by both, rather than the range typed out twice.
+pub fn is_carrier_grade_nat(addr: Ipv4Addr) -> bool {
+    let [a, b, _, _] = addr.octets();
+    a == 100 && (64..128).contains(&b)
+}
+
 /// The IPv6 half of [`is_lan_scope`].
 fn is_lan_scope_v6(addr: Ipv6Addr) -> bool {
     if addr.is_loopback() {
