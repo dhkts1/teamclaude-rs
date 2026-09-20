@@ -74,8 +74,25 @@ attach_host() {
   echo 1 > "$LAB/$name/.ifcount"
 }
 
+# True when $1 is a dotted address in 100.64.0.0/10, the tailnet-shaped range
+# `pair::is_tailnet` (src/peer/pair.rs) reads. Read as two fields rather than
+# matched against a case glob, because a glob covering 64-127 in the second
+# octet is the kind of pattern nobody rereads correctly a year later.
+is_overlay_addr() {
+  addr="$1"
+  first="$(echo "$addr" | awk -F. '{print $1}')"
+  second="$(echo "$addr" | awk -F. '{print $2}')"
+  [ "$first" = "100" ] && [ "$second" -ge 64 ] 2>/dev/null && [ "$second" -le 127 ] 2>/dev/null
+}
+
 # A second (or third) interface into a namespace `attach_host` already made.
-# Numbered eth1, eth2, ... because eth0 is the primary attach_host gave it.
+# Numbered eth1, eth2, ... because eth0 is the primary attach_host gave it,
+# UNLESS the address is in the tailnet-shaped overlay range: `node-entrypoint.sh`
+# (the compose harness) attaches that wire as an ordinary bridge interface and
+# then renames it to utun0, because `pair::is_tailnet` ranks an address first
+# only when the interface holding it is also named that. A namespace lab
+# creates the wire after `next_wire`, so it can give it the right name up
+# front and skip the rename dance entirely.
 attach_extra() {
   # $1 name, $2 bridge, $3 ip, $4 prefix
   name="$1"; bridge="$2"; addr="$3"; prefix="$4"
@@ -83,12 +100,17 @@ attach_extra() {
   idx="$(cat "$LAB/$name/.ifcount" 2>/dev/null || echo 1)"
   idx=$((idx + 1))
   echo "$idx" > "$LAB/$name/.ifcount"
+  if is_overlay_addr "$addr"; then
+    ifname="utun0"
+  else
+    ifname="eth$idx"
+  fi
   ip link add "h$w" type veth peer name "p$w"
   ip link set "p$w" master "$bridge" up
   ip link set "h$w" netns "$name"
-  ip -n "$name" link set "h$w" name "eth$idx"
-  ip -n "$name" addr add "$addr/$prefix" dev "eth$idx"
-  ip -n "$name" link set "eth$idx" up
+  ip -n "$name" link set "h$w" name "$ifname"
+  ip -n "$name" addr add "$addr/$prefix" dev "$ifname"
+  ip -n "$name" link set "$ifname" up
 }
 
 # The node recipe, lifted from tests/containers/node-entrypoint.sh: the same
