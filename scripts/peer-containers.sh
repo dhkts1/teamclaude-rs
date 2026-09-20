@@ -126,10 +126,14 @@ for script in "${scenarios[@]}"; do
     # One namespace lab per scenario, in one container: nothing here can reach
     # the host or the Docker daemon's own networking (--network none), and the
     # two capabilities are everything the sketch measured needing, never
-    # --privileged.
+    # --privileged. The default docker-default AppArmor profile (active on
+    # ubuntu-latest, absent on OrbStack) denies the mount syscall `ip netns
+    # add` needs even with SYS_ADMIN held, so apparmor=unconfined is what lets
+    # the two capabilities actually do their job, not a third capability.
     container="netlab-$name"
     "$DOCKER" run -d --name "$container" --network none \
       --cap-add NET_ADMIN --cap-add SYS_ADMIN \
+      --security-opt apparmor=unconfined \
       tcr-harness/netlab:dev >/dev/null || { echo "$name: FAIL: netlab container did not start" >&2; status=1; continue; }
     "$DOCKER" exec -e "NETLAB=1" "$container" "/lab-src/scenarios/$name.sh"
     ran=$?
