@@ -375,46 +375,26 @@ jobs:
   # only on whatever machine someone remembers to run it on. continue-on-error
   # keeps a red scenario here from blocking a merge; promotion to the required
   # check list is a separate one-line branch-protection change, not this job.
+  #
+  # --native (scripts/peer-containers.sh --native) was measured here beside
+  # this run on 2026-09-20: 9/10 scenarios passed in 2m29s of scenario time,
+  # but nat-upnp-mapping's miniupnpd refused AddPortMapping with UPnP error
+  # 501 under a bare unshare namespace, on the same commit that scenario
+  # passes 10/10 under Docker. That is the one behaviour netlab-design.md
+  # section 10 already named as reasoned rather than observed, now observed
+  # and red, so this job stays on Docker only; --native remains available for
+  # a local Linux root run and carries the same header note.
   netlab:
     name: netlab
     needs: changes
     if: needs.changes.outputs.inert != 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
-    # 25: room for the toolchain install, the cache restore, the release
-    # build and both runs (native, then Docker) on the same runner. The
-    # Docker run alone measured 9m04s in run 35527760655.
-    timeout-minutes: 25
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      # miniupnpd is the one Dockerfile.netlab:16 installs that ubuntu-latest
-      # does not carry; ip/iptables/iproute2/python3/unshare are already on
-      # the image. iptables here provides both the nft and the legacy
-      # binaries native-inner.sh's scenarios need.
-      - name: Install native netlab dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends iptables miniupnpd
-
-      - name: Build tcr (release)
-        run: |
-          cores="$(nproc)"
-          export CARGO_BUILD_JOBS="$cores"
-          cargo build --release --locked --bin tcr
-
-      - name: Run the netlab scenarios (native, no Docker)
-        run: |
-          set -o pipefail
-          sudo -E scripts/peer-containers.sh --native all 2>&1 | tee "$RUNNER_TEMP/netlab-native.log"
-
-      - name: Run the netlab scenarios (Docker)
+      - name: Run the netlab scenarios
         run: |
           cores="$(nproc)"
           export CARGO_BUILD_JOBS="$cores"
@@ -425,6 +405,4 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: netlab-log
-          path: |
-            ${{ runner.temp }}/netlab.log
-            ${{ runner.temp }}/netlab-native.log
+          path: ${{ runner.temp }}/netlab.log

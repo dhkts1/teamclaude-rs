@@ -28,6 +28,16 @@
 # `--keep` is refused with --native: a namespace dies with the process that
 # holds it, so there is nothing to keep.
 #
+# Measured on ubuntu-latest, 2026-09-20 (run 35533424004): 9 of 10 scenarios
+# passed. nat-upnp-mapping did not: miniupnpd refused AddPortMapping with
+# UPnP error 501 (ActionFailed) under a bare `unshare` namespace, on the same
+# commit that scenario passes 10/10 under --netlab's Docker container. That
+# is the one behaviour netlab-design.md section 10 already named as reasoned
+# rather than observed ("miniupnpd against iptables-legacy in a namespace"),
+# now observed and red, not yet root-caused. The CI netlab job runs Docker
+# only until that is fixed; --native is not wired into CI and is a local,
+# Linux-and-root option with this one known gap.
+#
 # This is the container half of the peer end-to-end. The in-process half,
 # `scripts/peer-e2e-local.sh` over `tests/peer_e2e.rs`, stays the fast gate and
 # this does not replace it: what lives here is every fact that needs a network
@@ -66,7 +76,7 @@ for arg in "$@"; do
     --netlab) NETLAB=1 ;;
     --native) NATIVE=1 ;;
     --list) LIST=1 ;;
-    -h|--help) sed -n '2,47p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,57p' "${BASH_SOURCE[0]}"; exit 0 ;;
     all) WANTED="" ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) WANTED="$arg" ;;
