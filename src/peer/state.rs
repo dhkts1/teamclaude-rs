@@ -197,6 +197,11 @@ pub struct PeerState {
     /// Zero when nothing was held back.
     #[serde(default)]
     pub found_not_shown: usize,
+    /// One-time keypairs minted for a sealed exchange (`src/peer/ask.rs`),
+    /// each with its own absolute deadline. Swept by [`Self::expire`] like
+    /// every other transient row, capped at [`MAX_OUTSTANDING_ASKS`].
+    #[serde(default)]
+    pub asks: Vec<PendingAsk>,
     /// Every key in this file that this build does not know.
     ///
     /// Kept so a read/modify/write here, `tcr peer pair` opening a two-minute
@@ -587,6 +592,45 @@ pub const MAX_LEARNED_KEYS: usize = 32;
 /// flood from a `/24` of addresses costs eight rows, not 254.
 pub const MAX_PENDING_KNOCKS: usize = 8;
 
+/// How many asks may be outstanding at once, the number
+/// [`MAX_PENDING_KNOCKS`] and [`crate::peer::pair::MAX_OUTSTANDING_INVITES`]
+/// already use. What it bounds is different from either: a trial open loop
+/// over at most eight live one-time keypairs, not a PSK the registrar must
+/// trial-decrypt message 1 against.
+pub const MAX_OUTSTANDING_ASKS: usize = 8;
+
+/// One outstanding ask: a one-time keypair minted for a sealed exchange, with
+/// the clock that sweeps it. Lives in the state file, never the peers file:
+/// it is transient, it has a deadline, and losing it costs one re-minted ask,
+/// where losing the peers file costs every pin.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingAsk {
+    /// This row's id, so `spend_ask` can remove exactly the row that opened,
+    /// even when two rows are live at once.
+    pub id: u64,
+    /// The public half, printed as the ask a friend pastes into a chat.
+    pub public: [u8; 32],
+    /// The private half. Never logged, never printed: see [`Debug`] below.
+    pub private: [u8; 32],
+    /// The absolute deadline, swept by [`PeerState::expire`] like every other
+    /// transient row with a clock.
+    pub until_ms: i64,
+}
+
+impl std::fmt::Debug for PendingAsk {
+    /// The private key is deliberately not printed, [`MovedKeys`]'s own move
+    /// (`src/peer/moved.rs:148-153`) for the same reason: a `{:?}` in a log
+    /// line is how a secret reaches a file that keeps scrollback.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAsk")
+            .field("id", &self.id)
+            .field("public", &"[32 bytes]")
+            .field("private", &"(withheld)")
+            .field("until_ms", &self.until_ms)
+            .finish()
+    }
+}
+
 /// The coalescing key for a knock: the peer's IP, with the ephemeral source
 /// port dropped.
 ///
@@ -662,10 +706,18 @@ impl PeerState {
     /// Bans are NOT touched: a ban has no deadline by design, and only
     /// `tcr peer unblock` clears one.
     pub fn expire(&mut self, now_ms: i64) -> usize {
-        let before = self.pending.len() + self.muted.len() + self.accepted.len() + self.found.len();
+        let before = self.pending.len()
+            + self.muted.len()
+            + self.accepted.len()
+            + self.found.len()
+            + self.asks.len();
         self.pending
             .retain(|knock| now_ms.saturating_sub(knock.last_seen_ms) < KNOCK_TTL_MS);
         self.muted.retain(|mute| mute.until_ms > now_ms);
+        // An ask outlives its clock the same way a knock does: the row is
+        // dropped rather than marked, so an expired one-time private key is
+        // never on disk a moment longer than its deadline.
+        self.asks.retain(|ask| now_ms < ask.until_ms);
         // A found row is a beacon this node heard, and it ages out on the
         // same TTL the browse task uses to decide what to show: a Mac whose
         // beacon stopped is gone from `tcr peer ls --json` within
@@ -715,7 +767,23 @@ impl PeerState {
                 keep
             });
         }
-        before - (self.pending.len() + self.muted.len() + self.accepted.len() + self.found.len())
+        before
+            - (self.pending.len()
+                + self.muted.len()
+                + self.accepted.len()
+                + self.found.len()
+                + self.asks.len())
+    }
+
+    /// Remove one outstanding ask by id, `true` if a row was there to remove.
+    ///
+    /// Called in the same locked write as a successful open
+    /// ([`open_reply`](crate::peer::ask::open_reply)), so a second paste of
+    /// the same reply finds no matching row rather than opening it twice.
+    pub fn spend_ask(&mut self, id: u64) -> bool {
+        let before = self.asks.len();
+        self.asks.retain(|ask| ask.id != id);
+        self.asks.len() != before
     }
 
     /// Whether `addr` is muted right now.
@@ -1561,6 +1629,54 @@ pub fn save_path_traffic(path: &Path, traffic: &[PathTraffic]) -> Result<()> {
     replace_section(path, "per-path traffic totals", move |state| {
         state.path_traffic = traffic;
     })
+}
+
+/// Add one freshly minted ask, keeping every other key, refusing past
+/// [`MAX_OUTSTANDING_ASKS`] live rows the way [`crate::peer::pair::mint_invite`]
+/// refuses past `MAX_OUTSTANDING_INVITES`: an expired row does not spend the
+/// cap, so it is dropped here before the count is taken.
+pub fn add_ask(path: &Path, ask: PendingAsk) -> Result<()> {
+    replace_section(path, "an outstanding ask", move |state| {
+        let now = crate::peer::pair::now_ms();
+        state.asks.retain(|row| now < row.until_ms);
+        if state.asks.len() < MAX_OUTSTANDING_ASKS {
+            state.asks.push(ask);
+        }
+    })
+}
+
+/// Try `pasted` against every live ask, and on the first one that opens it,
+/// spend that row in the same locked write.
+///
+/// A locked read-modify-write rather than a separate read and a separate
+/// [`PeerState::spend_ask`]: two processes opening the same reply at once must
+/// not both succeed, and the lock this function takes is the one thing that
+/// makes "spent on the first successful open" true rather than merely
+/// intended.
+pub fn open_and_spend_ask(
+    path: &Path,
+    pasted: &str,
+    now_ms: i64,
+) -> Result<crate::peer::ask::Opened> {
+    let _lock = crate::peer::config::FileLock::acquire(path)
+        .with_context(|| format!("peer join: locking {} to open a reply", path.display()))?;
+    let (mut state, origin) = load_with_origin(path, now_ms)?;
+    if let StateOrigin::Quarantined { aside, reason } = origin {
+        anyhow::bail!(
+            "peer join: {} could not be trusted ({reason}) and was renamed to {}; refusing to \
+             open a reply against a state this process never read",
+            path.display(),
+            aside.map_or_else(
+                || String::from("nowhere: the rename failed too"),
+                |aside| aside.display().to_string()
+            )
+        );
+    }
+    let (opened, id) = crate::peer::ask::open_reply(&state.asks, pasted, now_ms)
+        .map_err(|refusal| anyhow::anyhow!("peer join: {refusal}"))?;
+    state.spend_ask(id);
+    save(path, &state)?;
+    Ok(opened)
 }
 
 /// The locked read-modify-write every section writer above shares, so the lock,

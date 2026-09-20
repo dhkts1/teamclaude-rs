@@ -4408,6 +4408,117 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
     );
 }
 
+/// **The sealed exchange end to end, at the command line**: `invite --sealed`
+/// mints an ask that carries no address, `join --stdin` answers it with a
+/// reply that carries no address either, and `invite --reply --stdin` opens
+/// the reply and names the address the reply carried.
+///
+/// This is the wiring test: `tests/peer_ask.rs` covers the five refusal
+/// shapes against the library directly, and the container scenario
+/// (`tests/containers/scenarios/sealed-invite.sh`) is where the "no address
+/// in the chat" claim is measured over a real grep. This test is the one
+/// that proves the three CLI branches (`--sealed`, `--stdin` on an ask,
+/// `--reply --stdin`) are wired to each other at all.
+#[test]
+fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
+    let inviter = Node::new("sealed-inviter");
+    let mut inviter_file = inviter.file();
+    inviter_file.listen = Some("127.0.0.1:9700".parse().expect("a loopback address"));
+    inviter.write_file(&inviter_file);
+    let inviter_home = scratch("sealed-inviter-home");
+
+    let friend = Node::new("sealed-friend");
+    let mut friend_file = friend.file();
+    friend_file.listen = Some("127.0.0.1:9701".parse().expect("a loopback address"));
+    friend.write_file(&friend_file);
+    let friend_home = scratch("sealed-friend-home");
+
+    let mint = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+        .args(["peer", "invite", "--sealed"])
+        .args(["--peers", inviter.peers.to_str().expect("a utf-8 path")])
+        .env("HOME", &inviter_home)
+        .output()
+        .expect("spawn tcr peer invite --sealed");
+    let mint_out = String::from_utf8_lossy(&mint.stdout).to_string();
+    assert!(
+        mint.status.success(),
+        "minting an ask failed: {mint_out}{}",
+        String::from_utf8_lossy(&mint.stderr)
+    );
+    let ask_line = mint_out
+        .lines()
+        .find(|line| line.starts_with(teamclaude_rs::peer::ask::ASK_PREFIX))
+        .unwrap_or_else(|| panic!("no ask line on stdout: {mint_out}"))
+        .to_string();
+    assert!(
+        !ask_line.contains("9700") && !ask_line.contains("127.0.0.1"),
+        "an ask names no address at a glance: {ask_line}"
+    );
+
+    let mut answer = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+        .args(["peer", "join", "--stdin"])
+        .args(["--peers", friend.peers.to_str().expect("a utf-8 path")])
+        .env("HOME", &friend_home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tcr peer join --stdin");
+    use std::io::Write as _;
+    answer
+        .stdin
+        .as_mut()
+        .expect("the child's stdin")
+        .write_all(format!("{ask_line}\n").as_bytes())
+        .expect("write the ask to stdin");
+    let answer_out = answer.wait_with_output().expect("the child exits");
+    let answer_stdout = String::from_utf8_lossy(&answer_out.stdout).to_string();
+    assert!(
+        answer_out.status.success(),
+        "answering the ask failed: {answer_stdout}{}",
+        String::from_utf8_lossy(&answer_out.stderr)
+    );
+    let reply_line = answer_stdout
+        .lines()
+        .find(|line| line.starts_with(teamclaude_rs::peer::ask::REPLY_PREFIX))
+        .unwrap_or_else(|| panic!("no reply line on stdout: {answer_stdout}"))
+        .to_string();
+    assert!(
+        !reply_line.contains("127.0.0.1"),
+        "a reply names no address at a glance either: {reply_line}"
+    );
+
+    let mut open = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+        .args(["peer", "invite", "--reply", "--stdin"])
+        .args(["--peers", inviter.peers.to_str().expect("a utf-8 path")])
+        .env("HOME", &inviter_home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn tcr peer invite --reply --stdin");
+    open.stdin
+        .as_mut()
+        .expect("the child's stdin")
+        .write_all(format!("{reply_line}\n").as_bytes())
+        .expect("write the reply to stdin");
+    let open_out = open.wait_with_output().expect("the child exits");
+    let open_stdout = String::from_utf8_lossy(&open_out.stdout).to_string();
+    assert!(
+        open_out.status.success(),
+        "opening the reply failed: {open_stdout}{}",
+        String::from_utf8_lossy(&open_out.stderr)
+    );
+    assert!(
+        open_stdout.contains("peer invite: they answer at 127.0.0.1:9701"),
+        "the opened reply names the address the friend answered with: {open_stdout}"
+    );
+    assert!(
+        open_stdout.contains("tcr peer pair 127.0.0.1:9701"),
+        "the next command to run is printed: {open_stdout}"
+    );
+}
+
 /// **`tcr peer invite --plain` mints exactly the readable v2 key**, and none
 /// of the v3-only sentences that only make sense next to an opaque one.
 #[test]

@@ -614,6 +614,34 @@ pub fn local_dial_addresses(listen: SocketAddr, external: Option<SocketAddr>) ->
     )
 }
 
+/// Every address a friend could dial this Mac at right now, or a refusal
+/// naming what to do: the same two checks [`mint_invite_as`] runs before
+/// writing an invite row, in the same words, so answering an ask
+/// (`peer join --stdin`) refuses exactly as `tcr peer invite` would rather
+/// than in a second spelling of the same sentence.
+pub fn addresses_to_offer(
+    store: &PeerStore,
+    external: Option<SocketAddr>,
+) -> Result<Vec<SocketAddr>> {
+    let file = read_or_default(store.path())?;
+    let Some(listen) = file.listen else {
+        bail!(
+            "peer invite: this node has no peer listener, so a token would carry no address \
+             to dial (`tcr peer find on` opens one)"
+        );
+    };
+    let addrs = local_dial_addresses(listen, external);
+    if addrs.is_empty() {
+        bail!(
+            "peer invite: this Mac listens on {listen} and holds no address a friend could \
+             dial, so the key would carry nothing. Join a network and run this again; \
+             `tcr peer reach` says whether the router will forward the port once you are on \
+             one"
+        );
+    }
+    Ok(addrs.into_iter().map(|entry| entry.addr).collect())
+}
+
 /// Mint an invite: generate the secret, store the row, return the token.
 ///
 /// The label is sanitized here, at the point it is accepted, by the one shared
@@ -1694,14 +1722,18 @@ pub enum JoinInput {
     Link(ShareLink),
     /// A bare `tcr-join:…` key, as `tcr peer invite` prints it.
     Key(JoinToken),
+    /// A `tcr-invite:…` ask: names no address, carries no key, and grants
+    /// nothing. Answered with `tcr peer join --stdin`, which seals this Mac's
+    /// addresses to it and prints a reply, rather than joined.
+    Ask(crate::peer::ask::Ask),
 }
 
 impl JoinInput {
-    /// Decide which of the two this string is, by its own prefix.
+    /// Decide which of the three this string is, by its own prefix.
     ///
-    /// The prefixes are disjoint and both are checked, so an input that is
-    /// neither gets a refusal naming both shapes rather than whichever error
-    /// the first parser happened to produce.
+    /// The prefixes are disjoint and all three are checked, so an input that
+    /// is none of them gets a refusal naming every shape rather than
+    /// whichever error the first parser happened to produce.
     pub fn parse(raw: &str) -> Result<Self> {
         let raw = raw.trim();
         if raw.starts_with(LINK_PREFIX) {
@@ -1710,7 +1742,12 @@ impl JoinInput {
         if raw.starts_with(KEY_PREFIX) {
             return JoinToken::parse(raw).map(Self::Key);
         }
-        // The third shape names itself and stops there. `tcr peer moved open`
+        if raw.starts_with(crate::peer::ask::ASK_PREFIX) {
+            return crate::peer::ask::Ask::parse(raw)
+                .map(Self::Ask)
+                .map_err(|refusal| anyhow!("peer join: {refusal}"));
+        }
+        // The fourth shape names itself and stops there. `tcr peer moved open`
         // is the OTHER link under this scheme, and the two are easy to confuse
         // in a chat window where both are one opaque line: a person who pasted
         // the wrong one is told which verb reads it rather than left to read
@@ -1725,16 +1762,21 @@ impl JoinInput {
         }
         bail!(
             "peer join: this is neither a share link ({LINK_PREFIX}…) nor a join key \
-             ({KEY_PREFIX}…). Nothing is printed back, because a paste that failed to \
-             parse is still a live secret and a terminal keeps scrollback"
+             ({KEY_PREFIX}…) nor an invite ({}…). Nothing is printed back, because a \
+             paste that failed to parse is still a live secret and a terminal keeps \
+             scrollback",
+            crate::peer::ask::ASK_PREFIX
         )
     }
 
-    /// The join key to enrol with, if this input carries one.
+    /// The join key to enrol with, if this input carries one. An ask carries
+    /// neither a key nor a network key: that is the honest answer, not a
+    /// missing case.
     pub fn join_token(&self) -> Option<&JoinToken> {
         match self {
             Self::Link(link) => link.join.as_ref(),
             Self::Key(token) => Some(token),
+            Self::Ask(_) => None,
         }
     }
 
@@ -1742,7 +1784,7 @@ impl JoinInput {
     pub fn network_key(&self) -> Option<crate::peer::config::NetworkKey> {
         match self {
             Self::Link(link) => Some(link.network_key),
-            Self::Key(_) => None,
+            Self::Key(_) | Self::Ask(_) => None,
         }
     }
 }
