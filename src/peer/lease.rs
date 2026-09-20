@@ -172,6 +172,67 @@ pub fn schedule_refusal(
     }
 }
 
+/// When the window `schedule` is open inside, at `now`, stops being open,
+/// as unix milliseconds; `None` for a schedule with no intraday edge at all
+/// ([`crate::peer::schedule::Schedule::always`]).
+///
+/// **Assumes `now` is already inside `schedule`**
+/// ([`schedule_refusal`] answered `None` for it): the one caller
+/// ([`Ledger::grant`]) asks this right after that check, on the same
+/// reading. A `between` with no midnight crossing closes today at `end`; a
+/// crossing window closes today at `end` for the tail half (past midnight,
+/// before `end`) and tomorrow at `end` for the head half (past `start`,
+/// before midnight). `between: None` with a `days` filter closes at the next
+/// local midnight, the one intraday edge a day-only schedule has.
+///
+/// Built here rather than as a method on [`crate::peer::schedule::Schedule`]:
+/// `Hhmm`'s and `Schedule`'s own fields are public, this is the only caller,
+/// and the one thing this fix touches outside `lease.rs`'s own module is a
+/// wire refusal that already existed, so the close-time arithmetic stays
+/// beside the clamp ([`clamp_to_grant`]'s `schedule_close_ms`) it feeds
+/// rather than widening `schedule.rs`, which this unit does not own.
+fn schedule_closes_at_ms(
+    schedule: &crate::peer::schedule::Schedule,
+    now: time::OffsetDateTime,
+) -> Option<i64> {
+    let offset = time::UtcOffset::local_offset_at(now).unwrap_or(time::UtcOffset::UTC);
+    let local = now.to_offset(offset);
+    let minute = u16::from(local.hour()) * 60 + u16::from(local.minute());
+    let (close_time, next_day) = match schedule.between {
+        None => {
+            // No time-of-day restriction, only a `days` filter: the one edge
+            // that filter has is the day changing at local midnight.
+            schedule.days.as_ref()?;
+            (time::Time::MIDNIGHT, true)
+        }
+        Some((start, end)) => {
+            let (start_m, end_m) = (start.minute_of_day(), end.minute_of_day());
+            let close_time = time::Time::from_hms(end.hour(), end.minute(), 0).ok()?;
+            match start_m.cmp(&end_m) {
+                std::cmp::Ordering::Less => (close_time, false),
+                std::cmp::Ordering::Greater => {
+                    if minute < end_m {
+                        (close_time, false)
+                    } else {
+                        (close_time, true)
+                    }
+                }
+                // Never open (see `Schedule::contains_at_local`), so `now`
+                // cannot honestly be inside it under this function's own
+                // precondition; answered rather than reached.
+                std::cmp::Ordering::Equal => return None,
+            }
+        }
+    };
+    let date = if next_day {
+        local.date().next_day()?
+    } else {
+        local.date()
+    };
+    let close = date.with_time(close_time).assume_offset(local.offset());
+    i64::try_from(close.unix_timestamp_nanos() / 1_000_000).ok()
+}
+
 /// What [`Ledger::grant`] answers: the frame the borrower gets, and the
 /// operator's own grant that funded it.
 ///
@@ -274,6 +335,22 @@ impl Granted {
 /// decided is "is this end ahead of `now_ms`", and a function that dug the end
 /// out of the grant itself could not be asked about an end the grant does not
 /// carry. [`Ledger::grant`] is the one caller that passes `grant.until`.
+///
+/// `schedule_close_ms` is the FIFTH clamp, on [`Lease::expires_at_ms`] rather
+/// than on whether a lease mints at all: `--between`/`--days` is consulted
+/// once, here, by [`Ledger::grant`], and a lease minted a minute before the
+/// window closes used to keep its full TTL, so it went on serving hours past
+/// the hours it was lent for because nothing after mint ever asked the
+/// schedule again. `expires_at_ms` is already documented as the renewal TTL a
+/// borrower re-asks at, never lowered below what the schedule allows, so
+/// clamping it here means the re-ask lands back in [`Ledger::grant`], which
+/// refuses `OutsideSchedule` honestly once the window is shut, the same
+/// answer a borrower asking for the first time after close already gets. A
+/// `None` here is "this grant has no schedule, or the mint is already
+/// refused for a different reason", never "the window is always open"; the
+/// caller passes `None` in both cases and this function does not tell them
+/// apart, because neither one clamps.
+#[allow(clippy::too_many_arguments)]
 pub fn clamp_to_grant(
     ask: &LeaseRequest,
     granted: Option<LendGrant>,
@@ -282,6 +359,7 @@ pub fn clamp_to_grant(
     now_ms: i64,
     lease_id: u128,
     end: Option<u64>,
+    schedule_close_ms: Option<i64>,
 ) -> LeaseGrant {
     let refuse = |refusal: LeaseRefusal| LeaseGrant {
         lease: None,
@@ -318,13 +396,21 @@ pub fn clamp_to_grant(
         return refuse(LeaseRefusal::LeaseExpired);
     }
     let ttl_s = ask.ttl_s.min(grant.ttl_s);
+    let expires_at_ms = now_ms + i64::from(ttl_s) * 1_000;
+    // THE FIFTH CLAMP. See this function's own doc: a schedule is consulted
+    // at mint only, so the TTL is never allowed to outlive the window it was
+    // minted inside.
+    let expires_at_ms = match schedule_close_ms {
+        Some(close_ms) => expires_at_ms.min(close_ms),
+        None => expires_at_ms,
+    };
     LeaseGrant {
         lease: Some(Lease {
             lease_id,
             window: ask.window,
             unit: LeaseUnit::Fraction(amount),
             granted_at_ms: now_ms,
-            expires_at_ms: now_ms + i64::from(ttl_s) * 1_000,
+            expires_at_ms,
             spent: 0.0,
             max_inflight: ask.max_inflight.min(grant.max_inflight),
             until: end,
@@ -1680,10 +1766,16 @@ impl Ledger {
         // Mac's local offset itself, which is the offset an operator means by
         // "between 22:00 and 08:00". A grant with no schedule at all answers
         // `None` from `LendGrant::schedule` and never reaches this branch.
-        if let Some(schedule) = granted.as_ref().and_then(|grant| grant.schedule()) {
-            if let Some(refusal) =
-                schedule_refusal(Some(&schedule), time::OffsetDateTime::now_utc())
-            {
+        //
+        // The instant itself is kept beside the schedule (`schedule_now`),
+        // because `schedule_close_ms` below answers off the SAME reading:
+        // asking the wall clock again a few lines down would let a request
+        // straddling a clock tick see `contains` say yes against one second
+        // and the close computed against a different one.
+        let schedule_now = time::OffsetDateTime::now_utc();
+        let schedule = granted.as_ref().and_then(|grant| grant.schedule());
+        if let Some(schedule) = schedule.as_ref() {
+            if let Some(refusal) = schedule_refusal(Some(schedule), schedule_now) {
                 tracing::info!(
                     peer = %peer.display(),
                     window = ?ask.window,
@@ -1693,6 +1785,16 @@ impl Ledger {
                 return Granted::unfunded(refusal);
             }
         }
+        // THE FIFTH CLAMP's input: the window this lease is being minted
+        // inside stops being open at this instant, so nothing after mint has
+        // to consult the schedule again. See `clamp_to_grant`'s own doc and
+        // `schedule_closes_at_ms` below, this module's own helper:
+        // `Schedule`'s fields are public and this is the one caller, so the
+        // close-time arithmetic lives beside the clamp it feeds rather than
+        // adding a method to a module this unit does not own.
+        let schedule_close_ms = schedule
+            .as_ref()
+            .and_then(|schedule| schedule_closes_at_ms(schedule, schedule_now));
         // The scope, read off the grant the operator wrote. It stays
         // HERE: recorded beside the lease in this ledger and never put on the
         // wire.
@@ -1784,6 +1886,7 @@ impl Ledger {
             crate::now_ms(),
             lease_id,
             end,
+            schedule_close_ms,
         );
         if let Some(lease) = grant.lease {
             // The grantee, from the AUTHENTICATED session this answer is for,

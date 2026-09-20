@@ -705,7 +705,16 @@ fn a_grant_is_clamped_by_the_narrowest_of_the_three() {
     let granted = LendGrant::new(Window::SevenDay, 0.20, 300, 2);
 
     // The operator's grant is the narrowest of the three.
-    let grant = lease::clamp_to_grant(&ask, Some(granted.clone()), true, 0.40, NOW, LEASE, None);
+    let grant = lease::clamp_to_grant(
+        &ask,
+        Some(granted.clone()),
+        true,
+        0.40,
+        NOW,
+        LEASE,
+        None,
+        None,
+    );
     let minted = grant.lease.expect("0.20 is lendable, so a lease is minted");
     assert_eq!(minted.unit, LeaseUnit::Fraction(0.20));
     assert_eq!(minted.max_inflight, 2, "the grant's cap, not the ask's");
@@ -716,7 +725,16 @@ fn a_grant_is_clamped_by_the_narrowest_of_the_three() {
     );
 
     // The MEASURED headroom is the narrowest of the three.
-    let tight = lease::clamp_to_grant(&ask, Some(granted.clone()), true, 0.03, NOW, LEASE, None);
+    let tight = lease::clamp_to_grant(
+        &ask,
+        Some(granted.clone()),
+        true,
+        0.03,
+        NOW,
+        LEASE,
+        None,
+        None,
+    );
     assert_eq!(
         tight.lease.map(|lease| lease.unit),
         Some(LeaseUnit::Fraction(0.03)),
@@ -725,14 +743,31 @@ fn a_grant_is_clamped_by_the_narrowest_of_the_three() {
 
     // Below MIN_DEBIT there is no lease to mint: the first request would
     // overdraw it. Nothing is spent, so the refusal names the owner's guard.
-    let none_left =
-        lease::clamp_to_grant(&ask, Some(granted.clone()), true, 0.0005, NOW, LEASE, None);
+    let none_left = lease::clamp_to_grant(
+        &ask,
+        Some(granted.clone()),
+        true,
+        0.0005,
+        NOW,
+        LEASE,
+        None,
+        None,
+    );
     assert_eq!(none_left.lease, None);
     assert_eq!(none_left.refusal, Some(LeaseRefusal::OwnerGuard));
 
     // The lender's own opt-in is off: SERVE is not on offer at all, whatever the
     // arithmetic would have said.
-    let blind = lease::clamp_to_grant(&ask, Some(granted.clone()), false, 0.40, NOW, LEASE, None);
+    let blind = lease::clamp_to_grant(
+        &ask,
+        Some(granted.clone()),
+        false,
+        0.40,
+        NOW,
+        LEASE,
+        None,
+        None,
+    );
     assert_eq!(blind.lease, None);
     assert_eq!(blind.refusal, Some(LeaseRefusal::InspectNotGranted));
 
@@ -741,7 +776,8 @@ fn a_grant_is_clamped_by_the_narrowest_of_the_three() {
         window: Window::FiveHour,
         ..granted.clone()
     };
-    let mismatch = lease::clamp_to_grant(&ask, Some(other_window), true, 0.40, NOW, LEASE, None);
+    let mismatch =
+        lease::clamp_to_grant(&ask, Some(other_window), true, 0.40, NOW, LEASE, None, None);
     assert_eq!(mismatch.lease, None);
     assert_eq!(mismatch.refusal, Some(LeaseRefusal::InspectNotGranted));
 
@@ -759,6 +795,7 @@ fn a_grant_is_clamped_by_the_narrowest_of_the_three() {
             0.40,
             NOW,
             LEASE,
+            None,
             None
         )
         .refusal,
@@ -776,6 +813,7 @@ fn a_grant_is_clamped_by_the_narrowest_of_the_three() {
             0.40,
             NOW,
             LEASE,
+            None,
             None
         )
         .refusal,
@@ -4506,6 +4544,7 @@ fn a_grant_past_its_end_mints_nothing_and_one_ahead_carries_it() {
         now_ms,
         LEASE,
         Some(now_s - 1),
+        None,
     );
     assert_eq!(past.lease, None);
     assert_eq!(past.refusal, Some(LeaseRefusal::LeaseExpired));
@@ -4518,6 +4557,7 @@ fn a_grant_past_its_end_mints_nothing_and_one_ahead_carries_it() {
         now_ms,
         LEASE,
         Some(now_s + 7_200),
+        None,
     );
     assert_eq!(
         ahead
@@ -4529,8 +4569,16 @@ fn a_grant_past_its_end_mints_nothing_and_one_ahead_carries_it() {
     );
 
     // No end asked for, no end on the lease.
-    let endless =
-        lease::clamp_to_grant(&ask, Some(granted.clone()), true, 0.40, now_ms, LEASE, None);
+    let endless = lease::clamp_to_grant(
+        &ask,
+        Some(granted.clone()),
+        true,
+        0.40,
+        now_ms,
+        LEASE,
+        None,
+        None,
+    );
     assert_eq!(
         endless.lease.expect("a lease with no end is granted").until,
         None
@@ -5070,6 +5118,82 @@ fn a_grant_outside_its_window_is_refused_and_inside_it_mints() {
         Some(LeaseRefusal::OutsideSchedule),
         "and it says WHICH refusal: a borrower told `InspectNotGranted` would go and ask \
          its operator for a grant it already has"
+    );
+}
+
+/// A2-3. `--between`/`--days` is consulted at MINT ONLY: `Ledger::grant`
+/// checks `schedule_refusal` once, and nothing after it ever asks the
+/// schedule again. So a lease minted moments before its window closes used to
+/// keep serving for its whole TTL, hours past the hours it was lent for.
+///
+/// Same clock trick as
+/// [`a_grant_outside_its_window_is_refused_and_inside_it_mints`]: the window
+/// is built off this Mac's real wall clock, closing about two minutes from
+/// mint, with a one-HOUR ttl on the ask, so a fix that only shortens the
+/// grant's own `ttl_s` cannot pass this by coincidence.
+///
+/// Watch it fail by reverting the fifth clamp in `clamp_to_grant`: minted
+/// keeps its full one-hour `expires_at_ms`, `may_relay` two minutes later
+/// still says `Ok(())`, and the window closed ten minutes ago as far as the
+/// schedule is concerned.
+#[test]
+fn a_lease_minted_before_its_window_closes_stops_serving_at_the_close() {
+    use teamclaude_rs::peer::schedule::Between;
+
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let peers = dir.path().join("tcr-peers.json");
+    let borrower = PeerId([24_u8; 32]);
+
+    let now_utc = time::OffsetDateTime::now_utc();
+    let offset = time::UtcOffset::local_offset_at(now_utc).unwrap_or(time::UtcOffset::UTC);
+    let local = now_utc.to_offset(offset);
+    let minute = |shift: i16| -> (u8, u8) {
+        let total = i32::from(local.hour()) * 60 + i32::from(local.minute()) + i32::from(shift);
+        let total = total.rem_euclid(24 * 60);
+        ((total / 60) as u8, (total % 60) as u8)
+    };
+    let (start_h, start_m) = minute(-3);
+    let (end_h, end_m) = minute(2);
+    let window = format!("{start_h:02}:{start_m:02}-{end_h:02}:{end_m:02}");
+
+    let ask = LeaseRequest {
+        window: Window::SevenDay,
+        unit: LeaseUnit::Fraction(0.20),
+        // A full hour, deliberately far longer than the two minutes left on
+        // the window: the clamp this test guards is the one that shortens
+        // THIS, not the grant's own `ttl_s`.
+        ttl_s: 3600,
+        max_inflight: 2,
+    };
+    let mut grant = LendGrant::new(Window::SevenDay, 0.20, 3600, 2);
+    grant.between = Some(window.parse::<Between>().expect("the window parses"));
+    write_peers(&peers, vec![lender_row_for(borrower, vec![grant])]);
+    let store = PeerStore::open(&peers).expect("the peers file opens");
+
+    let mut ledger = Ledger::new();
+    ledger.note_owner_headroom(Window::SevenDay, 0.40);
+    let minted = ledger
+        .grant(&borrower, &ask, &store, &serve::NoFleetUtilization)
+        .answer
+        .lease
+        .expect("the window is open right now, so this mints");
+
+    let mint_ms = teamclaude_rs::now_ms();
+    assert!(
+        minted.expires_at_ms - mint_ms <= 2 * 60_000 + 5_000,
+        "expires_at_ms must be clamped to the window's close, not the ask's one-hour ttl: \
+         got {} ms out from mint",
+        minted.expires_at_ms - mint_ms
+    );
+
+    // Two minutes on, past the window's close and nowhere near the lease's
+    // full one-hour ttl.
+    let two_minutes_on = mint_ms + 2 * 60_000;
+    assert_eq!(
+        ledger.may_relay(minted.lease_id, two_minutes_on),
+        Err(LeaseRefusal::LeaseExpired),
+        "a lease whose window closed must stop serving at the close, not ride out its own \
+         renewal ttl"
     );
 }
 
