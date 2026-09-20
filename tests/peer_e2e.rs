@@ -934,7 +934,7 @@ async fn two_macs_find_each_other_pair_on_six_digits_and_pin() {
     );
     let text = lender.peer_ok(&["pending"]);
     assert!(
-        text.contains("wants to pair") && text.contains(&instance),
+        text.contains("wants to connect") && text.contains(&instance),
         "the text row is what the operator reads: {text}"
     );
     // The whole point: before Accept, the requester has been told

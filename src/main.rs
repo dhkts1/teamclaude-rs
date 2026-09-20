@@ -168,7 +168,7 @@ mod peer_cli {
         Lend(PeerLendArgs),
         /// Choose how this Mac reaches the internet.
         Via(PeerViaArgs),
-        /// Show the Macs asking to pair with this one, and nothing else about
+        /// Show the Macs asking to connect with this one, and nothing else about
         /// them: a request is a row, never a trust decision.
         Pending(PeerPendingArgs),
         /// Approve one pairing request, opening a two-minute window for that
