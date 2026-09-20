@@ -323,8 +323,31 @@ cmd_up() {
 }
 
 cmd_add() {
-  name="$1"; lan="$2"; addr="$3"
+  # netlab add <name> --lan <lan>: the address is not the caller's to pick,
+  # because the caller does not know what a running lab already handed out.
+  # A per-lan counter file does, starting past every address the topology's
+  # own hosts and their `extra` wires could plausibly hold.
+  name=""; lan=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --lan) lan="$2"; shift 2 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  : "${name:?netlab add: a node name is required}"
+  : "${lan:?netlab add: --lan <lan> is required}"
   bridge="$(awk -v want="$lan" '$1=="lan" && $2==want {print $3}' "$LAB/.plan")"
+  cidr="$(awk -v want="$lan" '$1=="lan" && $2==want {print $4}' "$LAB/.plan")"
+  if [ -z "$bridge" ] || [ -z "$cidr" ]; then
+    echo "netlab: FAIL: no lan named $lan in this lab's plan" >&2
+    return 1
+  fi
+  prefix="${cidr%.*/*}"
+  counter="$LAB/.addnum-$lan"
+  n=50
+  [ -f "$counter" ] && n="$(cat "$counter")"
+  addr="$prefix.$n"
+  echo "$((n + 1))" > "$counter"
   t0="$(now_ms)"
   attach_host "$name" "$bridge" "$addr" 24 -
   echo "node 7755 8088" > "$LAB/$name/role"
@@ -334,14 +357,31 @@ cmd_add() {
   echo "netlab: added $name at $addr in $((t1 - t0))ms"
 }
 
+# One row per node, including a live read of `tcr status --json` for every
+# node whose role file names it a `node` (a router or the upstream stub has
+# no `tcr` inside it to ask). `tcr status` reads the port out of the node's
+# OWN config and asks its OWN loopback, so this is the same call a person
+# would run on their own Mac, over `ip netns exec` rather than `ssh`.
 cmd_ps() {
-  printf '%-12s %-16s %-8s %s\n' NODE ADDRESS PID LISTENER
+  printf '%-18s %-16s %-8s %-8s %-6s %-8s %s\n' NODE ADDRESS PID ROLE SRC STATUS ACCOUNT
   for dir in "$LAB"/*/; do
     name="$(basename "$dir")"
     [ -f "$dir/role" ] || continue
+    role="$(awk '{print $1}' "$dir/role")"
     pid="$(cat "$dir/pid" 2>/dev/null || echo -)"
-    line="$(grep -o 'node=tcr-[A-Z0-9]*' "$dir/boot.log" 2>/dev/null | tail -1 || true)"
-    printf '%-12s %-16s %-8s %s\n' "$name" "$(cat "$dir/addr")" "$pid" "${line:--}"
+    addr="$(cat "$dir/addr" 2>/dev/null || echo -)"
+    src="-"; status="-"; account="-"
+    if [ "$role" = "node" ]; then
+      row="$(ip netns exec "$name" env HOME="$dir" XDG_CACHE_HOME="$dir/.cache" \
+        tcr status --json --config "$dir/.config/teamclaude.json" 2>/dev/null \
+        | python3 "$SRC/netlab-ps-row.py" || true)"
+      if [ -n "$row" ]; then
+        src="$(echo "$row" | cut -d' ' -f1)"
+        status="$(echo "$row" | cut -d' ' -f2)"
+        account="$(echo "$row" | cut -d' ' -f3)"
+      fi
+    fi
+    printf '%-18s %-16s %-8s %-8s %-6s %-8s %s\n' "$name" "$addr" "$pid" "$role" "$src" "$status" "$account"
   done
 }
 
