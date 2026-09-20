@@ -240,10 +240,15 @@ mints a one-use, ten-minute join key and rides it inside the same link, so openi
 completes pairing with this Mac, with no six-digit compare needed. Because that link is a live
 secret for as long as it is valid, send it somewhere as private as you would a password.
 
-`tcr peer invite` mints the same kind of one-use join key on its own (`tcr-join:v1:...`), for
-a Mac with no browser to open a link in; `tcr peer join --stdin` (or `--stdin` on
-`network-key join`) reads a key from standard input instead of the command line, so it never
-lands in shell history or in another process's view of this one's arguments.
+`tcr peer invite` mints the same kind of one-use join key on its own
+(`tcr-join:v2:<addr,addr,...>:...`), for a Mac with no browser to open a link in. The key
+carries every address this Mac answers at, best first, and the joining Mac works down the
+list, so the same key reaches a friend on the tailnet and a friend in the next room. A key
+from an older build carried one address, and this build still reads one of those.
+
+`tcr peer join --stdin` (or `--stdin` on `network-key join`) reads a key from standard input
+instead of the command line, so it never lands in shell history or in another process's view
+of this one's arguments.
 
 A Mac that already has a network key **refuses a link that carries a different one**, and says
 what accepting it would cut this Mac off from. Pasting a second office's key over the first is

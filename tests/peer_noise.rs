@@ -1337,14 +1337,14 @@ fn a_state_file_this_writer_creates_carries_the_format_version() {
 #[test]
 fn a_join_token_round_trips() {
     for addr in ["127.0.0.1:9600", "[::1]:9600"] {
-        let token = pair::JoinToken {
-            addr: addr.parse().expect("a test address"),
-            registrar: PeerId([3_u8; 32]),
-            secret: [7_u8; 32],
-        };
+        let token = pair::JoinToken::new(
+            vec![addr.parse().expect("a test address")],
+            PeerId([3_u8; 32]),
+            [7_u8; 32],
+        );
         let rendered = token.to_token();
         assert!(
-            rendered.starts_with(pair::TOKEN_PREFIX),
+            rendered.starts_with(pair::KEY_PREFIX),
             "an operator has to be able to see what they are pasting: {rendered}"
         );
         assert_eq!(
@@ -1368,19 +1368,24 @@ fn a_join_token_round_trips() {
 /// ground, so only a token that is well-formed in every field EXCEPT its
 /// version measures the version check.
 #[test]
-fn a_join_token_that_is_not_v1_is_refused() {
-    let v1 = pair::JoinToken {
-        addr: "127.0.0.1:9600".parse().expect("a test address"),
-        registrar: PeerId([3_u8; 32]),
-        secret: [7_u8; 32],
-    }
+fn a_join_token_with_an_unknown_version_is_refused() {
+    let good = pair::JoinToken::new(
+        vec!["127.0.0.1:9600".parse().expect("a test address")],
+        PeerId([3_u8; 32]),
+        [7_u8; 32],
+    )
     .to_token();
-    let v2 = v1.replace("tcr-join:v1:", "tcr-join:v2:");
-    assert_ne!(v1, v2, "the fixture has to differ from the good token");
-    let error = pair::JoinToken::parse(&v2)
-        .expect_err("a v2 token must be refused rather than read as a v1 one");
+    // v1 and v2 are both read now, so the fixture is the next version along:
+    // the check is that an unknown one is refused for BEING unknown.
+    let unknown = good.replace("tcr-join:v2:", "tcr-join:v3:");
+    assert_ne!(
+        good, unknown,
+        "the fixture has to differ from the good token"
+    );
+    let error = pair::JoinToken::parse(&unknown)
+        .expect_err("a v3 token must be refused rather than read as one of the two known ones");
     assert!(
-        format!("{error:#}").contains("not a v1 join key"),
+        format!("{error:#}").contains("not a join key"),
         "the refusal has to be about the VERSION: a token whose only fault is its version \
          must not be refused by accident, further in, on a field that happened to move: \
          {error:#}"
@@ -1792,7 +1797,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
     accepting.await.expect("the registrar's half");
 
     assert_eq!(
-        pinned, registrar_id,
+        pinned.peer, registrar_id,
         "the joiner pins the key the token named, as the handshake proved it"
     );
 
@@ -2027,11 +2032,11 @@ fn a_planted_symlink_does_not_capture_the_node_key() {
 /// empty-input refusal, the first assertion fails.
 #[test]
 fn a_join_token_arrives_on_stdin_and_never_in_a_message() {
-    let token = pair::JoinToken {
-        addr: "127.0.0.1:9600".parse().expect("a test address"),
-        registrar: PeerId([3_u8; 32]),
-        secret: [7_u8; 32],
-    };
+    let token = pair::JoinToken::new(
+        vec!["127.0.0.1:9600".parse().expect("a test address")],
+        PeerId([3_u8; 32]),
+        [7_u8; 32],
+    );
     let rendered = token.to_token();
 
     assert_eq!(

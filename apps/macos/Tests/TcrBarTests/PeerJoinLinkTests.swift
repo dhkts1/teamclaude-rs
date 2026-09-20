@@ -25,6 +25,53 @@ final class PeerJoinLinkTests: XCTestCase {
         XCTAssertEqual(invocation.stdin, "tcr://peer/join?v=1&nk=AAAABBBBCCCCDDDD&jk=EEEEFFFF")
     }
 
+    /// A join key carries a LIST of addresses now, comma separated, and the
+    /// whole link still goes across unparsed.
+    ///
+    /// The comma is the reason this test exists: it is a sub-delimiter in a
+    /// query value, so a URL layer that decided to re-encode it, or a panel
+    /// that split the query itself, would hand `tcr` a key whose address list
+    /// no longer parses. The keys here are obviously fake, and the addresses
+    /// are documentation-range ones.
+    ///
+    /// Watched red: have ``PeerJoinLink/invocation(for:)`` put
+    /// `url.absoluteString` through a comma-stripping replacement and the
+    /// stdin assertion fails on the first address pair.
+    func testAJoinKeyWithSeveralAddressesSurvivesTheRoundTrip() throws {
+        let key = "tcr-join:v2:192.0.2.10:7755,198.51.100.9:41641:AAAABBBB:CCCCDDDD"
+        let link = try url("tcr://peer/join?v=1&nk=AAAABBBBCCCCDDDD&jk=\(key)")
+        let invocation = try XCTUnwrap(try? PeerJoinLink.invocation(for: link).get())
+        XCTAssertEqual(
+            invocation.stdin, link.absoluteString,
+            "the CLI owns what a key means, so the whole link goes across unparsed")
+        XCTAssertTrue(
+            invocation.stdin.contains("192.0.2.10:7755,198.51.100.9:41641"),
+            "the address list reached stdin with its commas intact: \(invocation.stdin)")
+        XCTAssertFalse(
+            invocation.secretIsInArgv,
+            "a key with five addresses in it is still a secret")
+    }
+
+    /// An IPv6 address inside a key is bracketed, and Foundation rewrites a
+    /// bracket in a query to `%5B`/`%5D` on the way into `absoluteString`.
+    ///
+    /// This test states that as a fact rather than fighting it: the link that
+    /// reaches `tcr peer join --stdin` is the escaped one, which is why the
+    /// CLI's own link parser reads both spellings. A build where this stopped
+    /// being true would break the other half of that pair, so it is pinned
+    /// here and not assumed.
+    func testABracketedAddressArrivesEscapedAndIsStillTheWholeLink() throws {
+        let key = "tcr-join:v2:[2001:db8::4]:7755,192.0.2.10:7755:AAAABBBB:CCCCDDDD"
+        let link = try url("tcr://peer/join?v=1&jk=\(key)")
+        let invocation = try XCTUnwrap(try? PeerJoinLink.invocation(for: link).get())
+        XCTAssertEqual(
+            invocation.stdin, link.absoluteString,
+            "the whole link goes across, whatever the URL layer did to it")
+        XCTAssertTrue(
+            invocation.stdin.contains("%5B2001:db8::4%5D:7755,192.0.2.10:7755"),
+            "the bracketed address arrives escaped, and the CLI reads it: \(invocation.stdin)")
+    }
+
     /// And never into argv. `nk` and `jk` are credentials, and argv is
     /// readable by every process on this Mac through `ps`.
     func testTheSecretIsNeverInArgv() throws {

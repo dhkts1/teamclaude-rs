@@ -988,13 +988,30 @@ Mints a one-line join key for a Mac with no screen to compare digits on: the hea
 | `--uses <n>` | int | `1` | how many Macs may join with this one key |
 | `--revoke <id>` | int | none | revoke an outstanding key by id instead of minting one |
 
+The key carries **every address this Mac can be reached at**, best first
+(`tcr-join:v2:<addr,addr,...>:...`), and the joining Mac tries them in order: the tailnet
+address, then the external address a port mapping published, then each address a real
+interface holds. A bind address is never one of them: a Mac listening on `0.0.0.0` used to
+mint a key reading `0.0.0.0`, which sent the friend's `tcr peer join` at its own machine.
+Under the key, one line per address says which kind it is:
+
+```
+peer invite: tailscale 100.64.0.1:7755
+peer invite: lan 192.0.2.10:7755
+```
+
+When none of them is reachable from outside this network, one more line says so: over the
+internet the friend needs this Mac's router to forward the port, and `tcr peer reach` reports
+where that stands. When `listen` names one specific address rather than `0.0.0.0`, the key
+carries that address alone, because somebody chose it.
+
 ### `tcr peer join [key]`
 
 Joins another Mac using a key or link it printed.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `[key]` | positional | | the `tcr-join:v1:…` key or the `tcr://peer/join?…` link the other Mac printed. **Visible in `ps` and shell history**: use `--stdin` to avoid that |
+| `[key]` | positional | | the `tcr-join:…` key or the `tcr://peer/join?…` link the other Mac printed. **Visible in `ps` and shell history**: use `--stdin` to avoid that |
 | `--stdin` | bool | `false` | read the key or link from standard input instead of argv. The only path the panel and the `tcr://` URL handler use, and the one that never leaks the secret to another process |
 | `--label <name>` | string | none | this Mac's name, as the other one will show it |
 | `--replace` | bool | `false` | accept a link's network key when this Mac already has one |
