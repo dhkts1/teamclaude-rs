@@ -269,6 +269,19 @@ Reaching it tries a few things, in order:
   re-reads it every few seconds, so turning it on asks the router within that and turning it
   off deletes the mapping, neither needing a restart.
   `tcr peer reach` prints what your router agreed to.
+
+  Routers turn NAT-PMP down in two ways: most say nothing at all, and some refuse the request
+  outright. Both mean the same thing, that there is no NAT-PMP service there to ask, so both
+  are followed by the UPnP attempt. A router that will not open a port over either protocol is
+  asked again more and more slowly, after 5 seconds, then 30, then 2 minutes, then every 10
+  minutes, rather than every few seconds all day; the wait goes back to 5 seconds the moment
+  anything could have changed, when you turn the switch off and on again, when this Mac moves
+  to another router, or when a request is granted. What you see in the log is one line when
+  the answer changes and nothing more until it changes again.
+
+  If neither protocol will open a port, two things still work: forward the peer listener's port
+  to this Mac by hand in your router's own settings, or put both Macs on one private network
+  (Tailscale, or any VPN they both join) and pair over that.
 - **A fallback port that changes with the clock, for the dialling side only.** If
   the address this Mac last saw the peer at stops answering, both sides already know, without
   saying so to each other, a small set of ports that are "accepted" for right now: they are
