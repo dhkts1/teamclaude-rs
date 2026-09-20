@@ -51,7 +51,7 @@
 //! kept for [`pairing_window`]'s own test coverage rather than deleted, which
 //! is out of scope here.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -77,69 +77,227 @@ pub const MAX_OUTSTANDING_INVITES: usize = 8;
 /// while it exists.
 pub const INVITE_DEFAULT_TTL_SECS: u32 = 600;
 
-/// The one-line token an operator pastes.
+/// What kind of path one address in a join key is, as the Mac that minted the
+/// key knew it.
 ///
-/// Shape: `tcr-join:v1:<host:port>:<b32 static-pub>:<b32 secret32>`. A version
-/// field because this string is the one thing an operator moves between two
-/// builds by hand.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JoinToken {
-    /// Where to dial. An address, never a name to resolve: discovery is a
-    /// separate, optional mechanism and a token must work without it.
+/// **How this Mac learned the address, not a claim on the wire.** The same rule
+/// [`crate::peer::config::EndpointSource`] follows, and the reason it is not
+/// rendered into the key: a sender's word about its own address is not
+/// evidence, the joiner dials in the order it was given, and a reader that
+/// believed a kind field would be believing the one party that cannot be
+/// checked. It exists so `tcr peer invite` can tell an operator which of the
+/// lines under their key is the tailnet one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialAddressKind {
+    /// The listener is bound to one specific address and somebody chose it, so
+    /// it is the only address the key carries.
+    Chosen,
+    /// A tailnet address: a `utun` interface holding one out of
+    /// `100.64.0.0/10`. First, because it works from any network the friend is
+    /// on without a router forwarding anything.
+    Tailscale,
+    /// The external socket a held port mapping published, which is the one
+    /// address a friend anywhere on the internet can open.
+    Internet,
+    /// An address a real interface holds: reachable from this network and no
+    /// further.
+    Lan,
+    /// Read out of a pasted key. This Mac derived nothing about it, which is
+    /// what a parsed key honestly knows.
+    FromKey,
+}
+
+impl DialAddressKind {
+    /// The one word a surface prints for this kind. One spelling, so an
+    /// operator grepping their scrollback and a reader of this file see the
+    /// same token.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chosen => "chosen",
+            Self::Tailscale => "tailscale",
+            Self::Internet => "internet",
+            Self::Lan => "lan",
+            Self::FromKey => "from-key",
+        }
+    }
+}
+
+/// One address a friend could dial this Mac at, with what kind of path it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialAddress {
+    /// The full socket, as it goes into the key.
     pub addr: SocketAddr,
+    /// See [`DialAddressKind`]: local knowledge, never part of the key.
+    pub kind: DialAddressKind,
+}
+
+impl DialAddress {
+    /// An address read out of a pasted key.
+    pub fn from_key(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            kind: DialAddressKind::FromKey,
+        }
+    }
+}
+
+/// One address an interface holds, with the interface's own name.
+///
+/// The name is carried because the address alone cannot answer the one question
+/// the rank order turns on: `100.64.0.0/10` is both a tailnet and the range a
+/// mobile hotspot hands out (`crate::peer::listener::is_lan_scope`'s own doc
+/// says so), and putting a hotspot address first would put the slowest path
+/// first for everybody on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAddress {
+    /// The interface name, `utun4` or `en0`.
+    pub interface: String,
+    /// The address it holds.
+    pub addr: IpAddr,
+}
+
+/// The one-line key an operator pastes.
+///
+/// Shape: `tcr-join:v2:<addr,addr,…>:<b32 static-pub>:<b32 secret32>`, and a v1
+/// key with one address is still read. A version field because this string is
+/// the one thing an operator moves between two builds by hand.
+///
+/// # Why it is a list
+///
+/// It used to be the one address the peers file's `listen` field held, and a
+/// listener bound to `0.0.0.0` made every key say `0.0.0.0`: the friend's `tcr
+/// peer join` then dialled its own machine. A bind address is not a dial
+/// address, and there is no single dial address either, the friend on the
+/// tailnet and the friend in the next room reach this Mac at different ones. So
+/// the key carries all of them, best first, and the joiner works down the list.
+#[derive(Debug, Clone)]
+pub struct JoinToken {
+    /// Where to dial, best first and never empty. Addresses, never names to
+    /// resolve: discovery is a separate, optional mechanism and a key must work
+    /// without it.
+    pub addrs: Vec<DialAddress>,
     /// The registrar's static public key, the `IK` half.
     pub registrar: PeerId,
     /// The 32-byte join secret, the `psk1` half.
     pub secret: [u8; 32],
 }
 
-/// What every token starts with. The version is checked, never guessed at.
+/// Two keys are equal when they carry the same bytes.
+///
+/// [`DialAddressKind`] is deliberately not compared: it is what the minting Mac
+/// knew about its own address, it never goes on the wire, and a key that
+/// round-trips through a paste buffer would otherwise stop equalling itself.
+impl PartialEq for JoinToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.registrar == other.registrar
+            && self.secret == other.secret
+            && self.addrs.len() == other.addrs.len()
+            && self
+                .addrs
+                .iter()
+                .zip(other.addrs.iter())
+                .all(|(ours, theirs)| ours.addr == theirs.addr)
+    }
+}
+
+impl Eq for JoinToken {}
+
+/// What every join key starts with, whatever version follows it.
+pub const KEY_PREFIX: &str = "tcr-join:";
+
+/// The v1 key: exactly one address. Still read, never minted.
 pub const TOKEN_PREFIX: &str = "tcr-join:v1:";
 
+/// The v2 key: one or more addresses, comma-separated, best first.
+pub const TOKEN_PREFIX_V2: &str = "tcr-join:v2:";
+
 impl JoinToken {
-    /// Render the token for pasting.
+    /// A key for a list of addresses, best first, as a pasted key knows them.
     ///
-    /// The address stays plain text, an operator who has to read a token out
+    /// The kinds are [`DialAddressKind::FromKey`], which is what a caller
+    /// holding bare sockets can honestly say. [`mint_invite_as`] builds its own
+    /// with the kinds it derived.
+    pub fn new(addrs: Vec<SocketAddr>, registrar: PeerId, secret: [u8; 32]) -> Self {
+        Self {
+            addrs: addrs.into_iter().map(DialAddress::from_key).collect(),
+            registrar,
+            secret,
+        }
+    }
+
+    /// Every address in the key, in the order to dial them.
+    pub fn sockets(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.addrs.iter().map(|entry| entry.addr)
+    }
+
+    /// Render the key for pasting.
+    ///
+    /// The addresses stay plain text, an operator who has to read a key out
     /// loud can at least see which machine it points at, and base32ing
     /// `127.0.0.1:9600` hides nothing that the two 52-character fields after it
     /// do not already reveal is there. The two 32-byte fields go through the one
     /// base32 codec this tree has.
+    ///
+    /// Always v2, including for a single address: one shape to read back means
+    /// the parser's v1 arm only ever sees a key an older build minted.
     pub fn to_token(&self) -> String {
+        let addrs = self
+            .sockets()
+            .map(|addr| addr.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{TOKEN_PREFIX}{}:{}:{}",
-            self.addr,
+            "{TOKEN_PREFIX_V2}{addrs}:{}:{}",
             self.registrar.to_wire(),
             encode_key32(&self.secret)
         )
     }
 
-    /// Parse a pasted token. Refuses an unknown version rather than guessing,
-    /// because the alternative is a silent wrong-key dial.
+    /// Parse a pasted key, v2 or v1. Refuses an unknown version rather than
+    /// guessing, because the alternative is a silent wrong-key dial.
     ///
     /// Split from the RIGHT: an IPv6 address carries colons of its own, and the
     /// two fields after it do not, so the two rightmost separators are the only
-    /// ones whose position is known.
+    /// ones whose position is known. The address field is then split on commas,
+    /// which no address contains (an IPv6 one is bracketed).
     pub fn parse(token: &str) -> Result<Self> {
         let token = token.trim();
-        let Some(body) = token.strip_prefix(TOKEN_PREFIX) else {
+        let (body, version) = if let Some(body) = token.strip_prefix(TOKEN_PREFIX_V2) {
+            (body, KeyVersion::V2)
+        } else if let Some(body) = token.strip_prefix(TOKEN_PREFIX) {
+            (body, KeyVersion::V1)
+        } else {
             bail!(
-                "peer join: this is not a v1 join key (it must start with {TOKEN_PREFIX:?}); \
-                 an unknown version is refused rather than guessed, because guessing it \
-                 would be a silent dial to the wrong key"
+                "peer join: this is not a join key (it must start with {TOKEN_PREFIX_V2:?}, or \
+                 {TOKEN_PREFIX:?} from an older build); an unknown version is refused rather \
+                 than guessed, because guessing it would be a silent dial to the wrong key"
             );
         };
+
         let mut fields = body.rsplitn(3, ':');
-        let (Some(secret), Some(registrar), Some(addr)) =
+        let (Some(secret), Some(registrar), Some(addrs)) =
             (fields.next(), fields.next(), fields.next())
         else {
             bail!(
-                "peer join: a v1 join key is `{TOKEN_PREFIX}<host:port>:<registrar>:<secret>`, \
+                "peer join: a join key is `{TOKEN_PREFIX_V2}<host:port,…>:<registrar>:<secret>`, \
                  and this one has fewer than three fields after the version"
             );
         };
-        let addr: SocketAddr = addr
-            .parse()
-            .with_context(|| format!("peer join: {addr:?} is not the host:port to dial"))?;
+
+        let addrs = match version {
+            KeyVersion::V1 => vec![parse_dial_addr(addrs)?],
+            KeyVersion::V2 => {
+                let mut parsed = Vec::new();
+                for field in addrs.split(',') {
+                    parsed.push(parse_dial_addr(field)?);
+                }
+                parsed
+            }
+        };
+        if addrs.is_empty() {
+            bail!("peer join: this key carries no address to dial");
+        }
+
         let registrar = PeerId::parse(registrar).map_err(|refusal| {
             anyhow!("peer join: the registrar field is unreadable: {refusal}")
         })?;
@@ -150,12 +308,44 @@ impl JoinToken {
         let secret = decode_key32(secret)
             .map_err(|refusal| anyhow!("{refusal}"))
             .context("peer join: the secret field is not 32 base32-encoded bytes")?;
-        Ok(Self {
-            addr,
-            registrar,
-            secret,
-        })
+        Ok(Self::new(addrs, registrar, secret))
     }
+}
+
+/// Which spelling of the key a paste turned out to be. A typed pair rather than
+/// a `bool`, because the two arms differ in how the address field is split and
+/// a caller reading `true` would have to remember which way round it went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyVersion {
+    /// One address, minted by a build before the key carried a list.
+    V1,
+    /// A comma-separated list, best first.
+    V2,
+}
+
+/// One address field out of a key: a socket, and one a friend could actually
+/// open.
+///
+/// The unspecified address is the whole reason the key grew a list. An older
+/// build copied the peers file's `listen` field in verbatim, so a listener on
+/// `0.0.0.0` minted a key reading `0.0.0.0:7755`, and the friend's `tcr peer
+/// join` dialled its own machine and reported that nothing answered. It is
+/// refused here, with the one sentence that fixes it, rather than dialled.
+fn parse_dial_addr(field: &str) -> Result<SocketAddr> {
+    let addr: SocketAddr = field
+        .parse()
+        .with_context(|| format!("peer join: {field:?} is not the host:port to dial"))?;
+    if addr.ip().is_unspecified() {
+        bail!(
+            "peer join: this key says {addr}, which is the address the other Mac LISTENS on \
+             and not one anything can dial. Ask for a fresh key: `tcr peer invite` on a build \
+             that carries dialable addresses puts every address that Mac answers at into it"
+        );
+    }
+    if addr.port() == 0 {
+        bail!("peer join: this key says {addr}, and port 0 is not a port anything listens on");
+    }
+    Ok(addr)
 }
 
 /// Where `tcr peer join` takes the token from.
@@ -204,10 +394,138 @@ pub fn token_from_reader<R: std::io::BufRead>(mut reader: R) -> Result<JoinToken
     if line.trim().is_empty() {
         bail!(
             "peer join: standard input carried no join key (`--stdin` expects the \
-             `{TOKEN_PREFIX}…` line on stdin, so the key never enters this process's argv)"
+             `{KEY_PREFIX}…` line on stdin, so the key never enters this process's argv)"
         );
     }
     JoinToken::parse(&line)
+}
+
+/// Whether `addr` is in `100.64.0.0/10`, the range RFC 6598 set aside for
+/// carrier-grade NAT and the range Tailscale numbers a tailnet out of.
+///
+/// Written here rather than reused because the one other place in this tree
+/// that knows the range knows it in prose only:
+/// `crate::peer::listener::is_lan_scope_v4` deliberately does NOT count it as
+/// LAN (its doc says why, a tailnet is not this LAN), so calling that predicate
+/// would answer the opposite question. The wish to have one exported predicate
+/// is reported rather than taken, because that file is not this unit's.
+fn is_carrier_grade_nat(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            a == 100 && (64..128).contains(&b)
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Whether this address is a tailnet one: a `utun` interface holding an
+/// address in [`is_carrier_grade_nat`]'s range.
+///
+/// **Both halves, and the name is the half that matters.** The range alone also
+/// covers a Mac behind a mobile hotspot, whose carrier-NAT address is reachable
+/// by nothing outside that hotspot; ranking one of those first would put the
+/// deadest address at the top of every key minted on a tethered Mac.
+fn is_tailnet(host: &HostAddress) -> bool {
+    host.interface.starts_with("utun") && is_carrier_grade_nat(host.addr)
+}
+
+/// Every address a friend could dial this Mac at, best first.
+///
+/// The rank is the order a dial should try, and each band is there because a
+/// different friend is on the other end:
+///
+/// 1. the tailnet address, which works from any network without a router
+///    forwarding anything,
+/// 2. the external socket a held port mapping published, the one address a
+///    friend anywhere on the internet can open,
+/// 3. every address a real interface holds, for the friend in the next room.
+///
+/// A pinned `listen` short-circuits all of it: an address somebody typed into
+/// the peers file is the address they meant, and a key that quietly carried
+/// three others would be answering a question the operator already answered.
+///
+/// Pure, over a host address list and a mapping, so the order is tested against
+/// a written-down set of interfaces rather than against whatever this Mac
+/// happens to be plugged into. [`local_dial_addresses`] is the live half.
+pub fn dial_addresses(
+    listen: SocketAddr,
+    host: &[HostAddress],
+    external: Option<SocketAddr>,
+) -> Vec<DialAddress> {
+    if listen.port() == 0 {
+        return Vec::new();
+    }
+    if !listen.ip().is_unspecified() {
+        return vec![DialAddress {
+            addr: listen,
+            kind: DialAddressKind::Chosen,
+        }];
+    }
+
+    let port = listen.port();
+    let mut out: Vec<DialAddress> = Vec::new();
+    let mut push = |addr: SocketAddr, kind: DialAddressKind| {
+        if addr.ip().is_unspecified() || addr.port() == 0 {
+            return;
+        }
+        if out.iter().any(|existing| existing.addr == addr) {
+            return;
+        }
+        out.push(DialAddress { addr, kind });
+    };
+
+    for entry in host.iter().filter(|entry| is_tailnet(entry)) {
+        push(
+            SocketAddr::new(entry.addr, port),
+            DialAddressKind::Tailscale,
+        );
+    }
+    if let Some(external) = external {
+        push(external, DialAddressKind::Internet);
+    }
+    for entry in host {
+        // The same rule the Peers tab's "is this Mac on a network" fact runs,
+        // read from its own module rather than spelled a second time here:
+        // loopback, link-local and multicast are addresses no friend can use.
+        if is_tailnet(entry) || !crate::status::network_fact::is_usable(entry.addr) {
+            continue;
+        }
+        push(SocketAddr::new(entry.addr, port), DialAddressKind::Lan);
+    }
+    out
+}
+
+/// Every address a real, operationally-up interface holds right now, with the
+/// interface's own name.
+///
+/// The interface walk is `if-addrs`, the same crate and the same two filters
+/// `crate::status::network_fact` uses; its own walk keeps no names and is
+/// private, so the four lines are here rather than borrowed. An interface whose
+/// state this platform cannot report reads as down, which can only ever make a
+/// key carry FEWER addresses, never a dead one.
+fn host_addresses() -> Vec<HostAddress> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .into_iter()
+        .filter(|interface| interface.is_oper_up() && !interface.is_loopback())
+        .map(|interface| HostAddress {
+            interface: interface.name.clone(),
+            addr: interface.ip(),
+        })
+        .collect()
+}
+
+/// [`dial_addresses`] against this Mac's real interfaces and whatever mapping
+/// it is holding right now.
+pub fn local_dial_addresses(listen: SocketAddr) -> Vec<DialAddress> {
+    dial_addresses(
+        listen,
+        &host_addresses(),
+        crate::peer::reach::external_socket(),
+    )
 }
 
 /// Mint an invite: generate the secret, store the row, return the token.
@@ -251,12 +569,23 @@ pub fn mint_invite_as(
     // `accept_enrolment` just pinned under its own lock.
     let _lock = crate::peer::config::FileLock::acquire(store.path())?;
     let mut file = read_or_default(store.path())?;
-    let Some(addr) = file.listen else {
+    let Some(listen) = file.listen else {
         bail!(
             "peer invite: this node has no peer listener, so a token would carry no address \
              to dial (`tcr peer find on` opens one)"
         );
     };
+    // Derived BEFORE the invite row is written: a mint that is going to refuse
+    // must not leave a live PSK on disk behind it.
+    let addrs = local_dial_addresses(listen);
+    if addrs.is_empty() {
+        bail!(
+            "peer invite: this Mac listens on {listen} and holds no address a friend could \
+             dial, so the key would carry nothing. Join a network and run this again; \
+             `tcr peer reach` says whether the router will forward the port once you are on \
+             one"
+        );
+    }
 
     let now = now_ms();
     // An expired row is not an outstanding invite, so it does not spend the
@@ -285,7 +614,7 @@ pub fn mint_invite_as(
     save(store.path(), &file)?;
 
     let token = JoinToken {
-        addr,
+        addrs,
         registrar: node.id(),
         secret,
     };
@@ -417,8 +746,24 @@ pub fn accept_enrolment(
     Ok(row)
 }
 
+/// What a completed join produced: who was pinned, and where it answered.
+///
+/// A typed pair rather than the bare [`PeerId`] this used to return, because a
+/// key now carries a list and "which address worked" is a fact the caller has
+/// no other way to learn: `tcr peer join` prints it, and a key with five
+/// addresses in it would otherwise end in a line naming whichever one the
+/// operator guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Joined {
+    /// The registrar, as the handshake proved it rather than as the key
+    /// claimed it.
+    pub peer: PeerId,
+    /// The address that answered, which is the one written onto the pinned row.
+    pub addr: SocketAddr,
+}
+
 /// Run the joiner's half: dial, `IKpsk1`, pin the registrar, be pinned.
-pub async fn join(store: &PeerStore, token: &JoinToken, label: &str) -> Result<PeerId> {
+pub async fn join(store: &PeerStore, token: &JoinToken, label: &str) -> Result<Joined> {
     let node = NodeKey::load_or_mint(&default_config_dir())
         .context("peer join: this node has no keypair to enrol with")?;
     join_as(store, &node, token, label).await
@@ -438,12 +783,10 @@ pub async fn join_as(
     node: &NodeKey,
     token: &JoinToken,
     label: &str,
-) -> Result<PeerId> {
+) -> Result<Joined> {
     let label = sanitize_label(label).map_err(|refusal| anyhow!("peer join: {refusal}"))?;
 
-    let mut stream = tokio::net::TcpStream::connect(token.addr)
-        .await
-        .with_context(|| format!("peer join: could not reach {}", token.addr))?;
+    let (addr, mut stream) = connect_in_key_order(token).await?;
     let mut session = noise::dial_handshake(
         &mut stream,
         node.secret_bytes(),
@@ -530,13 +873,49 @@ pub async fn join_as(
         }
     }
 
-    pin_row(
-        store,
-        token.registrar,
-        &registrar_label(token.addr)?,
-        Some(token.addr),
-    )?;
-    Ok(token.registrar)
+    pin_row(store, token.registrar, &registrar_label(addr)?, Some(addr))?;
+    Ok(Joined {
+        peer: token.registrar,
+        addr,
+    })
+}
+
+/// Open a stream to the first address in the key that answers.
+///
+/// **The CONNECT is what falls through to the next address, and nothing after
+/// it does.** A refused or timed-out connect says this Mac is not at that
+/// address, which is exactly what a key carrying a tailnet address, an external
+/// socket and two LAN addresses expects most of its list to say. A connect that
+/// SUCCEEDED reached something listening, and a handshake that then fails is a
+/// real answer, a spent key, an expired one, a Mac that is not the registrar,
+/// and re-running it against the next address would turn one refusal into a
+/// sweep of every port in the key.
+///
+/// Every refusal is kept and named in the error, because "nothing answered" with
+/// no list is the sentence that made the last version of this bug invisible.
+async fn connect_in_key_order(token: &JoinToken) -> Result<(SocketAddr, tokio::net::TcpStream)> {
+    let mut refusals: Vec<String> = Vec::new();
+    for addr in token.sockets() {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => {
+                if !refusals.is_empty() {
+                    tracing::debug!(
+                        answered = %addr,
+                        tried = refusals.len(),
+                        "peer join: an earlier address in the key did not answer"
+                    );
+                }
+                return Ok((addr, stream));
+            }
+            Err(err) => refusals.push(format!("{addr} ({err})")),
+        }
+    }
+    bail!(
+        "peer join: nothing answered at any address this key carries: {}. That Mac may be \
+         asleep or on another network; ask for a fresh key, or `tcr peer reach` on that Mac \
+         says whether its router forwards the port",
+        refusals.join(", ")
+    )
 }
 
 /// How long the joiner waits for the registrar's `Hello` before calling the
@@ -1068,10 +1447,12 @@ impl ShareLink {
     /// Render the link.
     ///
     /// Percent-encoding is deliberately not applied and deliberately not
-    /// needed: every value here is Crockford base32, a colon, a dot or a digit
-    /// ([`JoinToken::to_token`]), and none of those is reserved in a query
-    /// string. A hand-rolled encoder over an alphabet that cannot contain a
-    /// reserved character would be a second thing to get wrong.
+    /// needed: every value here is Crockford base32, a colon, a dot, a digit,
+    /// a comma or the brackets around an IPv6 address
+    /// ([`JoinToken::to_token`]), and a query string carries all of those as
+    /// themselves. A hand-rolled encoder over an alphabet this small would be a
+    /// second thing to get wrong, and `PeerJoinLink` on the Swift side passes
+    /// the whole link through unparsed for the same reason.
     pub fn to_link(&self) -> String {
         let mut out = format!(
             "{LINK_PREFIX}v={LINK_VERSION}&nk={}",
@@ -1079,7 +1460,7 @@ impl ShareLink {
         );
         if let Some(join) = &self.join {
             out.push_str("&jk=");
-            out.push_str(&join.to_token());
+            out.push_str(&escape_brackets(&join.to_token()));
         }
         out
     }
@@ -1153,11 +1534,48 @@ impl ShareLink {
             .map_err(|refusal| anyhow!("{refusal}"))
             .context("peer link: the nk field is not 32 base32-encoded bytes")?;
         let join = match join_field {
-            Some(field) => Some(JoinToken::parse(&field)?),
+            Some(field) => Some(JoinToken::parse(&unescape_brackets(&field))?),
             None => None,
         };
         Ok(Self { network_key, join })
     }
+}
+
+/// The two characters in a join key that a URL will not carry as themselves,
+/// and their escapes.
+///
+/// An IPv6 address inside a key is bracketed (`[2001:db8::4]:7755`), and
+/// brackets are reserved in a URL for a host, not a query. Foundation's
+/// `URL(string:)` on the Swift side therefore rewrites them to `%5B` and `%5D`
+/// in `absoluteString`, which is the exact string TcrBar pipes to `tcr peer
+/// join --stdin`: measured here on 2026-09-20, a link with a literal `[` came
+/// back out escaped. So a link RENDERS them escaped and PARSES them either
+/// way, and a key carrying an IPv6 address survives the trip through a chat
+/// window and a click.
+///
+/// Two characters, not a URL encoder. Everything else in a key is Crockford
+/// base32, a digit, a dot, a colon or a comma, and a general encoder over that
+/// alphabet would be a second thing to get wrong for no gain.
+const BRACKET_ESCAPES: [(char, &str); 2] = [('[', "%5B"), (']', "%5D")];
+
+/// Render the two characters a URL will not carry (see [`BRACKET_ESCAPES`]).
+fn escape_brackets(token: &str) -> String {
+    let mut out = token.to_string();
+    for (plain, escaped) in BRACKET_ESCAPES {
+        out = out.replace(plain, escaped);
+    }
+    out
+}
+
+/// Read a `jk` field whether or not it came back escaped. Case-insensitive in
+/// the hex digits, because a URL layer may write either.
+fn unescape_brackets(field: &str) -> String {
+    let mut out = field.to_string();
+    for (plain, escaped) in BRACKET_ESCAPES {
+        out = out.replace(escaped, &plain.to_string());
+        out = out.replace(&escaped.to_lowercase(), &plain.to_string());
+    }
+    out
 }
 
 /// What `tcr peer join` was handed: a share link, or a bare join key.
@@ -1169,7 +1587,7 @@ impl ShareLink {
 pub enum JoinInput {
     /// A `tcr://peer/join?…` link.
     Link(ShareLink),
-    /// A bare `tcr-join:v1:…` key, as `tcr peer invite` prints it.
+    /// A bare `tcr-join:…` key, as `tcr peer invite` prints it.
     Key(JoinToken),
 }
 
@@ -1184,7 +1602,7 @@ impl JoinInput {
         if raw.starts_with(LINK_PREFIX) {
             return ShareLink::parse(raw).map(Self::Link);
         }
-        if raw.starts_with(TOKEN_PREFIX) {
+        if raw.starts_with(KEY_PREFIX) {
             return JoinToken::parse(raw).map(Self::Key);
         }
         // The third shape names itself and stops there. `tcr peer moved open`
@@ -1202,7 +1620,7 @@ impl JoinInput {
         }
         bail!(
             "peer join: this is neither a share link ({LINK_PREFIX}…) nor a join key \
-             ({TOKEN_PREFIX}…). Nothing is printed back, because a paste that failed to \
+             ({KEY_PREFIX}…). Nothing is printed back, because a paste that failed to \
              parse is still a live secret and a terminal keeps scrollback"
         )
     }
@@ -1250,4 +1668,264 @@ pub fn join_input_from_reader<R: std::io::BufRead>(mut reader: R) -> Result<Join
         );
     }
     JoinInput::parse(&line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The listener's port in every case below. One number, so a rank that
+    /// changed the port instead of the host would be visible.
+    const PORT: u16 = 7755;
+
+    fn host(interface: &str, addr: &str) -> HostAddress {
+        HostAddress {
+            interface: interface.to_string(),
+            addr: addr.parse().expect("a test address"),
+        }
+    }
+
+    fn socket(addr: &str) -> SocketAddr {
+        addr.parse().expect("a test socket")
+    }
+
+    fn wide() -> SocketAddr {
+        SocketAddr::new(IpAddr::from([0, 0, 0, 0]), PORT)
+    }
+
+    /// The bug this whole shape exists for: a listener on `0.0.0.0` must never
+    /// put `0.0.0.0` in a key, because the friend then dials their own machine.
+    #[test]
+    fn a_wide_listener_never_yields_an_unspecified_address() {
+        let addrs = dial_addresses(wide(), &[host("en0", "192.0.2.10")], None);
+        assert_eq!(
+            addrs,
+            vec![DialAddress {
+                addr: socket("192.0.2.10:7755"),
+                kind: DialAddressKind::Lan,
+            }],
+            "the bind address is not a dial address, and the interface's own is"
+        );
+        assert!(
+            !addrs.iter().any(|entry| entry.addr.ip().is_unspecified()),
+            "an unspecified address in a key is the friend dialling their own Mac"
+        );
+    }
+
+    /// Somebody typed an address into the peers file, so that is the address
+    /// they meant and the key carries it alone.
+    #[test]
+    fn a_pinned_listener_yields_exactly_that_address() {
+        let addrs = dial_addresses(
+            socket("192.0.2.10:7755"),
+            &[host("en0", "198.51.100.4"), host("utun4", "100.64.0.1")],
+            Some(socket("198.51.100.9:41641")),
+        );
+        assert_eq!(
+            addrs,
+            vec![DialAddress {
+                addr: socket("192.0.2.10:7755"),
+                kind: DialAddressKind::Chosen,
+            }],
+            "a chosen listen address is an answered question, not a first guess"
+        );
+    }
+
+    /// The rank is the dial order: the tailnet address works from anywhere, the
+    /// mapped external socket works from the internet, a LAN address works in
+    /// the next room.
+    #[test]
+    fn the_rank_is_tailnet_then_internet_then_lan() {
+        let addrs = dial_addresses(
+            wide(),
+            &[
+                host("en0", "192.0.2.10"),
+                host("utun4", "100.64.0.1"),
+                host("lo0", "127.0.0.1"),
+                host("en1", "169.254.7.7"),
+                host("en0", "2001:db8::4"),
+            ],
+            Some(socket("198.51.100.9:41641")),
+        );
+        assert_eq!(
+            addrs
+                .iter()
+                .map(|entry| (entry.kind, entry.addr.to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DialAddressKind::Tailscale, "100.64.0.1:7755".to_string()),
+                (DialAddressKind::Internet, "198.51.100.9:41641".to_string()),
+                (DialAddressKind::Lan, "192.0.2.10:7755".to_string()),
+                (DialAddressKind::Lan, "[2001:db8::4]:7755".to_string()),
+            ],
+            "loopback and link-local are addresses no friend can use, and the order is the \
+             order a joiner tries"
+        );
+    }
+
+    /// The range alone is not the tailnet test: a tethered Mac holds a
+    /// carrier-NAT address on a real interface, and ranking that first would
+    /// put the deadest address at the top of the key.
+    #[test]
+    fn a_hotspot_address_is_not_ranked_as_a_tailnet_one() {
+        let addrs = dial_addresses(wide(), &[host("en0", "100.64.0.5")], None);
+        assert_eq!(
+            addrs,
+            vec![DialAddress {
+                addr: socket("100.64.0.5:7755"),
+                kind: DialAddressKind::Lan,
+            }],
+            "the interface name is what separates a tailnet from a carrier NAT"
+        );
+    }
+
+    /// A listener with no port yet cannot produce a key at all.
+    #[test]
+    fn a_listener_with_no_port_yields_nothing() {
+        assert!(dial_addresses(
+            SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0),
+            &[host("en0", "192.0.2.10")],
+            None,
+        )
+        .is_empty());
+    }
+
+    /// One address twice on two interfaces is one address in the key: a
+    /// duplicate costs the joiner a second connect timeout to the same place.
+    #[test]
+    fn the_same_address_is_carried_once() {
+        let addrs = dial_addresses(
+            wide(),
+            &[host("en0", "192.0.2.10"), host("bridge0", "192.0.2.10")],
+            None,
+        );
+        assert_eq!(
+            addrs.len(),
+            1,
+            "a duplicate is a second timeout, not a path"
+        );
+    }
+
+    /// A v1 key from an older build still works, byte for byte, when its host
+    /// is a real one.
+    #[test]
+    fn a_v1_key_with_a_real_host_still_parses() {
+        let key = format!(
+            "{TOKEN_PREFIX}192.0.2.10:7755:{}:{}",
+            PeerId([3_u8; 32]).to_wire(),
+            encode_key32(&[7_u8; 32])
+        );
+        let parsed = JoinToken::parse(&key).expect("a v1 key with a real host parses");
+        assert_eq!(
+            parsed.sockets().collect::<Vec<_>>(),
+            vec![socket("192.0.2.10:7755")]
+        );
+        assert_eq!(parsed.registrar, PeerId([3_u8; 32]));
+    }
+
+    /// And a v1 key minted on a wide listener is refused with the sentence that
+    /// fixes it, rather than dialled at the joiner's own machine.
+    #[test]
+    fn a_v1_key_on_an_unspecified_host_is_refused_with_the_fix() {
+        let key = format!(
+            "{TOKEN_PREFIX}0.0.0.0:7755:{}:{}",
+            PeerId([3_u8; 32]).to_wire(),
+            encode_key32(&[7_u8; 32])
+        );
+        let refusal = JoinToken::parse(&key).expect_err("0.0.0.0 is not an address to dial");
+        let text = format!("{refusal:#}");
+        assert!(
+            text.contains("tcr peer invite"),
+            "the refusal has to name the fix, which is a fresh key: {text}"
+        );
+    }
+
+    /// One, two, and an IPv6 address: the shapes a v2 key carries.
+    #[test]
+    fn a_v2_key_round_trips_every_shape() {
+        for addrs in [
+            vec![socket("192.0.2.10:7755")],
+            vec![socket("100.64.0.1:7755"), socket("198.51.100.9:41641")],
+            vec![socket("[2001:db8::4]:7755"), socket("192.0.2.10:7755")],
+        ] {
+            let token = JoinToken::new(addrs.clone(), PeerId([3_u8; 32]), [7_u8; 32]);
+            let rendered = token.to_token();
+            assert!(
+                rendered.starts_with(TOKEN_PREFIX_V2),
+                "a minted key is v2: {rendered}"
+            );
+            let parsed = JoinToken::parse(&rendered).expect("a v2 key parses");
+            assert_eq!(
+                parsed.sockets().collect::<Vec<_>>(),
+                addrs,
+                "the addresses and their ORDER are the dial order: {rendered}"
+            );
+            assert_eq!(parsed, token, "a key that round trips is the same key");
+        }
+    }
+
+    /// A v2 key carrying the bind address is refused for the same reason a v1
+    /// one is: it is the one address that cannot work.
+    #[test]
+    fn a_v2_key_carrying_an_unspecified_address_is_refused() {
+        let key = format!(
+            "{TOKEN_PREFIX_V2}192.0.2.10:7755,0.0.0.0:7755:{}:{}",
+            PeerId([3_u8; 32]).to_wire(),
+            encode_key32(&[7_u8; 32])
+        );
+        assert!(
+            JoinToken::parse(&key).is_err(),
+            "one unspecified address in the list is still a dial at the joiner's own Mac"
+        );
+    }
+
+    /// A share link carrying a key with an IPv6 address survives the round
+    /// trip, in both directions: the brackets go out escaped, and a link whose
+    /// brackets a URL layer escaped on the way through still parses.
+    #[test]
+    fn a_link_carries_a_key_with_an_ipv6_address_either_way() {
+        let network_key = crate::peer::config::NetworkKey::from_bytes([0x2B; 32]);
+        let token = JoinToken::new(
+            vec![socket("[2001:db8::4]:7755"), socket("192.0.2.10:7755")],
+            PeerId([3_u8; 32]),
+            [7_u8; 32],
+        );
+        let link = ShareLink {
+            network_key,
+            join: Some(token.clone()),
+        };
+        let rendered = link.to_link();
+        assert!(
+            !rendered.contains('['),
+            "a bracket in a query is what the URL layer rewrites: {rendered}"
+        );
+        assert_eq!(
+            ShareLink::parse(&rendered).expect("a rendered link parses"),
+            link
+        );
+
+        // What the panel really hands over: Foundation escapes the brackets in
+        // `absoluteString`, and it may write either case.
+        let from_url = rendered.replace("%5B", "%5b").replace("%5D", "%5d");
+        assert_eq!(
+            ShareLink::parse(&from_url).expect("an escaped link parses"),
+            link,
+            "the link a click delivers is the one the CLI has to read"
+        );
+    }
+
+    /// A version this build does not know is refused rather than guessed at.
+    #[test]
+    fn an_unknown_version_is_refused() {
+        let key = format!(
+            "tcr-join:v3:192.0.2.10:7755:{}:{}",
+            PeerId([3_u8; 32]).to_wire(),
+            encode_key32(&[7_u8; 32])
+        );
+        let refusal = JoinToken::parse(&key).expect_err("v3 is not a version this build reads");
+        assert!(
+            format!("{refusal:#}").contains("not a join key"),
+            "the refusal is about the VERSION and not about a field further in"
+        );
+    }
 }

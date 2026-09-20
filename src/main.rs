@@ -782,7 +782,7 @@ mod peer_cli {
         /// Path to the peers file (default: ~/.config/tcr-peers.json).
         #[arg(long)]
         pub peers: Option<PathBuf>,
-        /// The `tcr-join:v1:…` key or the `tcr://peer/join?…` link the other
+        /// The `tcr-join:…` key or the `tcr://peer/join?…` link the other
         /// Mac printed.
         ///
         /// **Typed here, the secret is visible in `ps` output to every process
@@ -2211,6 +2211,24 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 invite.id, invite.label, a.ttl, a.uses
             );
             println!("{}", token.to_token());
+            // One line per address the key carries, in the order the joiner
+            // will try them, so the operator sending this key can see which
+            // paths their friend actually has. The key itself is unchanged by
+            // what is printed here.
+            for entry in &token.addrs {
+                println!("peer invite: {} {}", entry.kind.label(), entry.addr);
+            }
+            if !token
+                .addrs
+                .iter()
+                .any(|entry| entry.kind == teamclaude_rs::peer::pair::DialAddressKind::Internet)
+            {
+                println!(
+                    "peer invite: this key carries no internet address, so a friend who is not \
+                     on this network or this tailnet needs this Mac's router to forward the \
+                     port; `tcr peer reach` reports where that stands"
+                );
+            }
             println!(
                 "peer invite: this key is join-capable by anything that can read {} until it \
                  is used or expires, `tcr peer invite --revoke {}` ends it early",
@@ -2304,8 +2322,11 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 );
             }
             let label = a.label.clone().unwrap_or_else(|| "this-mac".to_string());
-            teamclaude_rs::peer::pair::join(&store, token, &label).await?;
-            println!("peer join: ok addr={} file={}", token.addr, path.display());
+            // The address that ANSWERED, not the first one in the key: a key
+            // carries every address that Mac can be reached at, and the one
+            // that worked is the only one worth printing back.
+            let joined = teamclaude_rs::peer::pair::join(&store, token, &label).await?;
+            println!("peer join: ok addr={} file={}", joined.addr, path.display());
             Ok(())
         }
         PeerAction::Forget(a) => {

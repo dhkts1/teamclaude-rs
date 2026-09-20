@@ -289,7 +289,7 @@ async fn a_two_process_join_leaves_a_pinned_row_on_both_sides() {
     let pinned = pair::join_as(&joiner_store, &joiner.key, &token, "this-mac")
         .await
         .expect("the join completes and is acknowledged");
-    assert_eq!(pinned, registrar.key.id());
+    assert_eq!(pinned.peer, registrar.key.id());
 
     // The registrar's half: the one this used to never write.
     let registrar_file = registrar.file();
@@ -1702,11 +1702,11 @@ fn the_network_key_round_trips_through_its_paste_string() {
 #[test]
 fn a_share_link_round_trips_with_and_without_a_join_key() {
     let network_key = NetworkKey::from_bytes([0x2B; 32]);
-    let token = pair::JoinToken {
-        addr: "127.0.0.1:9600".parse().expect("a loopback address"),
-        registrar: PeerId([0x3C; 32]),
-        secret: [0x4D; 32],
-    };
+    let token = pair::JoinToken::new(
+        vec!["127.0.0.1:9600".parse().expect("a loopback address")],
+        PeerId([0x3C; 32]),
+        [0x4D; 32],
+    );
 
     let bare = pair::ShareLink {
         network_key,
@@ -1730,8 +1730,11 @@ fn a_share_link_round_trips_with_and_without_a_join_key() {
     let parsed = pair::ShareLink::parse(&rendered).expect("an invite link parses");
     assert_eq!(parsed, invited);
     assert_eq!(
-        parsed.join.as_ref().map(|join| join.addr),
-        Some(token.addr),
+        parsed
+            .join
+            .as_ref()
+            .map(|join| join.sockets().collect::<Vec<_>>()),
+        Some(token.sockets().collect::<Vec<_>>()),
         "the join key inside a link must carry the address to dial"
     );
 
@@ -1777,13 +1780,13 @@ fn a_link_with_a_spent_join_key_still_sets_the_network_key() {
     let network_key = NetworkKey::from_bytes([0x6E; 32]);
     let link = pair::ShareLink {
         network_key,
-        join: Some(pair::JoinToken {
-            addr: "127.0.0.1:9600".parse().expect("a loopback address"),
-            registrar: PeerId([0x7F; 32]),
-            // A secret for an invite that is no longer on the registrar's
-            // disk: the enrolment will fail, and the network key must not.
-            secret: [0x80; 32],
-        }),
+        // A secret for an invite that is no longer on the registrar's disk:
+        // the enrolment will fail, and the network key must not.
+        join: Some(pair::JoinToken::new(
+            vec!["127.0.0.1:9600".parse().expect("a loopback address")],
+            PeerId([0x7F; 32]),
+            [0x80; 32],
+        )),
     };
 
     let input = pair::JoinInput::parse(&link.to_link()).expect("the link parses");
@@ -1804,11 +1807,11 @@ fn a_link_with_a_spent_join_key_still_sets_the_network_key() {
 /// else by naming both shapes.
 #[test]
 fn join_input_accepts_a_link_or_a_bare_key() {
-    let token = pair::JoinToken {
-        addr: "127.0.0.1:9600".parse().expect("a loopback address"),
-        registrar: PeerId([0x11; 32]),
-        secret: [0x22; 32],
-    };
+    let token = pair::JoinToken::new(
+        vec!["127.0.0.1:9600".parse().expect("a loopback address")],
+        PeerId([0x11; 32]),
+        [0x22; 32],
+    );
     let bare = pair::JoinInput::parse(&token.to_token()).expect("a bare key parses");
     assert_eq!(bare.join_token(), Some(&token));
     assert_eq!(
@@ -1829,7 +1832,7 @@ fn join_input_accepts_a_link_or_a_bare_key() {
     let error = pair::JoinInput::parse("hello").expect_err("neither shape must be refused");
     let text = format!("{error:#}");
     assert!(
-        text.contains("tcr://peer/join?") && text.contains("tcr-join:v1:"),
+        text.contains("tcr://peer/join?") && text.contains("tcr-join:"),
         "the refusal has to name BOTH shapes, because the operator does not know which one \
          they were given: {text}"
     );
@@ -1861,11 +1864,11 @@ fn join_stdin_keeps_the_key_out_of_argv_and_every_log_line() {
 
     // A token pointing at a port nothing is listening on: the dial fails, which
     // is the noisy path.
-    let token = pair::JoinToken {
-        addr: "127.0.0.1:1".parse().expect("a loopback address"),
-        registrar: PeerId([0x99; 32]),
-        secret: [0xAA; 32],
-    };
+    let token = pair::JoinToken::new(
+        vec!["127.0.0.1:1".parse().expect("a loopback address")],
+        PeerId([0x99; 32]),
+        [0xAA; 32],
+    );
     let rendered = token.to_token();
     let secret_field = tcr_peer_wire::encode_key32(&token.secret);
 
@@ -1924,11 +1927,11 @@ fn join_stdin_keeps_the_key_out_of_argv_and_every_log_line() {
 /// operator would see a refusal about base32 for a key that was fine.
 #[test]
 fn the_stdin_reader_takes_one_line_and_refuses_an_empty_one() {
-    let token = pair::JoinToken {
-        addr: "127.0.0.1:9600".parse().expect("a loopback address"),
-        registrar: PeerId([0x44; 32]),
-        secret: [0x55; 32],
-    };
+    let token = pair::JoinToken::new(
+        vec!["127.0.0.1:9600".parse().expect("a loopback address")],
+        PeerId([0x44; 32]),
+        [0x55; 32],
+    );
     let rendered = token.to_token();
 
     let input = pair::join_input_from_reader(std::io::Cursor::new(format!(
@@ -2194,11 +2197,11 @@ fn a_link_with_a_dead_join_key_still_sets_the_network_key_through_the_cli() {
     let network_key = NetworkKey::from_bytes([0x9C; 32]);
     let link = pair::ShareLink {
         network_key,
-        join: Some(pair::JoinToken {
-            addr: "127.0.0.1:1".parse().expect("a loopback address"),
-            registrar: PeerId([0xAB; 32]),
-            secret: [0xCD; 32],
-        }),
+        join: Some(pair::JoinToken::new(
+            vec!["127.0.0.1:1".parse().expect("a loopback address")],
+            PeerId([0xAB; 32]),
+            [0xCD; 32],
+        )),
     }
     .to_link();
 
@@ -3238,11 +3241,11 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
     let other_key = NetworkKey::from_bytes([0x77; 32]);
     let link = pair::ShareLink {
         network_key: other_key,
-        join: Some(pair::JoinToken {
-            addr: "127.0.0.1:1".parse().expect("a loopback address"),
-            registrar: PeerId([0xAB; 32]),
-            secret: [0xCD; 32],
-        }),
+        join: Some(pair::JoinToken::new(
+            vec!["127.0.0.1:1".parse().expect("a loopback address")],
+            PeerId([0xAB; 32]),
+            [0xCD; 32],
+        )),
     }
     .to_link();
 
@@ -3256,7 +3259,7 @@ fn a_join_link_with_both_keys_still_reads_the_join_token_when_the_network_key_is
         "the network-key refusal is still reported, on stdout not a bail: {out}"
     );
     assert!(
-        err.contains("could not reach"),
+        err.contains("nothing answered at any address this key carries"),
         "the join token must have been READ and tried, so the failure is \
          pair::join's own connect error, not the earlier network-key bail: {err}"
     );
@@ -4230,5 +4233,123 @@ fn the_two_pending_surfaces_print_the_same_dial_address() {
         addrs, prose_addrs,
         "the two surfaces disagree about what to dial, which is the whole point of \
          reading them from one place"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The key carries addresses a friend can dial
+// ---------------------------------------------------------------------------
+
+/// **A mint on a wide listener never puts the bind address in the key.**
+///
+/// This is the bug in one line: a Mac listening on `0.0.0.0:7755` minted
+/// `…:0.0.0.0:7755:…`, and the friend's `tcr peer join` dialled its own
+/// machine and reported that nothing answered.
+///
+/// Watched red: with `dial_addresses` returning the listen socket whatever it
+/// is, this fails with `left: [DialAddress { addr: 0.0.0.0:7755, kind: Chosen
+/// }]`.
+///
+/// Both outcomes are asserted, because the answer depends on the machine
+/// running the test: a host with no address of its own has nothing to put in a
+/// key, and that has to be a refusal naming what to do rather than a key
+/// nobody can use.
+#[test]
+fn a_mint_on_a_wide_listener_carries_no_bind_address() {
+    let node = Node::new("wide-listener");
+    let mut file = node.file();
+    file.listen = Some("0.0.0.0:7755".parse().expect("a wide bind address"));
+    node.write_file(&file);
+    let store = config::PeerStore::open(&node.peers).expect("open the store");
+
+    match pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1) {
+        Ok((_invite, token)) => {
+            assert!(
+                !token
+                    .sockets()
+                    .any(|addr| addr.ip().is_unspecified() || addr.port() == 0),
+                "the bind address is not a dial address: {:?}",
+                token.sockets().collect::<Vec<_>>()
+            );
+            assert!(
+                token.to_token().starts_with(pair::TOKEN_PREFIX_V2),
+                "a key minted today carries a list"
+            );
+        }
+        Err(refusal) => {
+            let text = format!("{refusal:#}");
+            assert!(
+                text.contains("no address a friend could dial"),
+                "a host with nothing dialable refuses and says what to do: {text}"
+            );
+        }
+    }
+}
+
+/// **A pinned `listen` is an answered question**: the key carries that address
+/// and nothing else, whatever else this Mac holds.
+///
+/// Watched red: drop the `is_unspecified` short circuit in `dial_addresses`
+/// and this fails on the address list.
+#[test]
+fn a_mint_on_a_pinned_listener_carries_exactly_that_address() {
+    let node = Node::new("pinned-listener");
+    let mut file = node.file();
+    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
+    node.write_file(&file);
+    let store = config::PeerStore::open(&node.peers).expect("open the store");
+
+    let (_invite, token) =
+        pair::mint_invite_as(&store, &node.key, "laptop-2", 600, 1).expect("an invite is minted");
+    assert_eq!(
+        token.sockets().collect::<Vec<_>>(),
+        vec!["127.0.0.1:9600"
+            .parse::<SocketAddr>()
+            .expect("a loopback address")],
+        "somebody typed that address into the peers file, so it is the one they meant"
+    );
+}
+
+/// **`tcr peer invite` says what each address in the key is**, on the surface
+/// an operator reads before they paste it into a chat window.
+///
+/// The key itself is unchanged by these lines: they are what lets the person
+/// sending it see that their friend on another network has nothing to dial
+/// yet.
+///
+/// Watched red: delete the per-address loop from the `Invite` arm of
+/// `run_peer` and this fails on the `chosen` line.
+#[test]
+fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
+    let node = Node::new("invite-cli");
+    let mut file = node.file();
+    file.listen = Some("127.0.0.1:9600".parse().expect("a loopback address"));
+    node.write_file(&file);
+
+    // `HOME` points at this test's own scratch directory, because `tcr peer
+    // invite` loads this node's keypair from the config directory and a test
+    // may not read or write the operator's real one.
+    let home = scratch("invite-cli-home");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
+        .args(["peer", "invite", "--label", "laptop-2"])
+        .args(["--peers", node.peers.to_str().expect("a utf-8 path")])
+        .env("HOME", &home)
+        .output()
+        .expect("spawn tcr peer invite");
+    let out = String::from_utf8_lossy(&output.stdout).to_string();
+    let err = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "the mint failed: {out}{err}");
+
+    assert!(
+        out.contains(&format!("\n{}", pair::TOKEN_PREFIX_V2)),
+        "the key itself is still printed on a line of its own: {out}"
+    );
+    assert!(
+        out.contains("peer invite: chosen 127.0.0.1:9600"),
+        "each address is named with what kind of path it is: {out}"
+    );
+    assert!(
+        out.contains("carries no internet address"),
+        "a key with nothing an outside friend can open says so, in one sentence: {out}"
     );
 }
