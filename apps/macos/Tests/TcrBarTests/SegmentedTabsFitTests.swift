@@ -56,6 +56,45 @@ final class SegmentedTabsFitTests: XCTestCase {
                 + "of residual overflow once shortened")
     }
 
+    /// An equal quarter share is not enough for "Sessions" beside a two-digit
+    /// badge, and no token can close the gap: the strip has 3 pt of gap to give
+    /// and the label is over twenty short. What IS enough is the strip letting
+    /// each segment take its own width, because the four together want less
+    /// than the strip has. Measured at the widest counts this panel can reach.
+    ///
+    /// Without that the label WRAPS, which is what the released panel drew:
+    /// `Sess` over `ions` beside its badge. This gate says the fix is
+    /// available, so a strip that asks each segment for its ideal width and a
+    /// label that refuses to wrap cannot overflow the panel.
+    func testTheFourSegmentsTogetherFitTheStripAtTheirOwnWidths() throws {
+        let accountsLabel = try panelTabTitle("accounts")
+        let sessions = try panelTabTitle("sessions")
+        let tools = try panelTabTitle("tools")
+        let segGap = try token("segGap")
+        let available =
+            try token("panelWidth") - 2 * (try token("panelPaddingSide"))
+            - 2 * (try token("segPadding")) - segGap * 3
+
+        // The widest two-digit and three-digit counts a fleet this size
+        // reaches: sessions run to three figures, tools to two.
+        let widest =
+            try idealSegmentWidth(label: accountsLabel, badge: nil)
+            + (try idealSegmentWidth(label: sessions, badge: 120))
+            + (try idealSegmentWidth(label: tools, badge: 12))
+            + (try idealSegmentWidth(label: "Peers", badge: nil))
+
+        XCTAssertLessThan(
+            widest, available,
+            "the four segments want \(String(format: "%.1f", widest)) pt of the strip's "
+                + "\(String(format: "%.1f", available)) pt, so at their own widths they do not "
+                + "fit and a label has to wrap or be cut")
+        XCTAssertGreaterThan(
+            try idealSegmentWidth(label: sessions, badge: 22),
+            try allottedSegmentWidth(tabCount: 4),
+            "\"\(sessions)\" now fits an equal quarter share, so this gate is measuring "
+                + "nothing: it exists because it does not")
+    }
+
     /// `[label: idealWidth]` for the four segments — the three real tabs plus
     /// the literal "Peers" stand-in (see the class doc-comment).
     private func idealWidths(accountsLabel: String) throws -> [String: CGFloat] {
