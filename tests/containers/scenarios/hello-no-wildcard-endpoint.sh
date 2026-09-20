@@ -39,15 +39,26 @@ SCENARIO="hello-no-wildcard-endpoint"
 export SCENARIO
 # shellcheck source=../lib/assert.sh
 . "$HERE/../lib/assert.sh"
-# shellcheck source=../lib/compose.sh
-. "$HERE/../lib/compose.sh"
 
-# The compose services this scenario needs, for the runner and for a reader.
-SERVICES="node-a1 node-a2"
-export SERVICES
+if [ "${NETLAB:-0}" = "1" ]; then
+  TOPOLOGY="$HERE/../topologies/hello-no-wildcard-endpoint.json"
+  export TOPOLOGY
+  # shellcheck source=../lib/netlab.sh
+  . "$HERE/../lib/netlab.sh"
+  NODES="node-a1 node-a2"
+  # shellcheck disable=SC2086 # NODES is a deliberate list of node names
+  up $NODES || { finish; exit 1; }
+else
+  # shellcheck source=../lib/compose.sh
+  . "$HERE/../lib/compose.sh"
 
-# shellcheck disable=SC2086 # SERVICES is a deliberate list of service names
-up $SERVICES || { finish; exit 1; }
+  # The compose services this scenario needs, for the runner and for a reader.
+  SERVICES="node-a1 node-a2"
+  export SERVICES
+
+  # shellcheck disable=SC2086 # SERVICES is a deliberate list of service names
+  up $SERVICES || { finish; exit 1; }
+fi
 
 pair_nodes node-a2 node-a1 "10.77.1.11:$LISTEN_PORT" || { finish; exit 1; }
 pair_nodes node-a1 node-a2 "10.77.1.12:$LISTEN_PORT" || { finish; exit 1; }

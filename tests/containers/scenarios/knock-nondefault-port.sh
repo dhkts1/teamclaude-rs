@@ -30,34 +30,47 @@ SCENARIO="knock-nondefault-port"
 export SCENARIO
 # shellcheck source=../lib/assert.sh
 . "$HERE/../lib/assert.sh"
-# shellcheck source=../lib/compose.sh
-. "$HERE/../lib/compose.sh"
 
-# The compose services this scenario needs, for the runner and for a reader.
-SERVICES="node-a1 node-a2"
-export SERVICES
-
-OVERRIDE="$HERE/knock-nondefault-port.override.yml"
-A1_ADDR="10.77.1.11:$LISTEN_PORT"
 A2_HOST=10.77.1.12
 A2_PORT=7766
 A2_DIAL="$A2_HOST:$A2_PORT"
 
-# up(), from compose.sh, with one extra compose file layered on: node-a2's
-# non-default listen port. Everything after `up -d` is copied from up() so
-# the boot wait is the same one every other scenario gets.
-dc -f "$OVERRIDE" up -d node-a1 node-a2 >/dev/null 2>&1 || {
-  fail "compose up node-a1 node-a2 (with the port override) refused"
-  finish
-  exit 1
-}
-for service in node-a1 node-a2; do
-  if ! wait_for_log "$service" "peer listener up" 90 >/dev/null; then
-    fail "$service: no 'peer listener up' in its boot log within 90s"
+if [ "${NETLAB:-0}" = "1" ]; then
+  TOPOLOGY="$HERE/../topologies/knock-nondefault-port.json"
+  export TOPOLOGY
+  # shellcheck source=../lib/netlab.sh
+  . "$HERE/../lib/netlab.sh"
+  A1_ADDR="10.77.1.11:$LISTEN_PORT"
+  NODES="node-a1 node-a2"
+  # shellcheck disable=SC2086 # NODES is a deliberate list of node names
+  up $NODES || { finish; exit 1; }
+else
+  # shellcheck source=../lib/compose.sh
+  . "$HERE/../lib/compose.sh"
+
+  # The compose services this scenario needs, for the runner and for a reader.
+  SERVICES="node-a1 node-a2"
+  export SERVICES
+
+  OVERRIDE="$HERE/knock-nondefault-port.override.yml"
+  A1_ADDR="10.77.1.11:$LISTEN_PORT"
+
+  # up(), from compose.sh, with one extra compose file layered on: node-a2's
+  # non-default listen port. Everything after `up -d` is copied from up() so
+  # the boot wait is the same one every other scenario gets.
+  dc -f "$OVERRIDE" up -d node-a1 node-a2 >/dev/null 2>&1 || {
+    fail "compose up node-a1 node-a2 (with the port override) refused"
     finish
     exit 1
-  fi
-done
+  }
+  for service in node-a1 node-a2; do
+    if ! wait_for_log "$service" "peer listener up" 90 >/dev/null; then
+      fail "$service: no 'peer listener up' in its boot log within 90s"
+      finish
+      exit 1
+    fi
+  done
+fi
 
 # --- node-a2 knocks node-a1 --------------------------------------------------
 if ! nxd node-a2 "$DRIVER" pair-start "$A1_ADDR"; then

@@ -1,0 +1,20 @@
+{
+  "lans": [
+    { "name": "home-a", "bridge": "br-home-a", "cidr": "10.77.1.0/24" },
+    { "name": "overlay", "bridge": "br-overlay", "cidr": "100.64.99.0/24" }
+  ],
+  "hosts": [
+    {
+      "name": "node-a1-overlay",
+      "lan": "home-a",
+      "ip": "10.77.1.11",
+      "role": "node",
+      "listen": 7755,
+      "proxy": 8088,
+      "extra": [
+        { "lan": "overlay", "ip": "100.64.99.11" }
+      ]
+    },
+    { "name": "node-a2", "lan": "home-a", "ip": "10.77.1.12", "role": "node", "listen": 7755, "proxy": 8088 }
+  ]
+}

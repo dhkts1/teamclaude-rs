@@ -1,0 +1,30 @@
+# The netlab lab image: the harness node image plus the pieces a whole lab
+# needs inside one container.
+#
+# FROM the tag the container harness already builds, so this measures the
+# delta a netlab image costs and never rebuilds `tcr`: `tcr-harness/tcr:dev`
+# carries the binary at /usr/local/bin/tcr already, which is the same binary
+# every namespace inside this container execs.
+#
+# Every "Mac" in a lab is a network namespace holding one veth, one address
+# and one `tcr`; every LAN is a bridge in this container's own namespace.
+# `netlab` is the builder, in `/lab-src` beside the other scripts a scenario
+# needs once it is inside the container: the mDNS observer, the stub
+# upstream, the peer-listing reader and the pairing driver, all already
+# shared with the compose harness and none of them copied.
+FROM tcr-harness/tcr:dev
+RUN apk add --no-cache python3 iptables iptables-legacy iproute2 miniupnpd
+# The lab tree, not the image's /scratch: one scratch dir per namespace, laid
+# out under /lab by `netlab up`. `/lab-src` mirrors tests/containers/ itself,
+# structure and all, so a scenario's `$HERE/../lib/netlab.sh` and
+# `$HERE/../topologies/*.json` resolve the same way they do on the host: the
+# only thing that differs between the two harnesses is which library a
+# scenario sources, never the paths either one is found at.
+RUN mkdir -p /lab
+COPY tests/containers/ /lab-src/
+RUN chmod +x /lab-src/netlab /lab-src/node-driver.sh /lab-src/scenarios/*.sh
+# The image's ENTRYPOINT is `tcr` itself for the node image, which is right
+# for a container that IS one Mac and wrong for a container that HOLDS
+# twenty: the lab is the machine room, and every Mac is a namespace inside it.
+ENTRYPOINT ["/bin/sh"]
+CMD ["-c", "sleep infinity"]

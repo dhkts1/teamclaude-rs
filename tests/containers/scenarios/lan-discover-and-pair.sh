@@ -39,27 +39,42 @@ SCENARIO="lan-discover-and-pair"
 export SCENARIO
 # shellcheck source=../lib/assert.sh
 . "$HERE/../lib/assert.sh"
-# shellcheck source=../lib/compose.sh
-. "$HERE/../lib/compose.sh"
 
-# The compose services this scenario needs, for the runner and for a reader.
-SERVICES="node-a1 node-a2"
-export SERVICES
+if [ "${NETLAB:-0}" = "1" ]; then
+  TOPOLOGY="$HERE/../topologies/two-on-one-lan.json"
+  export TOPOLOGY
+  # shellcheck source=../lib/netlab.sh
+  . "$HERE/../lib/netlab.sh"
+  NODES="node-a1 node-a2"
+  # shellcheck disable=SC2086 # NODES is a deliberate list of node names
+  up $NODES || { finish; exit 1; }
+else
+  # shellcheck source=../lib/compose.sh
+  . "$HERE/../lib/compose.sh"
 
-# Announced before either server boots, so the beacon starts with the server
-# rather than within the twenty seconds a running one takes to re-read the flag.
-NODE_A1_FIND=on
-NODE_A2_FIND=on
-NODE_A1_ANNOUNCE_NAME=on
-NODE_A2_ANNOUNCE_NAME=on
-export NODE_A1_FIND NODE_A2_FIND NODE_A1_ANNOUNCE_NAME NODE_A2_ANNOUNCE_NAME
+  # The compose services this scenario needs, for the runner and for a reader.
+  SERVICES="node-a1 node-a2"
+  export SERVICES
 
-# shellcheck disable=SC2086 # SERVICES is a deliberate list of service names
-up $SERVICES || { finish; exit 1; }
+  # Announced before either server boots, so the beacon starts with the server
+  # rather than within the twenty seconds a running one takes to re-read the flag.
+  NODE_A1_FIND=on
+  NODE_A2_FIND=on
+  NODE_A1_ANNOUNCE_NAME=on
+  NODE_A2_ANNOUNCE_NAME=on
+  export NODE_A1_FIND NODE_A2_FIND NODE_A1_ANNOUNCE_NAME NODE_A2_ANNOUNCE_NAME
+
+  # shellcheck disable=SC2086 # SERVICES is a deliberate list of service names
+  up $SERVICES || { finish; exit 1; }
+fi
 
 # --- the beacons, off the wire -------------------------------------------
 seen="$SCRATCH/mdns.txt"
-dc run --rm -T --no-deps observer > "$seen" 2>&1 || true
+if [ "${NETLAB:-0}" = "1" ]; then
+  observe observer 10 > "$seen" 2>&1 || true
+else
+  dc run --rm -T --no-deps observer > "$seen" 2>&1 || true
+fi
 cat "$seen"
 for address in 10.77.1.11 10.77.1.12; do
   if grep -q "^mdns: $address: " "$seen"; then
@@ -72,23 +87,32 @@ done
 # --- each node sees the other as found, before any pairing runs ----------
 a1_found_ls="$SCRATCH/a1-found.json"
 a2_found_ls="$SCRATCH/a2-found.json"
-ls_json node-a1 "$a1_found_ls" || true
-ls_json node-a2 "$a2_found_ls" || true
 
+# The serving process browses on its own 20s cadence beside its beacon, so a
+# listing read the instant `up` returns can predate the row this scenario
+# asserts on. This waits for the row, on the same deadline shape pair_nodes
+# already polls with, instead of assuming a browse has happened.
 check_found() {
-  # $1 the node whose file this is, $2 its listing, $3 the node it must see
-  # as found, $4 the address and name that node announces (`addr name`).
+  # $1 the node whose file this is, $2 the listing path to (re)write, $3 the
+  # node it must see as found, $4 the address and name that node announces
+  # (`addr name`).
   who="$1"
   listing="$2"
   other="$3"
   wanted="$4"
   found="$SCRATCH/$who-found.txt"
-  python3 "$LIB/peer-read.py" found < "$listing" > "$found" 2>&1 || true
-  if grep -qF "$wanted" "$found"; then
-    pass "$who sees $other as found, not trusted: $wanted"
-  else
-    fail "$who does not see $other as found (found: [$(tr '\n' ';' < "$found")])"
-  fi
+  i=0
+  while [ "$i" -lt 50 ]; do
+    ls_json "$who" "$listing" || true
+    python3 "$LIB/peer-read.py" found < "$listing" > "$found" 2>&1 || true
+    if grep -qF "$wanted" "$found"; then
+      pass "$who sees $other as found, not trusted: $wanted"
+      return
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  fail "$who does not see $other as found within 25s of a 20s browse cadence (found: [$(tr '\n' ';' < "$found")])"
 }
 
 check_no_self_found() {

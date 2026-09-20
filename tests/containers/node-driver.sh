@@ -23,11 +23,11 @@
 # than an English sentence this file would have to keep in step with.
 set -eu
 
-PEERS=/scratch/.config/tcr-peers.json
-FIFO=/scratch/pair.in
-OUT=/scratch/pair.out
-CODE=/scratch/pair.code
-STATUS=/scratch/pair.status
+PEERS="$HOME/.config/tcr-peers.json"
+FIFO="$HOME/pair.in"
+OUT="$HOME/pair.out"
+CODE="$HOME/pair.code"
+STATUS="$HOME/pair.status"
 # Ten minutes is `pair::PAIR_WAIT`; these are the outside of the two waits a
 # scenario does around it, and a scenario that hits one has found something.
 WAIT_SECONDS=180
