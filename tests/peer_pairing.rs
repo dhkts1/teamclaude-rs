@@ -4409,16 +4409,19 @@ fn tcr_peer_invite_names_every_address_and_the_internet_gap() {
 }
 
 /// **The sealed exchange end to end, at the command line**: `invite --sealed`
-/// mints an ask that carries no address, `join --stdin` answers it with a
-/// reply that carries no address either, and `invite --reply --stdin` opens
-/// the reply and names the address the reply carried.
+/// mints an ask that carries no address, `join --stdin` answers it by
+/// minting its own one-use join key and sealing that to the ask, and
+/// `invite --reply --stdin` opens the reply and runs the join with the key
+/// it carried.
 ///
-/// This is the wiring test: `tests/peer_ask.rs` covers the five refusal
-/// shapes against the library directly, and the container scenario
-/// (`tests/containers/scenarios/sealed-invite.sh`) is where the "no address
-/// in the chat" claim is measured over a real grep. This test is the one
-/// that proves the three CLI branches (`--sealed`, `--stdin` on an ask,
-/// `--reply --stdin`) are wired to each other at all.
+/// This is the wiring test, not the live-join test: `tests/peer_ask.rs`
+/// covers the five refusal shapes against the library directly, and the
+/// container scenario (`tests/containers/scenarios/sealed-invite.sh`) is
+/// where both the "no address in the chat" claim over a real grep AND the
+/// join actually completing against a real listening server are measured.
+/// This test proves the three CLI branches (`--sealed`, `--stdin` on an ask,
+/// `--reply --stdin`) are wired to each other and to the real `Enrol` join
+/// path, up to the point a live listener would be needed.
 #[test]
 fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
     let inviter = Node::new("sealed-inviter");
@@ -4503,19 +4506,28 @@ fn the_sealed_exchange_works_end_to_end_at_the_command_line() {
         .write_all(format!("{reply_line}\n").as_bytes())
         .expect("write the reply to stdin");
     let open_out = open.wait_with_output().expect("the child exits");
-    let open_stdout = String::from_utf8_lossy(&open_out.stdout).to_string();
-    assert!(
-        open_out.status.success(),
-        "opening the reply failed: {open_stdout}{}",
+    let open_out_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&open_out.stdout),
         String::from_utf8_lossy(&open_out.stderr)
     );
+    // `friend` never ran a real server, only the one-shot `join --stdin` that
+    // minted this key, so nothing is listening at 127.0.0.1:9701: the dial
+    // this `--reply --stdin` runs refuses to connect. That failure is the
+    // positive control: it proves opening the reply reached the `Enrol` join
+    // attempt with the friend's REAL address and REAL secret, not that mode
+    // B's whole flow completes without a listener. The live listener that
+    // proves the join itself succeeds is
+    // `tests/containers/scenarios/sealed-invite.sh`, against the real
+    // shipped binary running as a real server.
     assert!(
-        open_stdout.contains("peer invite: they answer at 127.0.0.1:9701"),
-        "the opened reply names the address the friend answered with: {open_stdout}"
+        open_out_text.contains("127.0.0.1:9701"),
+        "opening the reply attempted a join with the friend's real address: {open_out_text}"
     );
     assert!(
-        open_stdout.contains("tcr peer pair 127.0.0.1:9701"),
-        "the next command to run is printed: {open_stdout}"
+        !open_out_text.contains("tcr peer pair") && !open_out_text.contains("they answer at"),
+        "no dial-later or bare-address line: the reply carried a key, and the failure is the \
+         join's own, not a leftover from the old bare-address ending: {open_out_text}"
     );
 }
 

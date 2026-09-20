@@ -2309,16 +2309,20 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     line.trim(),
                     now_ms,
                 )?;
-                let teamclaude_rs::peer::ask::Opened::Addresses(addrs, _answering_pub) = opened;
-                for addr in &addrs {
-                    println!("peer invite: they answer at {addr}");
-                }
-                if let Some(first) = addrs.first() {
-                    println!(
-                        "peer invite: tcr peer pair {first} asks them to connect; they press \
-                         Accept and both screens show six digits"
-                    );
-                }
+                let teamclaude_rs::peer::ask::Opened::Key(token) = opened;
+                // Opening a reply runs the join immediately, the `Enrol`
+                // (`IKpsk1`) path a pasted key already takes: pinned and
+                // trusted on both sides the moment the handshake completes.
+                // No knock, no six-digit compare, and no `tcr peer pair`
+                // afterwards, because `internet_admission` never answers
+                // either from off the LAN and this reply's whole point is
+                // that the friend may be off it.
+                let joined = teamclaude_rs::peer::pair::join(&store, &token, "this-mac").await?;
+                println!(
+                    "peer invite: ok addr={} file={}",
+                    joined.addr,
+                    path.display()
+                );
                 return Ok(());
             }
             let label = a.label.clone().unwrap_or_else(|| "joining-mac".to_string());
@@ -2414,28 +2418,29 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                          here alone"
                     );
                 }
-                let addrs = teamclaude_rs::peer::pair::addresses_to_offer(&store, external)?;
-                let (secret, public) = teamclaude_rs::peer::noise::generate_static()?;
-                let id_bytes = teamclaude_rs::peer::noise::random_secret()?;
-                let id = u64::from_be_bytes(id_bytes[..8].try_into().expect("checked length"));
-                teamclaude_rs::peer::state::add_ask(
-                    &peer_state_path(&path),
-                    teamclaude_rs::peer::state::PendingAsk {
-                        id,
-                        public,
-                        private: secret,
-                        until_ms: now_ms.saturating_add(600_000),
-                    },
+                // The friend answering an ask mints a one-use, ten-minute join
+                // key for itself, the same `mint_invite` `tcr peer invite`
+                // runs, and seals THAT to the ask rather than a bare address:
+                // off the LAN, `internet_admission` (`src/peer/listener.rs`)
+                // answers only `Enrol` (a minted key), never a knock, so a
+                // reply that only taught an address could never be dialled by
+                // the friend this mode exists for.
+                let (_invite, token) = teamclaude_rs::peer::pair::mint_invite(
+                    &store,
+                    "sealed-invite-reply",
+                    600,
+                    1,
+                    external,
                 )?;
-                let reply = teamclaude_rs::peer::ask::seal_addresses(ask, &addrs, &public)?;
+                let reply = teamclaude_rs::peer::ask::seal_key(ask, &token)?;
                 println!("{}", reply.to_string_wire());
                 println!(
                     "peer join: send this back to whoever sent you the invite; nothing in it \
                      says where you are except to them"
                 );
                 println!(
-                    "peer join: they will then ask to connect, and both screens show six \
-                     digits you compare out loud"
+                    "peer join: opening it joins you immediately, pinned and trusted on both \
+                     sides, the same as a pasted key"
                 );
                 return Ok(());
             }

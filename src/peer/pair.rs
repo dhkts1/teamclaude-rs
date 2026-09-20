@@ -295,10 +295,44 @@ impl JoinToken {
         let mut body = Vec::new();
         body.extend_from_slice(&TOKEN_V3_MAGIC);
         body.push(TOKEN_V3_VERSION);
+        body.extend_from_slice(&self.to_v3_body());
+        format!("{TOKEN_PREFIX_V3}{}", encode_bytes(&body))
+    }
+
+    /// The three fields, in v3's compact spelling, with no magic and no
+    /// version: the address list through [`dialaddrs::encode`], the
+    /// registrar's 32 bytes, the secret's 32 bytes.
+    ///
+    /// [`Self::to_token_v3`] wraps this in a magic, a version and a base32
+    /// prefix for a pasted key. `src/peer/ask.rs` seals it directly instead:
+    /// its own frame already carries a magic and a version, and wrapping the
+    /// key's again would be the same fact spelled twice.
+    pub fn to_v3_body(&self) -> Vec<u8> {
+        let mut body = Vec::new();
         body.extend_from_slice(&dialaddrs::encode(&self.sockets().collect::<Vec<_>>()));
         body.extend_from_slice(&self.registrar.0);
         body.extend_from_slice(&self.secret);
-        format!("{TOKEN_PREFIX_V3}{}", encode_bytes(&body))
+        body
+    }
+
+    /// The inverse of [`Self::to_v3_body`]: the three fields back out of the
+    /// same compact spelling, with no magic or version to check (the caller
+    /// already checked its own).
+    pub fn from_v3_body(bytes: &[u8]) -> Result<Self> {
+        let (addrs, rest) =
+            dialaddrs::decode_prefix(bytes).map_err(|refusal| anyhow!("peer join: {refusal}"))?;
+        if rest.len() != 64 {
+            bail!(
+                "peer join: this key has the wrong number of bytes left after its address \
+                 list, which is what a paste cut short or padded looks like"
+            );
+        }
+        if addrs.is_empty() {
+            bail!("peer join: this key carries no address to dial");
+        }
+        let registrar = PeerId(rest[..32].try_into().expect("checked length"));
+        let secret: [u8; 32] = rest[32..64].try_into().expect("checked length");
+        Ok(Self::new(addrs, registrar, secret))
     }
 
     /// Parse a pasted key, v3, v2 or v1. Refuses an unknown version rather
@@ -389,23 +423,7 @@ impl JoinToken {
             bail!("peer join: this v3 key names format version {version}, which this build does not know");
         }
         let rest = &bytes[TOKEN_V3_MAGIC.len() + 1..];
-        // The address list is self-delimiting on its own count byte, so what
-        // `decode_prefix` leaves unconsumed is exactly the registrar and the
-        // secret.
-        let (addrs, rest) =
-            dialaddrs::decode_prefix(rest).map_err(|refusal| anyhow!("peer join: {refusal}"))?;
-        if rest.len() != 64 {
-            bail!(
-                "peer join: this v3 key has the wrong number of bytes left after its address \
-                 list, which is what a paste cut short or padded looks like"
-            );
-        }
-        if addrs.is_empty() {
-            bail!("peer join: this key carries no address to dial");
-        }
-        let registrar = PeerId(rest[..32].try_into().expect("checked length"));
-        let secret: [u8; 32] = rest[32..64].try_into().expect("checked length");
-        Ok(Self::new(addrs, registrar, secret))
+        Self::from_v3_body(rest)
     }
 }
 
@@ -612,34 +630,6 @@ pub fn local_dial_addresses(listen: SocketAddr, external: Option<SocketAddr>) ->
         &host_addresses(),
         external.or_else(crate::peer::reach::external_socket),
     )
-}
-
-/// Every address a friend could dial this Mac at right now, or a refusal
-/// naming what to do: the same two checks [`mint_invite_as`] runs before
-/// writing an invite row, in the same words, so answering an ask
-/// (`peer join --stdin`) refuses exactly as `tcr peer invite` would rather
-/// than in a second spelling of the same sentence.
-pub fn addresses_to_offer(
-    store: &PeerStore,
-    external: Option<SocketAddr>,
-) -> Result<Vec<SocketAddr>> {
-    let file = read_or_default(store.path())?;
-    let Some(listen) = file.listen else {
-        bail!(
-            "peer invite: this node has no peer listener, so a token would carry no address \
-             to dial (`tcr peer find on` opens one)"
-        );
-    };
-    let addrs = local_dial_addresses(listen, external);
-    if addrs.is_empty() {
-        bail!(
-            "peer invite: this Mac listens on {listen} and holds no address a friend could \
-             dial, so the key would carry nothing. Join a network and run this again; \
-             `tcr peer reach` says whether the router will forward the port once you are on \
-             one"
-        );
-    }
-    Ok(addrs.into_iter().map(|entry| entry.addr).collect())
 }
 
 /// Mint an invite: generate the secret, store the row, return the token.

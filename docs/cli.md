@@ -1007,6 +1007,9 @@ Mints a one-line join key for a Mac with no screen to compare digits on: the hea
 | `--uses <n>` | int | `1` | how many Macs may join with this one key |
 | `--revoke <id>` | int | none | revoke an outstanding key by id instead of minting one |
 | `--plain` | bool | `false` | mint the older, readable key (`tcr-join:v2:…`) instead of the opaque one this build mints by default |
+| `--sealed` | bool | `false` | mint an ask (`tcr-invite:v1:…`) instead of a key: a one-time public key that names no address and grants nothing. Good for ten minutes |
+| `--reply` | bool | `false` | open a reply to an ask this Mac minted, and join with the key it carried. Requires `--stdin` |
+| `--stdin` | bool | `false` | read the reply from standard input, for `--reply`. The only path: a reply is a live answer to a live ask and does not belong in argv any more than a join key does |
 
 The key carries **every address this Mac can be reached at**, best first, and the joining Mac
 tries them in order: the tailnet address, then the external address a port mapping published,
@@ -1040,14 +1043,26 @@ internet the friend needs this Mac's router to forward the port, and `tcr peer r
 where that stands. When `listen` names one specific address rather than `0.0.0.0`, the key
 carries that address alone, because somebody chose it.
 
+**The sealed exchange, `--sealed` and `--reply --stdin`.** A key, opaque or plain, still shows
+its holder an address once they parse it. For a friend who does not want an address in the
+chat at all, `tcr peer invite --sealed` mints an ask instead: a one-time public key that names
+nothing and grants nothing. The friend answers it with `tcr peer join --stdin` (below), which
+mints its own one-use join key and seals it to the ask, printing a reply
+(`tcr-reply:v1:…`). Pasting that reply back with `tcr peer invite --reply --stdin` opens it and
+runs the join immediately: pinned and trusted on both sides the moment the handshake
+completes, the same `Enrol` (`IKpsk1`) path a pasted key already takes. There is no knock, no
+six-digit compare and no further command, because the reply carried a real key rather than a
+bare address, and `src/peer/listener.rs`'s off-LAN admission answers that path even when the
+friend is not on this Wi-Fi, which a knock never would be.
+
 ### `tcr peer join [key]`
 
-Joins another Mac using a key or link it printed.
+Joins another Mac using a key, a link, or an ask it printed.
 
 | flag | type | default | effect |
 |---|---|---|---|
-| `[key]` | positional | | the `tcr-join:…` key or the `tcr://peer/join?…` link the other Mac printed. **Visible in `ps` and shell history**: use `--stdin` to avoid that |
-| `--stdin` | bool | `false` | read the key or link from standard input instead of argv. The only path the panel and the `tcr://` URL handler use, and the one that never leaks the secret to another process |
+| `[key]` | positional | | the `tcr-join:…` key, the `tcr://peer/join?…` link, or the `tcr-invite:…` ask the other Mac printed. **Visible in `ps` and shell history**: use `--stdin` to avoid that |
+| `--stdin` | bool | `false` | read the key, link or ask from standard input instead of argv. The only path the panel and the `tcr://` URL handler use, and the one that never leaks the secret to another process |
 | `--label <name>` | string | none | this Mac's name, as the other one will show it |
 | `--replace` | bool | `false` | accept a link's network key when this Mac already has one |
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
@@ -1056,6 +1071,11 @@ A link that carries a network key is **refused when this Mac already has one**, 
 refusal names what replacing it would cut this Mac off from. It is the same refusal
 `tcr peer network-key join` gives, for the same reason: a second office's key pasted over the
 first is the commonest way a Mac disappears from its own mesh. `--replace` means it.
+
+Fed an ask (`tcr-invite:v1:…`) instead of a key or a link, `tcr peer join --stdin` mints a
+one-use, ten-minute join key of its own (the same key `tcr peer invite` would mint) and seals
+it to the ask, printing a reply (`tcr-reply:v1:…`) rather than joining anything itself: it is
+the friend's side of the sealed exchange `tcr peer invite --sealed` describes above.
 
 ### `tcr peer forget <peer>`
 

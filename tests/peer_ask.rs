@@ -1,5 +1,5 @@
-//! The sealed exchange: an ask that names no address, a reply sealed to it
-//! that names no address either, and the five ways a reply is refused.
+//! The sealed exchange: an ask that names no address, a reply that seals a
+//! real join key to it, and the five ways a reply is refused.
 //!
 //! # Watched red
 //!
@@ -13,11 +13,10 @@
 //! `127.0.0.1:3456`. Every state file is a fresh temp file this test writes
 //! and cleans up itself.
 
-use std::net::SocketAddr;
-
+use tcr_peer_wire::PeerId;
 use teamclaude_rs::peer::ask::{self, Ask};
 use teamclaude_rs::peer::noise;
-use teamclaude_rs::peer::pair;
+use teamclaude_rs::peer::pair::{self, JoinToken};
 use teamclaude_rs::peer::state::{self, PeerState, PendingAsk};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
@@ -35,11 +34,17 @@ fn keypair() -> ([u8; noise::KEY_BYTES], [u8; noise::KEY_BYTES]) {
     noise::generate_static().expect("a test keypair")
 }
 
-fn some_addrs() -> Vec<SocketAddr> {
-    vec![
-        "192.0.2.10:7755".parse().expect("a test address"),
-        "198.51.100.20:7755".parse().expect("a test address"),
-    ]
+/// A join key the way `mint_invite` builds one, for a scenario this file does
+/// not itself need a `PeerStore` to write.
+fn some_token() -> JoinToken {
+    JoinToken::new(
+        vec![
+            "192.0.2.10:7755".parse().expect("a test address"),
+            "198.51.100.20:7755".parse().expect("a test address"),
+        ],
+        PeerId([4_u8; 32]),
+        [8_u8; 32],
+    )
 }
 
 fn row(
@@ -56,21 +61,19 @@ fn row(
     }
 }
 
-/// **A reply opens against its own ask and yields the addresses that went
-/// in.**
+/// **A reply opens against its own ask and yields the key that went in.**
 ///
 /// Watched red: change `noise::seal_to`'s pattern away from `PATTERN_SEAL`
-/// and this fails to build a matching responder; change `dialaddrs::encode`
-/// or `decode_prefix` and the addresses that come back differ from the ones
-/// that went in.
+/// and this fails to build a matching responder; change `JoinToken::to_v3_body`
+/// or `from_v3_body` and the key that comes back differs from the one that
+/// went in.
 #[test]
-fn a_reply_opens_against_its_own_ask_and_yields_the_addresses_that_went_in() {
+fn a_reply_opens_against_its_own_ask_and_yields_the_key_that_went_in() {
     let (ask_secret, ask_public) = keypair();
-    let (_answer_secret, answer_public) = keypair();
     let ask = Ask { key: ask_public };
-    let addrs = some_addrs();
+    let token = some_token();
 
-    let reply = ask::seal_addresses(&ask, &addrs, &answer_public).expect("it seals");
+    let reply = ask::seal_key(&ask, &token).expect("it seals");
     let rendered = reply.to_string_wire();
     assert!(
         rendered.starts_with(ask::REPLY_PREFIX),
@@ -84,8 +87,8 @@ fn a_reply_opens_against_its_own_ask_and_yields_the_addresses_that_went_in() {
     assert_eq!(id, 1, "the matching row's id is the one that opened it");
     assert_eq!(
         opened,
-        ask::Opened::Addresses(addrs, answer_public),
-        "every address that went in comes back out, in order"
+        ask::Opened::Key(token),
+        "the key that comes back out is the one that was sealed in"
     );
 }
 
@@ -93,17 +96,16 @@ fn a_reply_opens_against_its_own_ask_and_yields_the_addresses_that_went_in() {
 /// refusal.**
 ///
 /// "Quiet" means the refusal names no address, no Mac and no key: this test
-/// checks both the refusal (`DidNotOpen`) and that its `Display` carries
-/// none of the addresses the reply sealed.
+/// checks both the refusal (`DidNotOpen`) and that its `Display` carries none
+/// of the addresses the sealed key names.
 #[test]
 fn the_same_reply_against_a_second_macs_row_is_refused_with_the_quiet_refusal() {
     let (_ask_secret, ask_public) = keypair();
     let (other_secret, other_public) = keypair();
-    let (_answer_secret, answer_public) = keypair();
     let ask = Ask { key: ask_public };
-    let addrs = some_addrs();
+    let token = some_token();
 
-    let reply = ask::seal_addresses(&ask, &addrs, &answer_public).expect("it seals");
+    let reply = ask::seal_key(&ask, &token).expect("it seals");
     let rendered = reply.to_string_wire();
 
     let now = pair::now_ms();
@@ -114,7 +116,7 @@ fn the_same_reply_against_a_second_macs_row_is_refused_with_the_quiet_refusal() 
         .expect_err("a reply sealed to one ask must not open against another's row");
     assert_eq!(error, ask::ReplyRefusal::DidNotOpen);
     let text = format!("{error}");
-    for addr in &addrs {
+    for addr in token.sockets() {
         assert!(
             !text.contains(&addr.to_string()),
             "the refusal must name no address: {text}"
@@ -130,14 +132,19 @@ fn the_same_reply_against_a_second_macs_row_is_refused_with_the_quiet_refusal() 
 #[test]
 fn a_truncated_paste_is_cut_short_not_a_forgery() {
     let (ask_secret, ask_public) = keypair();
-    let (_answer_secret, answer_public) = keypair();
     let ask = Ask { key: ask_public };
-    let reply = ask::seal_addresses(&ask, &some_addrs(), &answer_public).expect("it seals");
+    let reply = ask::seal_key(&ask, &some_token()).expect("it seals");
     let rendered = reply.to_string_wire();
 
-    // Cut the paste in half: still starts with the prefix, still decodes as
-    // base32, but far too short to hold a frame, a nonce and a tag.
-    let cut = &rendered[..rendered.len() / 2];
+    // Cut well under the floor (magic + version + a 32-byte ephemeral key +
+    // a 16-byte tag + one byte, 54 bytes, about 87 base32 characters): still
+    // starts with the prefix, still decodes as base32, but far too short to
+    // hold a frame, a nonce and a tag. A proportional cut (half the string)
+    // is not safe here: the plaintext now carries a whole join key rather
+    // than a bare address, so half of a real reply can land ABOVE the floor
+    // and read as a genuine (if wrong) AEAD failure instead.
+    let cut_len = (ask::REPLY_PREFIX.len() + 40).min(rendered.len());
+    let cut = &rendered[..cut_len];
 
     let now = pair::now_ms();
     let rows = vec![row(3, ask_public, ask_secret, now + 600_000)];
@@ -158,9 +165,8 @@ fn a_truncated_paste_is_cut_short_not_a_forgery() {
 #[test]
 fn a_second_open_of_the_same_reply_is_refused() {
     let (ask_secret, ask_public) = keypair();
-    let (_answer_secret, answer_public) = keypair();
     let ask = Ask { key: ask_public };
-    let reply = ask::seal_addresses(&ask, &some_addrs(), &answer_public).expect("it seals");
+    let reply = ask::seal_key(&ask, &some_token()).expect("it seals");
     let rendered = reply.to_string_wire();
 
     let path = scratch("second-open");
@@ -189,10 +195,9 @@ fn a_second_open_of_the_same_reply_is_refused() {
 #[test]
 fn a_reply_past_the_asks_deadline_is_refused_and_just_before_it_still_opens() {
     let (ask_secret, ask_public) = keypair();
-    let (_answer_secret, answer_public) = keypair();
     let ask = Ask { key: ask_public };
-    let addrs = some_addrs();
-    let reply = ask::seal_addresses(&ask, &addrs, &answer_public).expect("it seals");
+    let token = some_token();
+    let reply = ask::seal_key(&ask, &token).expect("it seals");
     let rendered = reply.to_string_wire();
 
     let until_ms = pair::now_ms() + 600_000;
@@ -200,7 +205,7 @@ fn a_reply_past_the_asks_deadline_is_refused_and_just_before_it_still_opens() {
 
     let (opened, _id) = ask::open_reply(&rows, &rendered, until_ms - 1)
         .expect("one millisecond before the deadline, the row is still live");
-    assert_eq!(opened, ask::Opened::Addresses(addrs, answer_public));
+    assert_eq!(opened, ask::Opened::Key(token));
 
     let error = ask::open_reply(&rows, &rendered, until_ms)
         .expect_err("at the deadline itself, the row must no longer be live");
