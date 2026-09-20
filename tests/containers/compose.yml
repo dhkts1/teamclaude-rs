@@ -4,15 +4,18 @@
 # Addresses are fixed, not allocated, because a scenario asserts on the exact
 # endpoint a hello or an invite key carries, and a floating address turns that
 # assertion into a pattern match. The two home networks are RFC 1918, the way a
-# home LAN is. The internet network is 198.51.100.0/24, which is documentation
-# space rather than private space, and that is load-bearing: miniupnpd refuses
-# to map when its external interface holds an RFC 1918 address ("Reserved /
-# private IP address on ext interface: Port forwarding is impossible"), so a
-# 10.x internet would make the UPnP scenario fail for a reason that has nothing
-# to do with this code.
+# home LAN is. The internet network is 5.5.5.0/24, ordinary public unicast
+# space rather than private space, and that is load-bearing: miniupnpd's own
+# reserved-address list (RFC 1918, RFC 6598, RFC 5737 and the rest of the IANA
+# special-purpose registry) refuses to map when its external interface holds
+# an address on it ("Reserved / private IP address on ext interface: Port
+# forwarding is impossible"), and 198.51.100.0/24, tried first, is itself
+# RFC 5737 documentation space and on that list.
 #
 # Both home networks are `internal: true`: no route out except through their
-# router, which is the whole point of having one.
+# router, which is the whole point of having one. So is `internet`: nothing
+# here needs a route past this bridge, and marking it internal is what makes
+# "nothing here touches a real host" true rather than assumed.
 
 name: tcr-peers
 
@@ -21,7 +24,7 @@ x-node: &node
   entrypoint: /usr/local/bin/node-entrypoint.sh
   cap_add: [NET_ADMIN]
   environment:
-    UPSTREAM: http://198.51.100.20:8080
+    UPSTREAM: http://5.5.5.20:8080
   init: true
 
 services:
@@ -32,7 +35,7 @@ services:
       - ./upstream-stub.py:/upstream-stub.py:ro
     networks:
       internet:
-        ipv4_address: 198.51.100.20
+        ipv4_address: 5.5.5.20
 
   # The wire itself, on home-a: one multicast PTR query for the service type
   # and every answer that comes back. Run with `docker compose run --rm -T
@@ -61,13 +64,13 @@ services:
       net.ipv4.ip_forward: 1
     environment:
       INSIDE_SUBNET: 10.77.1.0/24
-      OUTSIDE_SUBNET: 198.51.100.0/24
+      OUTSIDE_SUBNET: 5.5.5.0/24
       UPNP: ${ROUTER_A_UPNP:-off}
     networks:
       home-a:
         ipv4_address: 10.77.1.2
       internet:
-        ipv4_address: 198.51.100.2
+        ipv4_address: 5.5.5.2
 
   router-b:
     image: tcr-harness/router:dev
@@ -76,13 +79,13 @@ services:
       net.ipv4.ip_forward: 1
     environment:
       INSIDE_SUBNET: 10.77.2.0/24
-      OUTSIDE_SUBNET: 198.51.100.0/24
+      OUTSIDE_SUBNET: 5.5.5.0/24
       UPNP: ${ROUTER_B_UPNP:-off}
     networks:
       home-b:
         ipv4_address: 10.77.2.2
       internet:
-        ipv4_address: 198.51.100.3
+        ipv4_address: 5.5.5.3
 
   # Home A. node-a1 is the one an invite comes from; node-a2 is its neighbour
   # on the same LAN, which is all the discovery scenarios need.
@@ -91,7 +94,7 @@ services:
     environment:
       NODE_NAME: node-a1
       PEER_LISTEN: 0.0.0.0:7755
-      UPSTREAM: http://198.51.100.20:8080
+      UPSTREAM: http://5.5.5.20:8080
       DEFAULT_VIA: 10.77.1.2
       FIND: ${NODE_A1_FIND:-off}
       ANNOUNCE_NAME: ${NODE_A1_ANNOUNCE_NAME:-off}
@@ -104,7 +107,7 @@ services:
     environment:
       NODE_NAME: node-a2
       PEER_LISTEN: 0.0.0.0:7755
-      UPSTREAM: http://198.51.100.20:8080
+      UPSTREAM: http://5.5.5.20:8080
       DEFAULT_VIA: 10.77.1.2
       FIND: ${NODE_A2_FIND:-off}
       ANNOUNCE_NAME: ${NODE_A2_ANNOUNCE_NAME:-off}
@@ -118,7 +121,7 @@ services:
     environment:
       NODE_NAME: node-b1
       PEER_LISTEN: 0.0.0.0:7755
-      UPSTREAM: http://198.51.100.20:8080
+      UPSTREAM: http://5.5.5.20:8080
       DEFAULT_VIA: 10.77.2.2
     networks:
       home-b:
@@ -132,26 +135,26 @@ services:
     environment:
       NODE_NAME: node-a1
       PEER_LISTEN: 0.0.0.0:7755
-      UPSTREAM: http://198.51.100.20:8080
+      UPSTREAM: http://5.5.5.20:8080
       DEFAULT_VIA: 10.77.1.2
     networks:
       home-a:
         ipv4_address: 10.77.1.11
       overlay:
-        ipv4_address: 10.99.0.11
+        ipv4_address: 100.64.99.11
 
   node-b1-overlay:
     <<: *node
     environment:
       NODE_NAME: node-b1
       PEER_LISTEN: 0.0.0.0:7755
-      UPSTREAM: http://198.51.100.20:8080
+      UPSTREAM: http://5.5.5.20:8080
       DEFAULT_VIA: 10.77.2.2
     networks:
       home-b:
         ipv4_address: 10.77.2.11
       overlay:
-        ipv4_address: 10.99.0.12
+        ipv4_address: 100.64.99.12
 
 networks:
   home-a:
@@ -165,11 +168,12 @@ networks:
       config:
         - subnet: 10.77.2.0/24
   internet:
+    internal: true
     ipam:
       config:
-        - subnet: 198.51.100.0/24
+        - subnet: 5.5.5.0/24
   overlay:
     internal: true
     ipam:
       config:
-        - subnet: 10.99.0.0/24
+        - subnet: 100.64.99.0/24

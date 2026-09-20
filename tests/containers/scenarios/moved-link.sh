@@ -2,7 +2,7 @@
 # moved-link
 # Mint a moved link, open it, and open it again.
 #
-# Cast: node-a1-overlay (10.77.1.11 on home-a, 10.99.0.11 on overlay) and
+# Cast: node-a1-overlay (10.77.1.11 on home-a, 100.64.99.11 on overlay) and
 # node-a2 (10.77.1.12 on home-a), paired both ways over home-a and then greeted
 # once.
 #
@@ -14,7 +14,7 @@
 # overlay address is the one fact the link has to carry, and every assertion
 # below about what was added names it.
 #
-# node-a2 is not on the overlay network and cannot dial 10.99.0.11. It does not
+# node-a2 is not on the overlay network and cannot dial 100.64.99.11. It does not
 # have to: what is measured here is what a link teaches a peers file, which is a
 # row fact, and the dial itself is `nat-no-mapping`'s and `overlay-invite`'s.
 #
@@ -66,7 +66,7 @@ export SERVICES
 # the two Macs are paired at; the third is the one only the link can teach.
 A1_HOME=10.77.1.11
 A2_HOME=10.77.1.12
-A1_OVERLAY=10.99.0.11
+A1_OVERLAY=100.64.99.11
 
 # shellcheck disable=SC2086 # SERVICES is a deliberate list of service names
 up $SERVICES || { finish; exit 1; }
