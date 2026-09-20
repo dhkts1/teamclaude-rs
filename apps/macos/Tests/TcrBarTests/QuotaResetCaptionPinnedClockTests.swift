@@ -8,15 +8,15 @@ import XCTest
 /// `TcrBar` executable target and are not importable here
 /// (`RenderFixtureShapeTests`'s own doc-comment on why: the test target
 /// links `TcrBarCore` alone). These tests instead pin the `TcrBarCore`
-/// contract that fixture depends on — ``QuotaFormat/resetCaption(resetAtMs:now:)``
-/// — the same way `RenderFixtureShapeTests` pins the logic behind the
+/// contract that fixture depends on, ``QuotaFormat/resetCaption(resetAtMs:now:)``,
+/// the same way `RenderFixtureShapeTests` pins the logic behind the
 /// duplicate-scene bug it guards.
 ///
 /// The bug: `account()`'s reset offsets used to be measured from `Date()`,
 /// the real clock, while `exitsCard` renders its account against `peerNow`,
 /// a clock fixed in the past. Two fixture builds on two different days
 /// produced two different captions against the one render clock that never
-/// moved — `w12-exits-local-dark` read "in 44d 18h" one week, "in 45d 2h"
+/// moved: `w12-exits-local-dark` read "in 44d 18h" one week, "in 45d 2h"
 /// the next, both against a 5h window. The fix, `RenderStates.exitsAliceJSON`,
 /// measures the offset from `peerNow` too, so the two clocks are the same
 /// clock and the gap between them can no longer grow.
@@ -28,7 +28,7 @@ final class QuotaResetCaptionPinnedClockTests: XCTestCase {
     /// measured from the real clock, read back against `peerNow`. The real
     /// clock has moved well past `peerNow` since this fixture's reference
     /// epoch was chosen, so the "5h" window reads as tens of days away
-    /// instead — exactly the wrong-magnitude caption the PNGs showed.
+    /// instead, exactly the wrong-magnitude caption the PNGs showed.
     func testResetOffsetMeasuredFromTheRealClockMisreadsAgainstAFixedRenderClock() {
         let resetAtMs = Int64(Date().addingTimeInterval(130 * 60).timeIntervalSince1970 * 1000)
 
@@ -37,7 +37,7 @@ final class QuotaResetCaptionPinnedClockTests: XCTestCase {
         XCTAssertNotEqual(
             caption, "in 2h 10m",
             "a 130-minute window measured from the real clock and read back against a `now` "
-                + "fixed months in the past must NOT still read as 2h 10m away — if it does, "
+                + "fixed months in the past must NOT still read as 2h 10m away. If it does, "
                 + "the two clocks have drifted back into agreement by coincidence, not by fix")
     }
 
