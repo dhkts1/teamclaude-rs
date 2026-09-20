@@ -779,8 +779,25 @@ mod peer_cli {
         /// text) instead of the opaque `tcr-join:v3:…` this build mints by
         /// default. For a script that greps a key out of stdout, and for a
         /// friend still on a build old enough to only read this one.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["sealed", "reply"])]
         pub plain: bool,
+        /// Mint an ask instead of a key: a one-time public key that names no
+        /// address and grants nothing, for the friend who does not want an
+        /// address in the chat at all. Good for ten minutes; the friend
+        /// answers with `tcr peer join --stdin`, and the reply is opened with
+        /// `--reply --stdin`.
+        #[arg(long, conflicts_with_all = ["plain", "revoke", "reply"])]
+        pub sealed: bool,
+        /// Open a reply to an ask this Mac minted, read from standard input,
+        /// and print the address it names plus the `tcr peer pair` command
+        /// that dials it. Requires `--stdin`.
+        #[arg(long, requires = "stdin", conflicts_with_all = ["plain", "sealed", "revoke"])]
+        pub reply: bool,
+        /// Read the reply from standard input, one line, for `--reply`. The
+        /// only source: a reply is a live answer to a live ask and does not
+        /// belong in argv any more than a join key does.
+        #[arg(long)]
+        pub stdin: bool,
     }
 
     #[derive(clap::Args)]
@@ -2247,6 +2264,67 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
+            if a.sealed {
+                let (secret, public) = teamclaude_rs::peer::noise::generate_static()?;
+                let now_ms = teamclaude_rs::peer::pair::now_ms();
+                let until_ms = now_ms.saturating_add(600_000);
+                let id_bytes = teamclaude_rs::peer::noise::random_secret()?;
+                let id = u64::from_be_bytes(id_bytes[..8].try_into().expect("checked length"));
+                teamclaude_rs::peer::state::add_ask(
+                    &peer_state_path(&path),
+                    teamclaude_rs::peer::state::PendingAsk {
+                        id,
+                        public,
+                        private: secret,
+                        until_ms,
+                    },
+                )?;
+                let ask = teamclaude_rs::peer::ask::Ask { key: public };
+                println!("{}", ask.to_string_wire());
+                println!(
+                    "peer invite: this names no address and grants nothing; whoever holds it \
+                     can send you an address and nothing else"
+                );
+                println!(
+                    "peer invite: it is good for ten minutes; paste what comes back with \
+                     tcr peer invite --reply --stdin"
+                );
+                return Ok(());
+            }
+            if a.reply {
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .context("peer invite: could not read the reply from standard input")?;
+                if line.trim().is_empty() {
+                    anyhow::bail!(
+                        "peer invite: standard input carried no reply (`--reply --stdin` \
+                         expects the {}… line on stdin)",
+                        teamclaude_rs::peer::ask::REPLY_PREFIX
+                    );
+                }
+                let now_ms = teamclaude_rs::peer::pair::now_ms();
+                let opened = teamclaude_rs::peer::state::open_and_spend_ask(
+                    &peer_state_path(&path),
+                    line.trim(),
+                    now_ms,
+                )?;
+                let teamclaude_rs::peer::ask::Opened::Key(token) = opened;
+                // Opening a reply runs the join immediately, the `Enrol`
+                // (`IKpsk1`) path a pasted key already takes: pinned and
+                // trusted on both sides the moment the handshake completes.
+                // No knock, no six-digit compare, and no `tcr peer pair`
+                // afterwards, because `internet_admission` never answers
+                // either from off the LAN and this reply's whole point is
+                // that the friend may be off it.
+                let joined = teamclaude_rs::peer::pair::join(&store, &token, "this-mac").await?;
+                println!(
+                    "peer invite: ok addr={} file={}",
+                    joined.addr,
+                    path.display()
+                );
+                return Ok(());
+            }
             let label = a.label.clone().unwrap_or_else(|| "joining-mac".to_string());
             // This process runs no keeper of its own, so a live mapping is not
             // sitting in `reach::external_socket`; it is read off the state
@@ -2327,6 +2405,45 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 teamclaude_rs::peer::pair::TokenSource::Argv(key)
             };
             let input = teamclaude_rs::peer::pair::read_join_input(source)?;
+
+            if let teamclaude_rs::peer::pair::JoinInput::Ask(ask) = &input {
+                let now_ms = teamclaude_rs::peer::pair::now_ms();
+                let (external, reason) = teamclaude_rs::peer::reach::recorded_external_socket(
+                    &peer_state_path(&path),
+                    now_ms,
+                );
+                if let Some(reason) = reason {
+                    println!(
+                        "peer join: {reason}, so this reply carries what this Mac answers on \
+                         here alone"
+                    );
+                }
+                // The friend answering an ask mints a one-use, ten-minute join
+                // key for itself, the same `mint_invite` `tcr peer invite`
+                // runs, and seals THAT to the ask rather than a bare address:
+                // off the LAN, `internet_admission` (`src/peer/listener.rs`)
+                // answers only `Enrol` (a minted key), never a knock, so a
+                // reply that only taught an address could never be dialled by
+                // the friend this mode exists for.
+                let (_invite, token) = teamclaude_rs::peer::pair::mint_invite(
+                    &store,
+                    "sealed-invite-reply",
+                    600,
+                    1,
+                    external,
+                )?;
+                let reply = teamclaude_rs::peer::ask::seal_key(ask, &token)?;
+                println!("{}", reply.to_string_wire());
+                println!(
+                    "peer join: send this back to whoever sent you the invite; nothing in it \
+                     says where you are except to them"
+                );
+                println!(
+                    "peer join: opening it joins you immediately, pinned and trusted on both \
+                     sides, the same as a pasted key"
+                );
+                return Ok(());
+            }
 
             // The network key first, because it is what a link with no join
             // key is FOR, and because setting it is what lets this Mac see the

@@ -262,6 +262,15 @@ refuses a v3 key with "this is not a join key", and no later build can edit that
 instead of the command line, so it never lands in shell history or in another process's view
 of this one's arguments.
 
+For a friend who does not want an address in the chat at all, `tcr peer invite --sealed`
+mints an ask (`tcr-invite:v1:…`) instead of a key: a one-time public key that names nothing
+and grants nothing. The friend runs `tcr peer join --stdin` on it, which mints its own
+one-use join key and seals it to the ask rather than joining anything itself, printing a reply
+(`tcr-reply:v1:…`). Pasting that reply back with `tcr peer invite --reply --stdin` opens it
+and joins with the key it carried on the spot: pinned and trusted on both sides, no knock and
+no six-digit compare, the same as a pasted key would be. Both the ask and the reply are
+opaque, so the chat carries no address in either mode.
+
 In the panel, the Peers tab's footer carries an `Invite…` button beside `Settings…` that runs
 `tcr peer invite` in one press: the sheet opens first, then shows the key in a copyable box
 under `tcr`'s own lines about which paths it carries and how long it lasts, unedited. `Settings
