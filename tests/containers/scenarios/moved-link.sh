@@ -55,12 +55,6 @@ SCENARIO="moved-link"
 export SCENARIO
 # shellcheck source=../lib/assert.sh
 . "$HERE/../lib/assert.sh"
-# shellcheck source=../lib/compose.sh
-. "$HERE/../lib/compose.sh"
-
-# The compose services this scenario needs, for the runner and for a reader.
-SERVICES="node-a1-overlay node-a2"
-export SERVICES
 
 # The three addresses this scenario names, written once. The first two are what
 # the two Macs are paired at; the third is the one only the link can teach.
@@ -68,8 +62,25 @@ A1_HOME=10.77.1.11
 A2_HOME=10.77.1.12
 A1_OVERLAY=100.64.99.11
 
-# shellcheck disable=SC2086 # SERVICES is a deliberate list of service names
-up $SERVICES || { finish; exit 1; }
+if [ "${NETLAB:-0}" = "1" ]; then
+  TOPOLOGY="$HERE/../topologies/moved-link.json"
+  export TOPOLOGY
+  # shellcheck source=../lib/netlab.sh
+  . "$HERE/../lib/netlab.sh"
+  NODES="node-a1-overlay node-a2"
+  # shellcheck disable=SC2086 # NODES is a deliberate list of node names
+  up $NODES || { finish; exit 1; }
+else
+  # shellcheck source=../lib/compose.sh
+  . "$HERE/../lib/compose.sh"
+
+  # The compose services this scenario needs, for the runner and for a reader.
+  SERVICES="node-a1-overlay node-a2"
+  export SERVICES
+
+  # shellcheck disable=SC2086 # SERVICES is a deliberate list of service names
+  up $SERVICES || { finish; exit 1; }
+fi
 
 pair_nodes node-a2 node-a1-overlay "$A1_HOME:$LISTEN_PORT" || { finish; exit 1; }
 pair_nodes node-a1-overlay node-a2 "$A2_HOME:$LISTEN_PORT" || { finish; exit 1; }
