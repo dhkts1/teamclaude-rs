@@ -93,6 +93,15 @@ public enum PeerPanelHeight {
         /// Share card, the section head and the count line. Reserved at every
         /// peer count, including zero, because those two switches are the tab.
         public let fixedChrome: CGFloat
+        /// One knock card, drawn whole: its name line, its address line, the
+        /// three lines its sentence wraps to, its two buttons, and the card's
+        /// own edges.
+        ///
+        /// Charged PER PENDING KNOCK rather than folded into
+        /// ``fixedChrome``, which is reserved at every count: a knock is the
+        /// one card on this tab that is usually absent and gone in ten
+        /// minutes when it is not.
+        public let knockCardHeight: CGFloat
 
         public init(
             nameLineHeight: CGFloat,
@@ -100,7 +109,8 @@ public enum PeerPanelHeight {
             meterHeight: CGFloat,
             cardChrome: CGFloat,
             cardGap: CGFloat,
-            fixedChrome: CGFloat
+            fixedChrome: CGFloat,
+            knockCardHeight: CGFloat
         ) {
             self.nameLineHeight = nameLineHeight
             self.subLineHeight = subLineHeight
@@ -108,6 +118,7 @@ public enum PeerPanelHeight {
             self.cardChrome = cardChrome
             self.cardGap = cardGap
             self.fixedChrome = fixedChrome
+            self.knockCardHeight = knockCardHeight
         }
     }
 
@@ -150,16 +161,43 @@ public enum PeerPanelHeight {
         min(PanelHeight.panelMaxHeight, listHeight(rows: rows, metrics: metrics))
     }
 
-    /// The height to give the whole Peers tab: its two switches, plus a peer
-    /// list clamped to ``PanelHeight/panelMaxHeight``.
+    /// What the pending knock cards cost: one card each, and the gap above
+    /// each one, the same `n` gaps and not `n - 1` that
+    /// ``listHeight(rows:metrics:)`` charges its rows, because each knock card
+    /// sits under either the Find card or the knock before it.
+    ///
+    /// OUTSIDE the capped list on purpose. The knock cards are drawn above
+    /// "Other Macs" and outside the scroll view (`PeersTabV4`), so charging
+    /// them to the list would reserve height inside a region that is clamped
+    /// and let the growth come out of the rows instead.
+    public static func knockHeight(pendingKnocks: Int, metrics: Metrics) -> CGFloat {
+        CGFloat(max(0, pendingKnocks)) * (metrics.knockCardHeight + metrics.cardGap)
+    }
+
+    /// The height to give the whole Peers tab: its two switches, every card a
+    /// Mac asking to connect draws, plus a peer list clamped to
+    /// ``PanelHeight/panelMaxHeight``.
     ///
     /// The clamp is the whole point of this function. Past the cap the rows
     /// scroll; the switches and the footer, which are drawn outside that
     /// region, keep every point they had at one peer. Clamping the panel's
     /// TOTAL instead (or not clamping at all) is the recorded bug
     /// `PanelHeight`'s header describes and `ffe8a86` fixed.
-    public static func peerSectionHeight(rows: [Row], metrics: Metrics) -> CGFloat {
-        metrics.fixedChrome + listViewportHeight(rows: rows, metrics: metrics)
+    ///
+    /// # Why the knocks are counted here at all
+    ///
+    /// They were charged NOWHERE. `fixedChrome` is the two switch cards, the
+    /// section head and the count line, and the list is the trusted rows, so a
+    /// panel holding a request to connect was sized as a panel holding none.
+    /// That is vertical pressure the tab cannot see, and what gives way under
+    /// it is a sentence: the knock card's own help line rendered cut mid-word
+    /// in the running panel. Making ``MuteText`` wrap without paying for the
+    /// lines it wraps to would only move the squeeze onto some other line.
+    public static func peerSectionHeight(
+        rows: [Row], pendingKnocks: Int = 0, metrics: Metrics
+    ) -> CGFloat {
+        metrics.fixedChrome + knockHeight(pendingKnocks: pendingKnocks, metrics: metrics)
+            + listViewportHeight(rows: rows, metrics: metrics)
     }
 
     /// Whether the peer list overflows its cap at this peer count, which is
@@ -177,6 +215,7 @@ public enum PeerPanelHeight {
     /// reaches this path too.
     public static func plan(
         rows: [Row],
+        pendingKnocks: Int = 0,
         header: [PanelSize.Line],
         footer: [PanelSize.Line],
         geometry: PanelSize.Geometry,
@@ -190,7 +229,8 @@ public enum PeerPanelHeight {
             width: chrome.width,
             headerHeight: chrome.headerHeight,
             footerHeight: chrome.footerHeight,
-            listHeight: peerSectionHeight(rows: rows, metrics: metrics),
+            listHeight: peerSectionHeight(
+                rows: rows, pendingKnocks: pendingKnocks, metrics: metrics),
             frameHeight: chrome.frameHeight
         )
     }

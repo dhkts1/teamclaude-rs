@@ -137,14 +137,15 @@ final class PeersPanelViewWiringTests: XCTestCase {
         // neither the name nor the address is the one a single-line control
         // truncates. Both still come from `PeerAdmission`, so the card still
         // cannot phrase the request on its own.
-        // The address line also carries the counted deadline now, so it takes
-        // the instant the snapshot was read at: a view reading its own
-        // `Date()` would make a rendered fixture count against the real clock.
+        // The deadline has moved off the address line and onto a pill of its
+        // own, so it is the PILL that takes the instant the snapshot was read
+        // at: a view reading its own `Date()` would make a rendered fixture
+        // count against the real clock and draw a different PNG every run.
         XCTAssertTrue(
-            card.contains("PeerAdmission.knockAddressLine(knock, now: snapshot.readAt)"),
+            card.contains("PeerAdmission.knockExpiryPill(knock, now: snapshot.readAt)"),
             "the knock counts against some other clock than the one its snapshot was read "
                 + "at, so a rendered scene cannot draw the same PNG twice")
-        for helper in ["knockNameLine(knock)", "knockAddressLine(knock, now:"] {
+        for helper in ["knockNameLine(knock)", "knockAddressLine(knock)"] {
             XCTAssertTrue(
                 card.contains("PeerAdmission.\(helper)"),
                 "the row writes its own title again, so the tab and the pane can phrase one "

@@ -69,10 +69,19 @@ public enum MenuBarMark {
 
     /// What VoiceOver says about the menu-bar item. It is the one surface with
     /// no room for a label, so this is the only place the state is spoken.
-    public static func accessibilityDescription(awake: Bool) -> String {
-        awake
+    ///
+    /// A Mac waiting on an answer is spoken FIRST, in
+    /// ``PeerAdmission/knockBarSentence(count:)``'s own words, because it is
+    /// the one thing here that is waiting on a person rather than reporting on
+    /// a fleet. Capacity follows it, unchanged, and at zero knocks the
+    /// sentence is byte-identical to what it has always been.
+    public static func accessibilityDescription(awake: Bool, knocks: Int = 0) -> String {
+        let capacity =
+            awake
             ? "tcr fleet capacity. \(KeepAwakeGlyph.accessibilityDescription)."
             : "tcr fleet capacity"
+        guard let asking = PeerAdmission.knockBarSentence(count: knocks) else { return capacity }
+        return "\(asking) \(capacity)"
     }
 
     /// Which colour the cup wears. Kept as data here, decided by the caller
@@ -117,7 +126,12 @@ public enum MenuBarMark {
     /// `nil` only when the cup symbol itself cannot be created — that is a
     /// missing SF Symbol, which the caller has to notice rather than paper
     /// over with an empty status item.
-    public static func image(fraction: Double?, tint: Tint) -> NSImage? {
+    /// - Parameter knocks: how many Macs are waiting on an answer, for the
+    ///   spoken description alone. The knock MARK itself is a separate glyph
+    ///   in the status item's title (`MenuBarShell.updateMark`), not part of
+    ///   this cup: it has to be drawn whether or not the counts label is on,
+    ///   and the cup is a reading of the fleet and nothing else.
+    public static func image(fraction: Double?, tint: Tint, knocks: Int = 0) -> NSImage? {
         guard
             let outline = NSImage(
                 systemSymbolName: symbolName,
@@ -147,7 +161,7 @@ public enum MenuBarMark {
         composed.isTemplate = tint == .template
         let awake: Bool
         if case .awake = tint { awake = true } else { awake = false }
-        composed.accessibilityDescription = accessibilityDescription(awake: awake)
+        composed.accessibilityDescription = accessibilityDescription(awake: awake, knocks: knocks)
         return composed
     }
 

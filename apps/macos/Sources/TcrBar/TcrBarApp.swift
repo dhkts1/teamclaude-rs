@@ -170,6 +170,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // was not polled until the panel had been opened once — the menu-bar
         // glyph sat at its `.pending` gauge until then.
         shell.poller.start()
+        // And the knocks, on the same terms and for a stronger version of the
+        // same reason: the Peers tab's own reader lives and dies with the tab,
+        // so with the panel closed, which is almost always, nothing in this
+        // app knows a Mac is asking to connect. This is what puts the mark on
+        // the bar and what the notifier reads.
+        shell.knocks.start()
         // One attempt, once per process.
         //
         // This used to need a `didAttemptLaunchStart` flag because `onAppear`

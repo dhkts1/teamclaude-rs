@@ -57,6 +57,19 @@ struct DimText: View {
 }
 
 /// `.mute` — the tertiary line: the plan line, a tool's owner, the footer.
+///
+/// ## No line limit means WRAP, never truncate
+///
+/// A `lineLimit(nil)` with no `fixedSize` truncates under vertical pressure
+/// instead of wrapping, and the panel is under vertical pressure by
+/// construction. The knock card's help line rendered `nothing is share…` in the
+/// running panel while the block beside it, which carries `fixedSize`, wrapped
+/// whole: one sentence cut and one sentence not, on one card, from this one
+/// missing modifier. `emptyCard` had the same latent defect.
+///
+/// So the modifier is applied when and ONLY when `lineLimit == nil`. A call
+/// site that asked for one line still gets one line and still ellipsises, which
+/// is what a bounded identifier on a shared row needs.
 struct MuteText: View {
     let text: String
     var lineLimit: Int? = 1
@@ -66,6 +79,7 @@ struct MuteText: View {
             .foregroundStyle(Tok.mute)
             .lineLimit(lineLimit)
             .truncationMode(.tail)
+            .fixedSize(horizontal: false, vertical: lineLimit == nil)
             .frame(minHeight: V4.lineHeight(V4.muteSize), alignment: .leading)
             .help(text)
             .accessibilityValue(text)

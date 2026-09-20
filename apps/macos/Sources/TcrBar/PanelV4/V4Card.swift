@@ -7,8 +7,27 @@ import SwiftUI
 /// Measured against the mockup: card border 1 pt at alpha .09 there, 0.5 pt at
 /// alpha .24 here — half the width at nearly three times the alpha, which reads
 /// as a drawn outline rather than the seam the sheet asks for.
+/// ## One card type, optionally tinted
+///
+/// `accent` is `nil` everywhere but the knock card, and `nil` is today's card
+/// byte for byte. A non-`nil` accent washes the card fill with it and borders
+/// in it, at ``V4/accentWashAlpha`` and ``V4/accentLineAlpha``, the pair the
+/// "what yes does" block already drew at.
+///
+/// A parameter rather than a second card type. A card that needs to look
+/// different is how two card vocabularies start, and the second one is always
+/// the one that stops matching the sheet.
 struct V4Card<Content: View>: View {
+    /// The hue this card wears, or `nil` for the plain card.
+    ///
+    /// Reserved for a card with a DEADLINE on it: the knock card, which is the
+    /// only thing on the Peers tab that will be gone in ten minutes whether or
+    /// not anybody looks. A colour spent on a card that is simply there
+    /// forever stops meaning anything on the card that is not.
+    var accent: Color?
     @ViewBuilder var content: () -> Content
+
+    private var fill: Color { accent?.opacity(V4.accentWashAlpha) ?? .clear }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -17,10 +36,19 @@ struct V4Card<Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, V4.cardInsetV)
         .padding(.horizontal, V4.cardInsetH)
-        .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.cardFill))
+        .background(
+            RoundedRectangle(cornerRadius: V4.cardRadius)
+                .fill(Tok.cardFill)
+                // The wash sits OVER the card fill rather than replacing it,
+                // which is what `color-mix(in srgb, near 7%, card)` means: the
+                // card is still the panel's card, warmed.
+                .overlay(RoundedRectangle(cornerRadius: V4.cardRadius).fill(fill))
+        )
         .overlay(
             RoundedRectangle(cornerRadius: V4.cardRadius)
-                .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth)
+                .strokeBorder(
+                    accent?.opacity(V4.accentLineAlpha) ?? Tok.cardLine,
+                    lineWidth: V4.panelBorderWidth)
         )
     }
 }

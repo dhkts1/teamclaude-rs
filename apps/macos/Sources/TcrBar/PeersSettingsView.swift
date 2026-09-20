@@ -396,8 +396,8 @@ struct PeersSettingsPane: View {
     /// because both are places an operator is looking when somebody knocks,
     /// and the words are ``PeerAdmission``'s so the two cannot phrase one
     /// request two ways.
-    /// **One line, not two.** ``PeerAdmission/knockDetail``, "Accepting shows
-    /// six digits on both screens; nothing is shared until you press Trust"
+    /// **One line, not two.** ``PeerAdmission/knockDetail``, the sentence
+    /// about what Accept buys and what is shared meanwhile,
     /// is drawn by the Peers TAB, which is where a knock is met: the tab is
     /// what opens when the panel says somebody is waiting, and this pane is
     /// where an operator arrives already knowing. Two copies of the sentence

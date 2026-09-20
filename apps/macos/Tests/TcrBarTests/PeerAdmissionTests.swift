@@ -38,9 +38,6 @@ final class PeerAdmissionTests: XCTestCase {
             addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471", proposedName: "loft-mini",
             firstSeenMs: Int64((now.timeIntervalSince1970 - 180) * 1000))
         XCTAssertEqual(PeerAdmission.knockExpiry(firstSeenMs: knock.firstSeenMs, now: now), "7m")
-        XCTAssertEqual(
-            PeerAdmission.knockAddressLine(knock, now: now), "10.0.1.24 · expires in 7m",
-            "the address line no longer counts the deadline the knock's own timestamp buys")
 
         // A knock older than the deadline, and one whose producer sent no
         // timestamp at all, both count NOTHING rather than a negative span or
@@ -49,17 +46,80 @@ final class PeerAdmissionTests: XCTestCase {
             addr: "10.0.1.24", instanceId: "8f", proposedName: "loft-mini",
             firstSeenMs: Int64((now.timeIntervalSince1970 - 3600) * 1000))
         XCTAssertNil(PeerAdmission.knockExpiry(firstSeenMs: stale.firstSeenMs, now: now))
-        XCTAssertEqual(PeerAdmission.knockAddressLine(stale, now: now), "10.0.1.24")
         XCTAssertNil(
             PeerAdmission.knockExpiry(firstSeenMs: 0, now: now),
             "a knock with no timestamp got a deadline out of the epoch")
+    }
 
-        // With no name proposed the name line IS the address, so the second
-        // line is the count alone rather than the address twice.
+    /// The address line carries the ADDRESS and nothing else.
+    ///
+    /// It used to fold the countdown in, which put one fact in two places the
+    /// moment the deadline moved onto a pill of its own: the line says where
+    /// the request came from, the pill says how long is left, and neither
+    /// says the other's half.
+    ///
+    /// Watched red: with the countdown still folded in, the first assertion
+    /// reads `10.0.1.24 · expires in 7m`.
+    func testTheAddressLineIsTheAddressAndTheMissingNameIsSaidOutLoud() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let named = PeerKnock(
+            addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471", proposedName: "loft-mini",
+            firstSeenMs: Int64((now.timeIntervalSince1970 - 180) * 1000))
+        XCTAssertEqual(PeerAdmission.knockAddressLine(named), "10.0.1.24")
+
+        // With no name proposed the name line IS the address, so this line
+        // says what is MISSING rather than printing the address twice or
+        // disappearing, which looked like a line that failed to load.
         let unnamed = PeerKnock(
             addr: "10.0.1.24", instanceId: "8f",
             firstSeenMs: Int64((now.timeIntervalSince1970 - 180) * 1000))
-        XCTAssertEqual(PeerAdmission.knockAddressLine(unnamed, now: now), "expires in 7m")
+        XCTAssertEqual(PeerAdmission.knockAddressLine(unnamed), "no name sent")
+        XCTAssertEqual(
+            PeerAdmission.knockAddressLine(
+                PeerKnock(addr: "10.0.1.24", instanceId: "aa", proposedName: "")),
+            "no name sent",
+            "an empty name is the same state as no name")
+    }
+
+    /// The pill counts the deadline, and returns NOTHING when there is
+    /// nothing honest to count.
+    ///
+    /// `nil` is the one the card must draw as no pill at all: a knock whose
+    /// sender stamped no time, and one already past its ten minutes, are not
+    /// a zero and not an invented ten minutes.
+    func testTheExpiryPillCountsOrDrawsNothing() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func knock(_ secondsAgo: Double?) -> PeerKnock {
+            PeerKnock(
+                addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471", proposedName: "loft-mini",
+                firstSeenMs: secondsAgo.map {
+                    Int64((now.timeIntervalSince1970 - $0) * 1000)
+                } ?? 0)
+        }
+        XCTAssertEqual(PeerAdmission.knockExpiryPill(knock(60), now: now), "Expires in 9m")
+        XCTAssertEqual(
+            PeerAdmission.knockExpiryPill(knock(560), now: now), "Expires in 40s",
+            "under a minute the span counts in seconds, which is PeerFormat's own rule")
+        XCTAssertNil(
+            PeerAdmission.knockExpiryPill(knock(nil), now: now),
+            "a knock whose sender stamped no time got a pill out of the epoch")
+        XCTAssertNil(
+            PeerAdmission.knockExpiryPill(knock(3600), now: now),
+            "a knock an hour past its deadline still drew a pill")
+    }
+
+    /// One sentence under the address, and it is the only place on the card
+    /// that says what Accept buys. Two sentences said "six digits" twice and
+    /// "nothing is shared until Trust" twice, on one card.
+    func testTheDetailSentenceSaysWhatAcceptBuysOnce() {
+        let detail = PeerAdmission.knockDetail
+        XCTAssertEqual(
+            detail,
+            "Accepting shows six digits on both screens. Until you press Trust on both, this "
+                + "Mac pins nothing, carries nothing and serves nothing.")
+        XCTAssertEqual(
+            detail.components(separatedBy: "six digits").count - 1, 1,
+            "the card promises six digits twice again")
     }
 
     /// Every verb on the row takes the INSTANCE ID, not the name: two knocks

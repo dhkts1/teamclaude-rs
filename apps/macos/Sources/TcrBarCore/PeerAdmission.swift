@@ -281,19 +281,38 @@ public enum PeerAdmission {
         return "\(name) wants to connect"
     }
 
-    /// The address on its own line beside ``knockNameLine``, with the
-    /// deadline counted beside it: `10.0.1.24 · expires in 7m`.
+    /// The address on its own line beside ``knockNameLine``: `10.0.1.24`, or
+    /// `no name sent` when the knock proposed none.
     ///
-    /// When no name was proposed, ``knockNameLine`` already IS the address and
-    /// this line is the count alone; with neither an expiry nor a name there
-    /// is nothing left to say and the line is `nil`.
-    public static func knockAddressLine(_ knock: PeerKnock, now: Date) -> String? {
+    /// **The deadline is no longer folded in here.** It is counted by
+    /// ``knockExpiryPill(_:now:)`` and drawn as a pill on this same row, and a
+    /// countdown printed in both places is one fact said twice, which is the
+    /// one that drifts. Nothing in this line counts any more, so it takes no
+    /// clock.
+    ///
+    /// Never `nil`. When no name was proposed ``knockNameLine`` already IS the
+    /// address, so this line says what is MISSING rather than repeating the
+    /// address or collapsing to nothing: a card whose second line vanished
+    /// looked like a card whose second line failed to load.
+    public static func knockAddressLine(_ knock: PeerKnock) -> String {
         let named = !(knock.proposedName ?? "").isEmpty
-        let expiry = knockExpiry(firstSeenMs: knock.firstSeenMs, now: now)
-            .map { "expires in \($0)" }
-        guard named else { return expiry }
-        guard let expiry else { return knock.addr }
-        return "\(knock.addr) · \(expiry)"
+        return named ? knock.addr : "no name sent"
+    }
+
+    /// `Expires in 9m` for the pill on the knock card's address row, or `nil`
+    /// when there is nothing honest to count.
+    ///
+    /// Over ``knockExpiry(firstSeenMs:now:)`` rather than beside it: that
+    /// function already decides both absences, a knock past its deadline and
+    /// one whose sender stamped no time, and `nil` here is the honest answer
+    /// for each. No pill at all, never a zero and never an invented ten
+    /// minutes. The card keeps its accent either way: it still expires, this
+    /// Mac just cannot say when.
+    public static func knockExpiryPill(_ knock: PeerKnock, now: Date) -> String? {
+        guard let remaining = knockExpiry(firstSeenMs: knock.firstSeenMs, now: now) else {
+            return nil
+        }
+        return "Expires in \(remaining)"
     }
 
     /// How long a knock stands before the Mac holding it drops the row.
@@ -320,10 +339,91 @@ public enum PeerAdmission {
         return PeerFormat.span(remaining)
     }
 
-    /// What Accept buys, under the title. Decision row 10 in one line:
+    /// What Accept buys, under the address. Decision row 10 in one sentence:
     /// approval comes first and nothing is shared until Trust.
+    ///
+    /// **One sentence, because the card used to carry two.** This line and the
+    /// block under the buttons both said "six digits" and both said "nothing
+    /// is shared until Trust", which is one promise written twice on one card;
+    /// the block is gone and what it added, that this Mac pins, carries and
+    /// serves nothing meanwhile, is the second half of this sentence. The card
+    /// ends up shorter than it was, which is what pays for a line that wraps
+    /// whole instead of being cut mid-word.
     public static let knockDetail =
-        "Accepting shows six digits on both screens; nothing is shared until you press Trust."
+        "Accepting shows six digits on both screens. Until you press Trust on both, this Mac "
+        + "pins nothing, carries nothing and serves nothing."
+
+    /// What the menu bar says about Macs waiting on an answer, in words:
+    /// `1 Mac is asking to connect. Open the Peers tab to answer it.`
+    ///
+    /// The tooltip AND the mark's accessibility description, which is the
+    /// rule colour is never the only channel: an amber glyph on somebody's
+    /// wallpaper can be promised no contrast ratio against anything, so the
+    /// mark being there at all is the signal and this sentence is what says
+    /// what it means.
+    ///
+    /// It never says WHO. A proposed name is a string a stranger's Mac chose,
+    /// the bar has no room for the address beside it, and a name with no
+    /// address is the half an operator cannot check. `nil` at zero: there is
+    /// no sentence for nobody asking, and a "0 Macs are asking" on every Mac
+    /// that has never met another one is noise.
+    public static func knockBarSentence(count: Int) -> String? {
+        guard count > 0 else { return nil }
+        if count == 1 {
+            return "1 Mac is asking to connect. Open the Peers tab to answer it."
+        }
+        return "\(count) Macs are asking to connect. Open the Peers tab to answer them."
+    }
+
+    /// A notification's title over the Macs it is about: `loft-mini wants to
+    /// connect` for one, `2 Macs want to connect` for several.
+    ///
+    /// One Mac gets ``knockNameLine(_:)``, the card's own headline, so the
+    /// banner and the card a click lands on say the same thing. Several get a
+    /// count and no names: a banner has one line for a title and a list of
+    /// proposed names is the half an operator cannot check.
+    public static func knockNoticeTitle(_ knocks: [PeerKnock]) -> String? {
+        guard let first = knocks.first else { return nil }
+        guard knocks.count > 1 else { return knockNameLine(first) }
+        return "\(knocks.count) Macs want to connect"
+    }
+
+    /// The banner's body: which addresses, how long they stand, and what is
+    /// shared meanwhile.
+    ///
+    /// **The deadline is described here and counted everywhere else**, and
+    /// that contradiction is deliberate. A banner is written once and then
+    /// sits in Notification Centre beside the arrival time macOS keeps for it,
+    /// so `expires in ten minutes` is still true an hour later while `9m`
+    /// would be a lie the moment the user looked away. The figure is
+    /// ``knockExpirySeconds``, said in words in this one place.
+    ///
+    /// Above three addresses the list becomes `<first> and 3 others`, the
+    /// shape the tab's own held-back footer already uses: a banner listing
+    /// eight addresses is a banner nobody reads.
+    public static func knockNoticeBody(_ knocks: [PeerKnock]) -> String? {
+        guard let first = knocks.first else { return nil }
+        let promise =
+            "Nothing is shared until you accept and both screens show the same six digits."
+
+        func addressPhrase(_ knock: PeerKnock) -> String {
+            let named = !(knock.proposedName ?? "").isEmpty
+            return named ? knock.addr : "No name sent"
+        }
+
+        guard knocks.count > 1 else {
+            return "\(addressPhrase(first)) · expires in ten minutes. \(promise)"
+        }
+        let addresses = knocks.map(\.addr)
+        let list: String
+        if knocks.count <= 3 {
+            list = PeerFormat.list(addresses)
+        } else {
+            let others = knocks.count - 1
+            list = "\(first.addr) and \(others) others"
+        }
+        return "\(list) · each expires in ten minutes. \(promise)"
+    }
 
     /// `12 shown, 3 more not shown`, or `nil` when nothing was held back.
     ///
@@ -465,9 +565,15 @@ extension PeerCommand {
     /// three take.
     public static func unblock(address: String) -> [String] { ["peer", "unblock", address] }
 
-    /// `tcr peer pending --json`. The tab reads the pending rows out of
+    /// `tcr peer pending --json`. The TAB reads the pending rows out of
     /// `tcr peer ls --json` instead, in ONE read: two calls would see two
     /// different instants and the footer would be able to disagree with the
-    /// rows above it. This is here for a caller that wants only the queue.
+    /// rows above it.
+    ///
+    /// ``KnockReader`` is the caller that wants only the queue, and it is the
+    /// menu bar's whole channel: it runs with the panel closed, where nothing
+    /// asks `peer ls` at all, and this verb reads the peer state file rather
+    /// than the running proxy, so a proxy that is down cannot make it answer
+    /// "nobody is asking".
     public static let pending = ["peer", "pending", "--json"]
 }

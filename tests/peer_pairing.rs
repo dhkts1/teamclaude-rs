@@ -2090,6 +2090,86 @@ fn the_approval_verbs_and_ls_json_agree_about_one_pending_row() {
     );
 }
 
+/// **Every surface that prints a proposed name masks it, `pending` included.**
+///
+/// A proposed name is text a stranger's Mac chose. It is sanitized on arrival
+/// and masked again on the way out, for the reason `masked_label` gives: this
+/// repository is public and the state file is hand-editable JSON, so a row can
+/// carry a name that never went through a listener at all.
+///
+/// `tcr peer ls --json` masked it. `tcr peer pending`, in both its text and
+/// its `--json` form, did not, which is one rule with two answers, and the
+/// surface that skipped it is the one a menu bar segment and a notification
+/// banner read. Both now go through `pending_row_for_readers`.
+///
+/// Watched red against the shipped binary: before the change `pending --json`
+/// answers `alice@example.com` on `proposedName` and this fails on the first
+/// assertion.
+#[test]
+fn every_pending_surface_masks_the_name_a_stranger_proposed() {
+    let dir = scratch("pending-mask");
+    let peers = dir.join("tcr-peers.json");
+    let state_file = dir.join("peer-state.json");
+    config::save(&peers, &PeerFile::default()).expect("write the peers file");
+
+    // A name no label rule accepts, written straight into the state file the
+    // way a hand edit can: `@` is not one of the characters
+    // `tcr_peer_wire::sanitize_label` allows.
+    let mut value = PeerState::default();
+    value
+        .record_knock(
+            "192.0.2.24",
+            instance(0xE7),
+            Some("alice@example.com".to_string()),
+            1,
+            None,
+            pair::now_ms(),
+        )
+        .expect("queued");
+    state::save(&state_file, &value).expect("write the state file");
+
+    let (out, err, ok) = run_tcr(&peers, &["pending", "--json"]);
+    assert!(ok, "`tcr peer pending --json` must exit 0: {err}");
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(
+        parsed["pending"][0]["proposedName"].as_str(),
+        Some("[masked]"),
+        "the panel, the menu bar and a notification banner all read this field: {out}"
+    );
+    assert!(
+        !out.contains("alice@example.com"),
+        "the raw name reached the surface anyway, somewhere else in the document: {out}"
+    );
+
+    // The text form is the same rule, and it is what an operator reads.
+    let (out, err, ok) = run_tcr(&peers, &["pending"]);
+    assert!(ok, "`tcr peer pending` must exit 0: {err}");
+    assert!(
+        out.contains("[masked]") && !out.contains("alice@example.com"),
+        "the two pending surfaces disagree about masking, which is how one of them \
+         quietly stops: {out}"
+    );
+
+    // And the address is still the dialable one, so masking did not cost the
+    // row the thing an answer is aimed at.
+    assert!(
+        out.contains("192.0.2.24"),
+        "the address a reader dials went missing: {out}"
+    );
+
+    // `ls --json` masked this before and had no test saying so, which is how
+    // the rule came to hold on one surface only. Both are pinned now, on the
+    // one function that decides it.
+    let (out, err, ok) = run_tcr(&peers, &["ls", "--json"]);
+    assert!(ok, "`tcr peer ls --json` must exit 0: {err}");
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(
+        parsed["pending"][0]["proposedName"].as_str(),
+        Some("[masked]"),
+        "the listing stopped masking the name a stranger proposed: {out}"
+    );
+}
+
 /// **Through the real CLI: a link whose join key is spent still sets the
 /// network key.**
 ///

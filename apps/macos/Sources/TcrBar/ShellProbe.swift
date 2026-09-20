@@ -307,6 +307,34 @@ enum ShellProbe {
         //     so the gauge is right in both while the cup stays cyan in both.
         checks.append(appearanceCheck())
 
+        // 10. `UNUserNotificationCenter.current()` TRAPS in a process with no
+        //      bundle identifier, and this binary is one: `--render-states`,
+        //      `--render-mark` and this probe all run the raw `swift build`
+        //      product. `KnockNotifier` builds the centre lazily behind a
+        //      `Bundle.main.bundleIdentifier != nil` guard, and the only way to
+        //      know the guard is what stopped it, rather than nothing ever
+        //      having asked, is to drive a read that WOULD post and then look.
+        //
+        //      Two reads: the first is adopted silently, the second carries a
+        //      Mac the first did not, which is the exact shape that posts a
+        //      banner in a bundled app. The address is documentation range.
+        let notifier = shell.knockNotifier
+        notifier?.fold([])
+        notifier?.fold([
+            PeerKnock(
+                addr: "192.0.2.24", instanceId: "8f2c1ad63b0e4471", proposedName: "loft-mini",
+                firstSeenMs: Int64(Date().timeIntervalSince1970 * 1000))
+        ])
+        let bundleId = Bundle.main.bundleIdentifier
+        let builtCentre = notifier?.builtCentre ?? true
+        checks.append(
+            Check(
+                10,
+                "a knock arriving in an unbundled run constructs no UNUserNotificationCenter",
+                passed: notifier != nil && bundleId == nil && !builtCentre,
+                detail: "notifier=\(notifier == nil ? "nil" : "built") "
+                    + "bundleIdentifier=\(bundleId ?? "nil") builtCentre=\(builtCentre)"))
+
         report(
             checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
             notes: notes)

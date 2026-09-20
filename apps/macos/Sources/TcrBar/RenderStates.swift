@@ -892,6 +892,92 @@ enum RenderStates {
                         ])),
                 false
             ),
+            // 8a. The same tab, same found Mac, with NOBODY asking. The twin
+            //     of the scene above and the only way to read what a knock
+            //     costs the panel: the two PNGs differ by one card, so the
+            //     difference in their heights is that card, measured rather
+            //     than asserted off the arithmetic that charges it.
+            (
+                "67-peers-knock-none",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ])),
+                false
+            ),
+            // 8b. Two Macs asking at once, which is where a colour can stop
+            //     meaning anything: two amber cards in a column, each with its
+            //     own address, its own deadline and its own pair of answers.
+            (
+                "68-peers-knock-two",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ],
+                        pending: [
+                            .init(
+                                addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471",
+                                proposedName: "loft-mini", wireVersion: 1,
+                                firstSeenMs: peerMsAgo(30), lastSeenMs: peerMsAgo(4)),
+                            .init(
+                                addr: "10.0.1.31", instanceId: "3b1d90c47ae25f68",
+                                proposedName: "attic-nuc", wireVersion: 1,
+                                firstSeenMs: peerMsAgo(340), lastSeenMs: peerMsAgo(8)),
+                        ])),
+                false
+            ),
+            // 8c. A knock that proposed no name at all, which is what a Mac
+            //     with `announceName` off looks like from this side: the
+            //     headline is already the address, so the line under it says
+            //     what is missing rather than saying the address twice.
+            (
+                "69-peers-knock-no-name",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ],
+                        pending: [
+                            .init(
+                                addr: "10.0.1.31", instanceId: "3b1d90c47ae25f68",
+                                wireVersion: 1, firstSeenMs: peerMsAgo(45),
+                                lastSeenMs: peerMsAgo(5))
+                        ])),
+                false
+            ),
+            // 8d. A knock whose sender stamped no first-seen time: NO pill at
+            //     all, never a zero and never an invented ten minutes. The
+            //     nil arm of the pill helper is the one a reader is most
+            //     likely to assume was filled with a number.
+            (
+                "70-peers-knock-no-expiry",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ],
+                        pending: [
+                            .init(
+                                addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471",
+                                proposedName: "loft-mini", wireVersion: 1,
+                                firstSeenMs: 0, lastSeenMs: peerMsAgo(4))
+                        ])),
+                false
+            ),
             // 9. Trust pressed, and the other operator has not answered. The
             //    row state, built through the same overlay the
             //    live controller applies, so the fixture cannot show a row

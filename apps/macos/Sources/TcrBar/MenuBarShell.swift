@@ -35,6 +35,14 @@ final class MenuBarShell {
     /// and an assertion that ended when the panel closed would be a keep-awake
     /// control that keeps nothing awake.
     let awake: AwakeController
+    /// Macs waiting on an answer, read with the panel CLOSED.
+    ///
+    /// Owned here for the reason every other controller on this object is: the
+    /// Peers tab's own `PeerController` starts on `onAppear` and stops on
+    /// `onDisappear`, so with the panel shut nothing in this app knows a knock
+    /// exists. The panel is shut almost always, which is the whole case the
+    /// menu-bar mark and the notification are for.
+    let knocks: KnockReader
     let preference: LaunchPreference
     /// "Show counts in the menu bar" — whether ``updateMark`` draws the
     /// `ready/enabled` label. Owned here for the same reason as `preference`:
@@ -86,6 +94,10 @@ final class MenuBarShell {
             groupController: groupController, updater: updater,
             onWhatsNew: { [weak self] in self?.openWhatsNew() }))
 
+    /// The banner, and the memory of what has already been said. Built after
+    /// the popover below, because it asks it whether the panel is open.
+    private(set) var knockNotifier: KnockNotifier?
+
     let statusItem: NSStatusItem
     let popover: NSPopover
 
@@ -111,7 +123,8 @@ final class MenuBarShell {
         whatsNew: WhatsNewController? = nil,
         runningToolsPreference: ShowRunningToolsPreference? = nil,
         defaultTabPreference: DefaultTabPreference? = nil,
-        panelDensityPreference: PanelDensityPreference? = nil
+        panelDensityPreference: PanelDensityPreference? = nil,
+        knocks: KnockReader? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -119,6 +132,9 @@ final class MenuBarShell {
         self.accounts = accounts ?? AccountController()
         self.control = control ?? ControlAccountController()
         self.awake = awake ?? AwakeController()
+        // Never started here: `AppDelegate` starts it beside the poller, and
+        // `--shell-probe` builds this object without ever spawning a `tcr`.
+        self.knocks = knocks ?? KnockReader()
         self.preference = preference ?? LaunchPreference()
         self.countsPreference = countsPreference ?? MenuBarCountsPreference()
         self.updater = updater ?? Updater()
@@ -168,7 +184,7 @@ final class MenuBarShell {
         statusItem.isVisible = true
         popover = NSPopover()
 
-        let hosting = NSHostingController(
+        let hosting = Self.hosting(
             rootView: FleetPanel(
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
                 accounts: self.accounts, control: self.control, awake: self.awake,
@@ -176,58 +192,10 @@ final class MenuBarShell {
                 groupController: self.groupController, removeController: self.removeController,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
+                onFindingTurnedOn: { [weak self] in
+                    self?.knockNotifier?.requestAuthorizationOnce()
+                },
                 initialTab: Self.initialTab(from: self.defaultTabPreference)))
-        // Without this the popover takes a default size and the panel is clipped.
-        //
-        // This is the specific thing `MenuBarExtra` did for free. `FleetView`
-        // measures its own row height through a `GeometryReader` preference
-        // (`FleetView.swift:44-56, 178-189`), which exists precisely because a
-        // scroll view's ideal height collapses to about one row — so a shell
-        // that does not propagate the preferred size up to the popover
-        // reproduces that exact bug, and it looks like a SwiftUI layout problem
-        // rather than a missing line here. `--shell-probe` assertion 5 checks
-        // the resulting `contentSize` numerically.
-        hosting.sizingOptions = [.preferredContentSize]
-        // The line above sizes the popover; it is also one half of a layout
-        // cycle that aborts the app. The other half is safe-area.
-        // `NSHostingView` observes its own frame through KVO, and every frame
-        // change runs `invalidateSafeAreaInsets()`, which requests another
-        // SwiftUI update, which marks the window as needing another
-        // update-constraints pass. The popover resizes itself from those
-        // constraints, the hosting view's frame changes again, and AppKit
-        // throws from `_postWindowNeedsUpdateConstraints` once the pass count
-        // passes its guard. Nothing catches that `NSException`, so `abort()`.
-        //
-        // Three crash reports from a 0.2.43 build (2026-09-09, macOS 26.6.2,
-        // all three throwing at that same frame) show the cycle with no TcrBar
-        // frame anywhere in it: it runs entirely between `_NSPopoverWindow`,
-        // `NSPopoverFrame` and `NSHostingView`, driven from `stepIdle` with no
-        // user event in the stack.
-        //
-        // `PanelHeight.settled` damps the OTHER loop, the one that runs
-        // through `onPreferenceChange`. Its predecessor `PanelHeight.quantized`
-        // shipped in that same 0.2.43 build, which is the evidence that damping
-        // that loop is not sufficient alone: preference quantization cannot
-        // reach a cycle that never reads a preference, and none of the three
-        // 0.2.43 stacks contains a TcrBar frame at all.
-        //
-        // `quantized` is no longer called from this target — `settled` owns the
-        // publish path and calls it internally, and it was made internal to
-        // `TcrBarCore` so that re-adding it at a `GeometryReader` emitter fails
-        // to compile rather than silently reverting the fix.
-        //
-        // A popover has no safe area to inset against: no notch, no title bar,
-        // no keyboard. Opting out is correct on its own terms, and it is the
-        // edge of the cycle that can be cut without giving up the preferred
-        // size that assertion 5 checks.
-        //
-        // Not reproduced locally: the machine that crashes is one point
-        // release ahead (26.6.2 vs 26.6.1) and the panel is stable here across
-        // days. This cuts a documented edge of the cycle in the crash stack;
-        // it has not been watched to fail and then pass.
-        if #available(macOS 13.3, *) {
-            hosting.safeAreaRegions = []
-        }
         popover.contentViewController = hosting
         // What restores click-outside dismissal, which a menu had by nature.
         popover.behavior = .transient
@@ -254,14 +222,20 @@ final class MenuBarShell {
         // follows the identical rule for the same reason: toggling it and
         // reading `countsPreference.showCounts` back inside this sink would
         // race the very publisher this sink exists to trust.
+        // The knock count is combined in here for the same reason the other
+        // three are: the mark is recomposed whenever ANY of them changes, and
+        // a knock arriving between two polls must move the bar without
+        // waiting for an account figure to change.
         self.poller.$state
             .combineLatest(self.awake.$isOn, self.countsPreference.$showCounts)
             .combineLatest(self.runningToolsPreference.$showRunningToolCount)
-            .sink { [weak self] combined, showRunningTools in
+            .combineLatest(self.knocks.$knocks)
+            .sink { [weak self] outer, pending in
+                let (combined, showRunningTools) = outer
                 let (state, isOn, showCounts) = combined
                 self?.updateMark(
                     state: state, awake: isOn, showCounts: showCounts,
-                    showRunningTools: showRunningTools)
+                    showRunningTools: showRunningTools, knocks: pending.count)
             }
             .store(in: &marks)
 
@@ -280,6 +254,82 @@ final class MenuBarShell {
                 self?.logPanelSize(state: state)
             }
             .store(in: &marks)
+
+        // Built here, after the popover exists, because it asks the popover
+        // whether the panel is open before it posts anything. It constructs no
+        // `UNUserNotificationCenter`: that happens on the first read that has
+        // something to say, and only in a process with a bundle identifier.
+        let notifier = KnockNotifier(
+            panelIsOpen: { [weak self] in self?.popover.isShown ?? false },
+            openPeersTab: { [weak self] in self?.openPanel(on: .peers) })
+        notifier.watch(self.knocks)
+        self.knockNotifier = notifier
+    }
+
+    /// The panel's hosting controller, configured the one way it may be.
+    ///
+    /// A factory rather than five lines inside `init`, because the panel is
+    /// built a second time when a notification asks for a particular tab:
+    /// `FleetView`'s `selectedTab` is `@State` seeded from `initialTab`, so
+    /// replacing the root view of the EXISTING controller would keep the state
+    /// it already had and open on whatever tab was last selected. Two
+    /// construction sites, one of them forgetting `sizingOptions`, is the
+    /// clipped-panel bug below, so there is one site.
+    @MainActor
+    private static func hosting(rootView: FleetPanel) -> NSHostingController<FleetPanel> {
+        let hosting = NSHostingController(rootView: rootView)
+    // Without this the popover takes a default size and the panel is clipped.
+    //
+    // This is the specific thing `MenuBarExtra` did for free. `FleetView`
+    // measures its own row height through a `GeometryReader` preference
+    // (`FleetView.swift:44-56, 178-189`), which exists precisely because a
+    // scroll view's ideal height collapses to about one row, so a shell
+    // that does not propagate the preferred size up to the popover
+    // reproduces that exact bug, and it looks like a SwiftUI layout problem
+    // rather than a missing line here. `--shell-probe` assertion 5 checks
+    // the resulting `contentSize` numerically.
+    hosting.sizingOptions = [.preferredContentSize]
+    // The line above sizes the popover; it is also one half of a layout
+    // cycle that aborts the app. The other half is safe-area.
+    // `NSHostingView` observes its own frame through KVO, and every frame
+    // change runs `invalidateSafeAreaInsets()`, which requests another
+    // SwiftUI update, which marks the window as needing another
+    // update-constraints pass. The popover resizes itself from those
+    // constraints, the hosting view's frame changes again, and AppKit
+    // throws from `_postWindowNeedsUpdateConstraints` once the pass count
+    // passes its guard. Nothing catches that `NSException`, so `abort()`.
+    //
+    // Three crash reports from a 0.2.43 build (2026-09-09, macOS 26.6.2,
+    // all three throwing at that same frame) show the cycle with no TcrBar
+    // frame anywhere in it: it runs entirely between `_NSPopoverWindow`,
+    // `NSPopoverFrame` and `NSHostingView`, driven from `stepIdle` with no
+    // user event in the stack.
+    //
+    // `PanelHeight.settled` damps the OTHER loop, the one that runs
+    // through `onPreferenceChange`. Its predecessor `PanelHeight.quantized`
+    // shipped in that same 0.2.43 build, which is the evidence that damping
+    // that loop is not sufficient alone: preference quantization cannot
+    // reach a cycle that never reads a preference, and none of the three
+    // 0.2.43 stacks contains a TcrBar frame at all.
+    //
+    // `quantized` is no longer called from this target: `settled` owns the
+    // publish path and calls it internally, and it was made internal to
+    // `TcrBarCore` so that re-adding it at a `GeometryReader` emitter fails
+    // to compile rather than silently reverting the fix.
+    //
+    // A popover has no safe area to inset against: no notch, no title bar,
+    // no keyboard. Opting out is correct on its own terms, and it is the
+    // edge of the cycle that can be cut without giving up the preferred
+    // size that assertion 5 checks.
+    //
+    // Not reproduced locally: the machine that crashes is one point
+    // release ahead (26.6.2 vs 26.6.1) and the panel is stable here across
+    // days. This cuts a documented edge of the cycle in the crash stack;
+    // it has not been watched to fail and then pass.
+    if #available(macOS 13.3, *) {
+        hosting.safeAreaRegions = []
+    }
+        return hosting
     }
 
     // MARK: - The mark
@@ -309,15 +359,62 @@ final class MenuBarShell {
     /// running"), never colour alone: the amber count on the glyph has no
     /// accessible text of its own, but this sentence already says "near their
     /// limit" in words, which is what "never colour alone" asks for.
-    static func toolTip(state: PollState, awake: Bool, showRunningTools: Bool) -> String {
+    /// A Mac waiting on an answer is PREPENDED, in its own sentence, ahead of
+    /// every capacity clause: it is the one thing on this item that is waiting
+    /// on a person, and the pointer route is where the amber glyph beside the
+    /// cup says what it means in words.
+    static func toolTip(
+        state: PollState, awake: Bool, showRunningTools: Bool, knocks: Int = 0
+    ) -> String {
         var sentence = state.tooltipSentence
         if let running = state.runningToolsCount(showRunningTools: showRunningTools) {
             let noun = running == 1 ? "tool" : "tools"
             sentence += " · \(running) \(noun) running"
         }
-        return awake
-            ? "\(sentence) · \(KeepAwakeGlyph.accessibilityDescription)"
-            : sentence
+        if awake {
+            sentence = "\(sentence) · \(KeepAwakeGlyph.accessibilityDescription)"
+        }
+        guard let asking = PeerAdmission.knockBarSentence(count: knocks) else { return sentence }
+        return "\(asking) \(sentence)"
+    }
+
+    /// The knock segment: `person.fill.questionmark` in amber, plus the count
+    /// once more than one Mac is asking.
+    ///
+    /// `nil` at zero, which is what keeps an empty title empty.
+    ///
+    /// The same text-attachment shape the running-tools glyph uses, at the
+    /// same 13 pt and the same baseline nudge, because these are the two
+    /// glyphs that sit in this one label and a second construction is how they
+    /// come to sit at two different heights. The count is NOT drawn at one:
+    /// a `1` beside a glyph that is only there when somebody is asking says
+    /// nothing the glyph did not.
+    static func knockAttributedSegment(count: Int) -> NSAttributedString? {
+        guard count > 0 else { return nil }
+        let font = NSFont.monospacedDigitSystemFont(
+            ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
+        guard
+            let glyph = NSImage(
+                systemSymbolName: "person.fill.questionmark",
+                accessibilityDescription: PeerAdmission.knockBarSentence(count: count))
+        else { return nil }
+        glyph.isTemplate = true
+        let tinted = NSImage(size: glyph.size, flipped: false) { rect in
+            Tok.nearNSColor.set()
+            glyph.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        let attachment = NSTextAttachment()
+        attachment.image = tinted
+        attachment.bounds = NSRect(x: 0, y: -2, width: 13, height: 13)
+        let result = NSMutableAttributedString(attachment: attachment)
+        guard count > 1 else { return result }
+        result.append(
+            NSAttributedString(
+                string: " \(count)",
+                attributes: [.font: font, .foregroundColor: Tok.nearNSColor]))
+        return result
     }
 
     /// `PollState.countsLabel`, rendered with tabular figures so the status
@@ -372,25 +469,50 @@ final class MenuBarShell {
         return result
     }
 
+    /// The status item's title, built in two independent halves.
+    ///
+    /// The knock segment comes FIRST and is drawn whether or not the counts
+    /// preference is on: somebody waiting on an answer is not a preference,
+    /// and the `else` branch used to write `button.title = ""` over it. What
+    /// stays empty is a title with neither half, which is the default Mac with
+    /// counts off and nobody asking.
+    ///
+    /// The order is fixed: what wants an answer, then what the fleet is doing.
+    static func markTitle(
+        state: PollState, showCounts: Bool, showRunningTools: Bool, knocks: Int
+    ) -> NSAttributedString {
+        let title = NSMutableAttributedString()
+        if let asking = Self.knockAttributedSegment(count: knocks) {
+            title.append(asking)
+        }
+        // `state.countsLabel` (`TcrBarCore/StatusPoller.swift`) is `nil` for
+        // the same cases the cup's fill already carries, pending, a failed
+        // read, an all-disabled fleet, so the guard here is purely
+        // `showCounts`; the state check already happened.
+        guard showCounts, let label = state.countsLabel else { return title }
+        if title.length > 0 {
+            title.append(NSAttributedString(string: " "))
+        }
+        title.append(
+            Self.countsAttributedTitle(
+                label, amber: state.countIsNearCapacity,
+                runningTools: state.runningToolsCount(showRunningTools: showRunningTools)))
+        return title
+    }
+
     private func updateMark(
-        state: PollState, awake isOn: Bool, showCounts: Bool, showRunningTools: Bool
+        state: PollState, awake isOn: Bool, showCounts: Bool, showRunningTools: Bool,
+        knocks: Int
     ) {
         guard let button = statusItem.button else { return }
         if let mark = MenuBarMark.image(
-            fraction: state.capacityFraction, tint: Self.cupTint(for: state, awake: isOn))
+            fraction: state.capacityFraction, tint: Self.cupTint(for: state, awake: isOn),
+            knocks: knocks)
         {
             button.image = mark
-            // `state.countsLabel` (`TcrBarCore/StatusPoller.swift`) is `nil`
-            // for the same cases the cup's fill already carries — pending, a
-            // failed read, an all-disabled fleet — so the guard below is
-            // purely `showCounts`; the state check already happened.
-            if showCounts, let label = state.countsLabel {
-                button.attributedTitle = Self.countsAttributedTitle(
-                    label, amber: state.countIsNearCapacity,
-                    runningTools: state.runningToolsCount(showRunningTools: showRunningTools))
-            } else {
-                button.title = ""
-            }
+            button.attributedTitle = Self.markTitle(
+                state: state, showCounts: showCounts, showRunningTools: showRunningTools,
+                knocks: knocks)
         } else if button.image == nil {
             // Only reachable if an SF Symbol this build names has gone missing.
             // A status item with neither image nor title is zero points wide and
@@ -398,7 +520,8 @@ final class MenuBarShell {
             // something rather than disappear.
             button.title = "tcr"
         }
-        button.toolTip = Self.toolTip(state: state, awake: isOn, showRunningTools: showRunningTools)
+        button.toolTip = Self.toolTip(
+            state: state, awake: isOn, showRunningTools: showRunningTools, knocks: knocks)
     }
 
     // MARK: - The panel's size, predicted against what it really is
@@ -571,6 +694,32 @@ final class MenuBarShell {
         PanelTab(rawValue: preference.tab) ?? .accounts
     }
 
+    /// Open the panel ON a named tab, through the same seam
+    /// ``DefaultTabPreference`` uses: `initialTab` on a freshly built panel.
+    ///
+    /// The panel's content is rebuilt, and that is the cost of this route:
+    /// `FleetView.selectedTab` is `@State`, seeded once, so a root view swapped
+    /// under the existing controller would be handed the state it already had
+    /// and open wherever the operator last was. The rebuild costs the panel's
+    /// scroll offset and any open sheet, on a click that happens when somebody
+    /// answers a banner, and it buys the one thing the banner promised: the
+    /// tab with the card on it.
+    func openPanel(on tab: PanelTab) {
+        popover.contentViewController = Self.hosting(
+            rootView: FleetPanel(
+                poller: poller, server: server, loginItem: loginItem,
+                accounts: accounts, control: control, awake: awake,
+                preference: preference, updater: updater,
+                groupController: groupController, removeController: removeController,
+                onWhatsNew: { [weak self] in self?.openWhatsNew() },
+                onSettings: { [weak self] in self?.openSettings() },
+                onFindingTurnedOn: { [weak self] in
+                    self?.knockNotifier?.requestAuthorizationOnce()
+                },
+                initialTab: tab))
+        openPanel()
+    }
+
     func openPanel() {
         guard let button = statusItem.button else { return }
         // Without activation the panel opens without key focus, and
@@ -664,6 +813,14 @@ struct FleetPanel: View {
     @ObservedObject var removeController: RemoveAccountController
     var onWhatsNew: () -> Void = {}
     var onSettings: () -> Void = {}
+    /// Run when **Find Macs on this network** is switched ON.
+    ///
+    /// The one moment a knock becomes possible at all, and therefore the
+    /// moment notification permission is asked for. Injected rather than
+    /// reached for: the panel has no way to the shell's notifier, and a view
+    /// that could ask for a system permission on its own is a view that can
+    /// ask at any moment.
+    var onFindingTurnedOn: () -> Void = {}
     var initialTab: PanelTab = .accounts
 
     var body: some View {
@@ -680,6 +837,7 @@ struct FleetPanel: View {
             startServerAtLaunch: $preference.startServerAtLaunch,
             onWhatsNew: onWhatsNew,
             onSettings: onSettings,
+            onFindingTurnedOn: onFindingTurnedOn,
             initialTab: initialTab
         )
     }

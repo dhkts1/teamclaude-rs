@@ -52,6 +52,11 @@ struct FleetView: View {
     /// Opens the Settings window (gear button, `⌘,`). Same closure shape as
     /// ``onWhatsNew``, and for the same reason: the render harness passes `{}`.
     var onSettings: () -> Void = {}
+    /// Run when **Find Macs on this network** is switched ON, which is where
+    /// notification permission is asked for. Same closure shape and same
+    /// reason as the two above: the render harness passes `{}`, so a rendered
+    /// fixture can never put a system permission prompt on screen.
+    var onFindingTurnedOn: () -> Void = {}
 
     /// The panel's ONE peer reader, shared by the Peers tab and by the
     /// accounts tab's "Lent to …" lines.
@@ -230,6 +235,7 @@ struct FleetView: View {
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
         onSettings: @escaping () -> Void = {},
+        onFindingTurnedOn: @escaping () -> Void = {},
         initialTab: PanelTab = .accounts,
         // Found in review (2026-09-12): `snapshotMode` never reads
         // real session files (comment above, `body`'s `.onAppear`), so every
@@ -278,6 +284,7 @@ struct FleetView: View {
         self.snapshotMode = snapshotMode
         self.onWhatsNew = onWhatsNew
         self.onSettings = onSettings
+        self.onFindingTurnedOn = onFindingTurnedOn
         self._selectedTab = State(initialValue: initialTab)
         self._sessionFiles = State(initialValue: initialSessionFiles)
         self._machine = State(initialValue: initialMachineStats)
@@ -635,7 +642,8 @@ struct FleetView: View {
                     // The same act the menu bar item runs, off the same
                     // `Updater` the header's own "Update…" button uses, so the
                     // card cannot start a second kind of update check.
-                    onCheckForUpdates: { updater.checkForUpdates() })
+                    onCheckForUpdates: { updater.checkForUpdates() },
+                    onFindingTurnedOn: onFindingTurnedOn)
             }
         default:
             // Every not-a-fleet state keeps the banner it already had: those
@@ -1180,7 +1188,8 @@ struct FleetView: View {
             case .peers:
                 PeersView(
                     snapshotMode: snapshotMode, onOpenSettings: onSettings,
-                    onCheckForUpdates: { updater.checkForUpdates() })
+                    onCheckForUpdates: { updater.checkForUpdates() },
+                    onFindingTurnedOn: onFindingTurnedOn)
             }
         }
     }
@@ -3575,17 +3584,24 @@ struct PeersView: View {
     /// `MenuBarShell` owns the `Updater`, `FleetView` is handed it, and this is
     /// the one hop that was missing between the two.
     private let onCheckForUpdates: (() -> Void)?
+    /// Run when the Find switch goes ON. Passed down rather than reached for,
+    /// the same hop `onCheckForUpdates` documents above it: the tab has no way
+    /// to the shell that owns the notifier, and `{}` is what the render
+    /// harness passes.
+    private let onFindingTurnedOn: () -> Void
 
     init(
         controller: PeerController? = nil,
         snapshotMode: Bool = false,
         onOpenSettings: @escaping () -> Void = {},
-        onCheckForUpdates: (() -> Void)? = nil
+        onCheckForUpdates: (() -> Void)? = nil,
+        onFindingTurnedOn: @escaping () -> Void = {}
     ) {
         _controller = StateObject(wrappedValue: controller ?? PeerController())
         self.snapshotMode = snapshotMode
         self.onOpenSettings = onOpenSettings
         self.onCheckForUpdates = onCheckForUpdates
+        self.onFindingTurnedOn = onFindingTurnedOn
     }
 
     var body: some View {
@@ -3593,7 +3609,8 @@ struct PeersView: View {
             controller: controller,
             snapshotMode: snapshotMode,
             onOpenSettings: onOpenSettings,
-            onCheckForUpdates: onCheckForUpdates)
+            onCheckForUpdates: onCheckForUpdates,
+            onFindingTurnedOn: onFindingTurnedOn)
     }
 }
 
