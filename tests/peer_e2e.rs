@@ -45,15 +45,17 @@
 //!    whose address nobody can dial. This test writes a fixed loopback port for
 //!    that reason, which is worth knowing before an operator is told to use
 //!    `:0`.
-//! 3. The peer-lease fallback is installed at boot only
-//!    (`server.rs:1182`), so a Mac that pairs while its proxy is up cannot
-//!    borrow until it restarts. Step 8 restarts the borrower for that reason
-//!    and asserts the install line, so the restart is visible rather than
-//!    folded into a passing test.
+//! 3. Closed: the peer-lease fallback used to install at boot only, so a Mac
+//!    that paired while its proxy was up could not borrow until it restarted.
+//!    `fallback::install_late_if_the_file_now_allows_it` now re-asks the same
+//!    question the next time the dry-fleet arm needs an answer, so step 7
+//!    below runs no restart at all: it grants `disclose` on a live process and
+//!    the very next request is served through the provider that install call
+//!    put there.
 //! 4. `listener::serve_control` (`src/peer/listener.rs:1486`) answers `Hello`
 //!    and `Ping` and refuses everything else, so a real `Control::LeaseRequest`
 //!    (the first frame of every borrow), is refused by the lender with no log
-//!    line of its own. Step 8 asserts the served 200 directly (the diagnostic
+//!    line of its own. Step 7 asserts the served 200 directly (the diagnostic
 //!    probe this file used to gate behind `TCR_E2E_EXPECT_LEASE_ARM=1` is now
 //!    the assertion, unconditional): until LEASE-WIRE's arm lands in this
 //!    tree, this test is RED there, and the failure names the line above.
@@ -1361,17 +1363,17 @@ fn wait_for_file(path: &Path, needle: &str, mac: &Mac) -> String {
 /// (`Manager::lendable_fraction` answers `0.0` on an unmeasured window and
 /// `Ledger::grant` reads the last note).
 ///
-/// Step 8 asserts the served 200 through the lease arm (gap 4 in this file's
+/// Step 7 asserts the served 200 through the lease arm (gap 4 in this file's
 /// docs, `listener::serve_control`, `src/peer/listener.rs:1486`), with the
-/// chain in front of it proven too: the provider installed, the borrower
-/// dialled the lender, the lender's Noise handshake completed. Until
-/// LEASE-WIRE lands that arm in this tree, this test is RED at step 8, with
-/// the borrower's dry-fleet ladder exhausted at 429 in the failure message
-/// instead of served.
+/// chain in front of it proven too: the provider installed itself for this
+/// dry fleet with no restart, the borrower dialled the lender, the lender's
+/// Noise handshake completed. Until LEASE-WIRE lands that arm in this tree,
+/// this test is RED at step 7, with the borrower's dry-fleet ladder exhausted
+/// at 429 in the failure message instead of served.
 ///
 /// Watched red: `tests/tools/e2e/watch-peer-e2e-fail.sh` deletes the
 /// `install_peer_lease_provider` block from `src/server.rs` and this fails at
-/// step 8 with no `peer-lease fallback` line at all.
+/// step 7 with no `peer-lease fallback` line at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_credential() {
     let (upstream, seen) = spawn_upstream().await;
@@ -1485,19 +1487,7 @@ async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_c
 
     step(
         7,
-        "the borrower restarts, because the peer-lease provider is installed at boot only",
-    );
-    borrower.shutdown();
-    borrower.boot();
-    let installed = borrower.wait_for_log("peer-lease fallback");
-    assert!(
-        installed.contains("outcome=Yes"),
-        "the borrower's boot must install a provider now that it has a lender: {installed}"
-    );
-
-    step(
-        8,
-        "a request on the borrower's proxy, served through the lease",
+        "a request on the borrower's proxy, served through the lease the provider installs itself for",
     );
     let mut last = (0_u16, String::new());
     for attempt in 1..=BORROW_SERVED_ATTEMPTS {
@@ -1534,7 +1524,7 @@ async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_c
         "a served borrow must have reached the fake upstream a second time"
     );
 
-    step(9, "the borrower's own credential never left the borrower");
+    step(8, "the borrower's own credential never left the borrower");
     let credentials = seen.credentials();
     assert!(
         !credentials
@@ -1550,7 +1540,7 @@ async fn a_borrowed_request_reaches_the_lender_and_never_carries_the_borrowers_c
         "every request the upstream saw must be on the lender's own token: {credentials:?}"
     );
 
-    step(10, "forget, and the next request is today's 429");
+    step(9, "forget, and the next request is today's 429");
     let forgotten = lender.peer_ok(&["forget", &borrower_node]);
     assert!(
         forgotten.contains("peer forget: ok"),
@@ -2199,12 +2189,6 @@ async fn measure_latency_local_vs_borrowed() {
         "2",
     ]);
     borrower.peer_ok(&["allow", &lender_node, "disclose", "on"]);
-
-    // The lease provider installs at boot only (server.rs:1182), same
-    // precondition as step 7 of the correctness test above.
-    borrower.shutdown();
-    borrower.boot();
-    borrower.wait_for_log("peer-lease fallback");
 
     println!("STEP: {SAMPLES} requests served locally on the lender");
     let mut local_ms = Vec::with_capacity(SAMPLES as usize);
@@ -2861,18 +2845,6 @@ async fn a_forwarded_borrow_reaches_the_lender_through_a_third_mac() {
 
     step(
         6,
-        "borrower restarts, so the peer-lease fallback is installed for this boot",
-    );
-    borrower.shutdown();
-    borrower.boot();
-    let installed = borrower.wait_for_log("peer-lease fallback");
-    assert!(
-        installed.contains("outcome=Yes"),
-        "the borrower's boot must install a fallback now that it has a lender: {installed}"
-    );
-
-    step(
-        7,
         "the lender's addresses go stale in the borrower's file: its row keeps the pinned \
          key, the lease and the grant, and nothing to dial",
     );
@@ -2884,9 +2856,10 @@ async fn a_forwarded_borrow_reaches_the_lender_through_a_third_mac() {
     );
 
     step(
-        8,
-        "the borrower's request is served anyway, on the LENDER's own credential, and the \
-         carrier's log says it carried the stream",
+        7,
+        "the borrower's request is served anyway, through the fallback provider it installs \
+         itself for on this dry fleet, on the LENDER's own credential, and the carrier's log \
+         says it carried the stream",
     );
     let before = seen.requests();
     let mut result = (0_u16, String::new());
@@ -3109,18 +3082,6 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
 
     step(
         6,
-        "borrower restarts, so the peer-lease fallback is installed",
-    );
-    borrower.shutdown();
-    borrower.boot();
-    let installed = borrower.wait_for_log("peer-lease fallback");
-    assert!(
-        installed.contains("outcome=Yes"),
-        "boot must install the fallback: {installed}"
-    );
-
-    step(
-        7,
         "the lender's row on borrower is rewritten to an IPv6-only endpoint no route on this \
          box can reach: no global IPv6, and this address is loopback-only IPv6, so the direct \
          attempt fails fast rather than timing out",
@@ -3139,8 +3100,9 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
     );
 
     step(
-        8,
-        "the borrow is served anyway, through the carrier, on the lender's credential",
+        7,
+        "the borrow is served anyway, through the carrier, on the lender's credential and \
+         the fallback provider the dry fleet installs for itself",
     );
     let before = seen.requests();
     let mut result = (0_u16, String::new());
@@ -3260,17 +3222,8 @@ async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
         "the hello round trip must confirm: {hello}"
     );
 
-    step(6, "borrower restarts, installing the fallback");
-    borrower.shutdown();
-    borrower.boot();
-    let installed = borrower.wait_for_log("peer-lease fallback");
-    assert!(
-        installed.contains("outcome=Yes"),
-        "boot must install the fallback: {installed}"
-    );
-
     step(
-        7,
+        6,
         "the lender's addresses go stale on borrower's row: every borrow must go via carrier",
     );
     strip_endpoints(&borrower, &lender_at_borrower);
@@ -3280,7 +3233,7 @@ async fn forwarder_killed_mid_borrow_releases_the_client_promptly() {
     );
 
     step(
-        8,
+        7,
         "start one borrow against the slow upstream, then kill carrier while it is in flight",
     );
     let start = Instant::now();
@@ -3587,7 +3540,7 @@ async fn a_captive_portal_reports_no_network_and_pins_nothing() {
 /// `tests/peer_forward.rs::a_forward_rides_the_carrier_an_undialable_target_parked`.
 ///
 /// Watched red by removing the `StreamKind::Park` arm from
-/// `listener::serve_stream`: the carrier never holds a socket, step 8's wait
+/// `listener::serve_stream`: the carrier never holds a socket, step 7's wait
 /// for the desk's own line times out, and the borrow goes back to ending
 /// unserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -3642,18 +3595,6 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
 
     step(
         6,
-        "borrower restarts, so the peer-lease fallback is installed for this boot",
-    );
-    borrower.shutdown();
-    borrower.boot();
-    let installed = borrower.wait_for_log("peer-lease fallback");
-    assert!(
-        installed.contains("outcome=Yes"),
-        "the borrower's boot must install a fallback now that it has a lender: {installed}"
-    );
-
-    step(
-        7,
         "the lender becomes undialable: its addresses go from BOTH files, so neither the \
          borrower nor the carrier holds a socket address for it",
     );
@@ -3666,7 +3607,7 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
     );
 
     step(
-        8,
+        7,
         "the lender restarts with no address anywhere, so its boot asks the carrier to hold \
          a socket for it",
     );
@@ -3683,7 +3624,7 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
     );
 
     step(
-        9,
+        8,
         "warm the restarted lender again, so it has a MEASURED window to lend from",
     );
     // A restart takes the fleet's utilization with it: `Ledger::may_relay`
@@ -3694,8 +3635,9 @@ async fn an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs(
     assert_eq!(rewarm, 200, "the restarted lender serves its own request");
 
     step(
-        10,
-        "the borrow is SERVED, over the socket the lender parked, inside the borrow timeout",
+        9,
+        "the borrow is SERVED, over the socket the lender parked, and through the fallback \
+         provider the borrower's dry fleet installs for itself, inside the borrow timeout",
     );
     let started = std::time::Instant::now();
     let (status, _body) = post_messages(&borrower.proxy).await;
