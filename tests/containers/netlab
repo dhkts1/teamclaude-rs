@@ -1,0 +1,284 @@
+#!/bin/sh
+# netlab: build a lab of Linux network namespaces inside ONE container.
+#
+# Every "Mac" is a namespace holding one veth, one address and one `tcr`; every
+# LAN is a bridge in the container's own namespace. Nothing here touches the
+# Docker daemon's networking, so two labs on one daemon cannot collide on a
+# subnet, and no veth reaches the host bridge.
+#
+# Verbs:
+#   netlab up <topology.json>      build every lan and host, start every role
+#   netlab add <name> <lan> <ip>   attach one more node to a running lab
+#   netlab ps                      one row per node: address, pid, listener
+#   netlab down                    tear the whole tree down
+#   netlab nx <name> <cmd...>      run a command in one node's namespace
+set -eu
+
+LAB=/lab
+SRC="${NETLAB_SRC:-/lab-src}"
+UPSTREAM_URL="${NETLAB_UPSTREAM:-http://10.77.1.30:8080}"
+mkdir -p "$LAB"
+
+# Milliseconds since this container booted. NOT `date +%s%3N`: busybox date
+# does not take %N and prints the literal, which reads back as a plausible
+# zero through shell arithmetic. Every timing in the sketch was wrong once for
+# exactly that reason.
+now_ms() { awk '{printf "%d\n", $1 * 1000}' /proc/uptime; }
+
+# --- one host -------------------------------------------------------------
+
+# veth names are capped at 15 characters and a node name is not, so the wire is
+# numbered and the name lives in the namespace. The counter is a file because
+# `netlab add` runs in a later process than `netlab up`.
+next_wire() {
+  n=0
+  [ -f "$LAB/.wire" ] && n="$(cat "$LAB/.wire")"
+  n=$((n + 1))
+  echo "$n" > "$LAB/.wire"
+  echo "$n"
+}
+
+make_lan() {
+  bridge="$1"
+  ip link add "$bridge" type bridge 2>/dev/null || true
+  ip link set "$bridge" up
+  # A bridge snoops IGMP by default and has no querier, so multicast to a port
+  # that has not spoken recently can be dropped. mDNS is the whole of discovery
+  # here, so snooping is turned off where sysfs is writable, and the lab says
+  # so when it is not: a `-w` test is not the check, because busybox answers it
+  # off the permission bits and the refusal comes from the mount.
+  if { echo 0 > "/sys/class/net/$bridge/bridge/multicast_snooping"; } 2>/dev/null; then
+    echo "netlab: $bridge: igmp snooping off"
+  else
+    echo "netlab: $bridge: sysfs is read-only, igmp snooping left on"
+  fi
+}
+
+attach_host() {
+  # $1 name, $2 bridge, $3 ip, $4 prefix, $5 gw or -
+  name="$1"; bridge="$2"; addr="$3"; prefix="$4"; gw="$5"
+  w="$(next_wire)"
+  ip netns add "$name"
+  ip link add "h$w" type veth peer name "p$w"
+  ip link set "p$w" master "$bridge" up
+  ip link set "h$w" netns "$name"
+  ip -n "$name" link set lo up
+  ip -n "$name" link set "h$w" name eth0
+  ip -n "$name" addr add "$addr/$prefix" dev eth0
+  ip -n "$name" link set eth0 up
+  if [ "$gw" != "-" ]; then
+    ip -n "$name" route add default via "$gw"
+  fi
+  mkdir -p "$LAB/$name/.config" "$LAB/$name/.cache"
+  echo "$addr" > "$LAB/$name/addr"
+  echo 1 > "$LAB/$name/.ifcount"
+}
+
+# A second (or third) interface into a namespace `attach_host` already made.
+# Numbered eth1, eth2, ... because eth0 is the primary attach_host gave it.
+attach_extra() {
+  # $1 name, $2 bridge, $3 ip, $4 prefix
+  name="$1"; bridge="$2"; addr="$3"; prefix="$4"
+  w="$(next_wire)"
+  idx="$(cat "$LAB/$name/.ifcount" 2>/dev/null || echo 1)"
+  idx=$((idx + 1))
+  echo "$idx" > "$LAB/$name/.ifcount"
+  ip link add "h$w" type veth peer name "p$w"
+  ip link set "p$w" master "$bridge" up
+  ip link set "h$w" netns "$name"
+  ip -n "$name" link set "h$w" name "eth$idx"
+  ip -n "$name" addr add "$addr/$prefix" dev "eth$idx"
+  ip -n "$name" link set "eth$idx" up
+}
+
+# The node recipe, lifted from tests/containers/node-entrypoint.sh: the same
+# fake config, the same 0600 peers file, the same pre-boot `find on`.
+start_node() {
+  # $1 name, $2 listen port, $3 proxy port, $4 find, $5 announce
+  name="$1"; listen="$2"; proxy="$3"; find="$4"; announce="$5"
+  home="$LAB/$name"
+  config="$home/.config/teamclaude.json"
+  peers="$home/.config/tcr-peers.json"
+  cat > "$config" <<JSON
+{
+  "proxy": { "port": $proxy },
+  "upstream": "$UPSTREAM_URL",
+  "quotaProbeSeconds": 0,
+  "warmupSeconds": 0,
+  "accounts": [
+    {
+      "name": "$name-fake",
+      "accessToken": "at-fake-$name",
+      "accountUuid": "11111111-1111-1111-1111-111111111111",
+      "orgUuid": "22222222-2222-2222-2222-222222222222"
+    }
+  ]
+}
+JSON
+  # The three fields `tcr peer name` and `tcr peer find on` write, written
+  # here instead of shelled out for.
+  #
+  # Measured: `tcr peer find on` costs 1530ms of a node's 1660ms, because it
+  # writes the flag and then scans once
+  # (`find_on_writes_the_flag_and_scans_once`, src/main.rs:4576). A lab that
+  # runs it fifty times pays 77s for fifty one-shot browses whose rows are
+  # discarded. The flag is what the beacon reads, and the beacon is the
+  # server's, so writing the field has the same effect and none of the wait.
+  case "$find" in
+    on) discovery=true ;;
+    *) discovery=false ;;
+  esac
+  case "$announce" in
+    on) announce_name=true ;;
+    *) announce_name=false ;;
+  esac
+  printf '{"listen":"0.0.0.0:%s","discovery":%s,"name":"%s","announceName":%s,"peers":[]}\n' \
+    "$listen" "$discovery" "$name" "$announce_name" > "$peers"
+  chmod 600 "$peers"
+  ip netns exec "$name" env HOME="$home" XDG_CACHE_HOME="$home/.cache" NO_COLOR=1 \
+    TCR_CLAUDE_CODE_CREDENTIALS="$home/no-such-credentials.json" \
+    tcr --headless --port "$proxy" --no-replace >>"$home/boot.log" 2>&1 &
+  echo "$!" > "$home/pid"
+}
+
+start_upstream() {
+  name="$1"; port="$2"
+  home="$LAB/$name"
+  ip netns exec "$name" python3 "$SRC/upstream-stub.py" "$port" >>"$home/boot.log" 2>&1 &
+  echo "$!" > "$home/pid"
+}
+
+wait_listener() {
+  # $1 name, $2 seconds
+  name="$1"; seconds="${2:-60}"
+  i=0
+  while [ "$i" -lt "$((seconds * 10))" ]; do
+    if grep -q "peer listener up" "$LAB/$name/boot.log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# --- verbs ----------------------------------------------------------------
+
+cmd_up() {
+  topo="$1"
+  t0="$(now_ms)"
+  python3 "$SRC/netlab-plan.py" "$topo" > "$LAB/.plan"
+
+  while read -r kind a b c d e f g h; do
+    case "$kind" in
+      lan) make_lan "$b" ;;
+    esac
+  done < "$LAB/.plan"
+
+  # shellcheck disable=SC2094 # the awk below only reads .plan; the loop
+  # itself never writes it
+  while read -r kind a b c d e f g h; do
+    case "$kind" in
+      host)
+        # a=name b=lan c=ip d=prefix e=gw f=role g=listen h=proxy
+        bridge="$(awk -v want="$b" '$1=="lan" && $2==want {print $3}' "$LAB/.plan")"
+        attach_host "$a" "$bridge" "$c" "$d" "$e"
+        echo "$f $g $h" > "$LAB/$a/role"
+        ;;
+    esac
+  done < "$LAB/.plan"
+
+  # shellcheck disable=SC2094 # same: read-only awk inside a read-only loop
+  while read -r kind a b c d _ _ _ _; do
+    case "$kind" in
+      extra)
+        bridge="$(awk -v want="$b" '$1=="lan" && $2==want {print $3}' "$LAB/.plan")"
+        attach_extra "$a" "$bridge" "$c" "$d"
+        ;;
+    esac
+  done < "$LAB/.plan"
+
+  t1="$(now_ms)"
+  echo "netlab: wired $(grep -c '^host ' "$LAB/.plan") hosts in $((t1 - t0))ms"
+
+  # The find/announce columns are read a second time here, past the eight
+  # positional fields `read` splits into.
+  grep '^host ' "$LAB/.plan" | while read -r _ name _ _ _ _ role listen proxy find announce; do
+    case "$role" in
+      node) start_node "$name" "$listen" "$proxy" "$find" "$announce" ;;
+      upstream) start_upstream "$name" "$listen" ;;
+      observer) : ;;
+    esac
+  done
+  t2="$(now_ms)"
+  echo "netlab: started every role in $((t2 - t1))ms"
+
+  awk '$1=="host" && $7=="node" {print $2}' "$LAB/.plan" | while read -r name; do
+    if ! wait_listener "$name" 90; then
+      echo "netlab: FAIL: $name never printed 'peer listener up'"
+      tail -5 "$LAB/$name/boot.log" 2>/dev/null || true
+      exit 1
+    fi
+  done || return 1
+  t3="$(now_ms)"
+  echo "netlab: every listener up in $((t3 - t2))ms (total $((t3 - t0))ms)"
+}
+
+cmd_add() {
+  name="$1"; lan="$2"; addr="$3"
+  bridge="$(awk -v want="$lan" '$1=="lan" && $2==want {print $3}' "$LAB/.plan")"
+  t0="$(now_ms)"
+  attach_host "$name" "$bridge" "$addr" 24 -
+  echo "node 7755 8088" > "$LAB/$name/role"
+  start_node "$name" 7755 8088 on on
+  wait_listener "$name" 90 || { echo "netlab: FAIL: $name never came up"; return 1; }
+  t1="$(now_ms)"
+  echo "netlab: added $name at $addr in $((t1 - t0))ms"
+}
+
+cmd_ps() {
+  printf '%-12s %-16s %-8s %s\n' NODE ADDRESS PID LISTENER
+  for dir in "$LAB"/*/; do
+    name="$(basename "$dir")"
+    [ -f "$dir/role" ] || continue
+    pid="$(cat "$dir/pid" 2>/dev/null || echo -)"
+    line="$(grep -o 'node=tcr-[A-Z0-9]*' "$dir/boot.log" 2>/dev/null | tail -1 || true)"
+    printf '%-12s %-16s %-8s %s\n' "$name" "$(cat "$dir/addr")" "$pid" "${line:--}"
+  done
+}
+
+cmd_down() {
+  t0="$(now_ms)"
+  for dir in "$LAB"/*/; do
+    [ -f "$dir/pid" ] || continue
+    kill "$(cat "$dir/pid")" 2>/dev/null || true
+  done
+  for name in $(ip netns list 2>/dev/null | awk '{print $1}'); do
+    ip netns delete "$name" 2>/dev/null || true
+  done
+  awk '$1=="lan" {print $3}' "$LAB/.plan" 2>/dev/null | while read -r bridge; do
+    ip link delete "$bridge" 2>/dev/null || true
+  done
+  rm -rf "${LAB:?}"/*/ "$LAB/.plan" "$LAB/.wire"
+  t1="$(now_ms)"
+  echo "netlab: down in $((t1 - t0))ms"
+}
+
+cmd_nx() {
+  name="$1"
+  shift
+  home="$LAB/$name"
+  exec ip netns exec "$name" env HOME="$home" XDG_CACHE_HOME="$home/.cache" NO_COLOR=1 \
+    TCR_CLAUDE_CODE_CREDENTIALS="$home/no-such-credentials.json" "$@"
+}
+
+verb="${1:-}"
+shift || true
+case "$verb" in
+  up) cmd_up "$@" ;;
+  add) cmd_add "$@" ;;
+  ps) cmd_ps ;;
+  down) cmd_down ;;
+  nx) cmd_nx "$@" ;;
+  *) echo "netlab: no verb named ${verb:-<none>} (up, add, ps, down, nx)" >&2; exit 2 ;;
+esac
