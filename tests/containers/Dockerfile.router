@@ -7,7 +7,14 @@
 # nothing here listens on 5351 unless a scenario starts miniupnpd, and even then
 # miniupnpd runs with `enable_natpmp=no`: UPnP only, which is the shape the
 # fallback has to find.
+# miniupnpd links against libip4tc, the legacy library that talks to the
+# `ip_tables` kernel module directly; the plain `iptables` package here is
+# built against libnftnl and manages nftables over netlink instead, a
+# separate kernel subsystem with no shared state. A chain this image's own
+# `iptables` creates is therefore invisible to miniupnpd ("chain MINIUPNPD
+# not found" on every AddPortMapping); `iptables-legacy` is the CLI that
+# writes to the same backend miniupnpd reads from.
 FROM alpine:3.20
-RUN apk add --no-cache iptables iproute2 miniupnpd
+RUN apk add --no-cache iptables iptables-legacy iproute2 miniupnpd
 COPY tests/containers/router-entrypoint.sh /usr/local/bin/router-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/router-entrypoint.sh"]

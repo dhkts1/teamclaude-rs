@@ -5,7 +5,10 @@
 # Cast: node-a1-overlay and node-b1-overlay, each on its home network AND on
 # `overlay`, plus router-a and router-b with no mapping asked of either. The
 # overlay stands in for a mesh VPN's reachability and nothing else: no
-# WireGuard, no key exchange, no MagicDNS, no ACLs.
+# WireGuard, no key exchange, no MagicDNS, no ACLs. It models a tailnet, not
+# a second LAN: its subnet sits inside 100.64.0.0/10 and each overlay node's
+# entrypoint renames the interface holding that address to `utun0`, because
+# `pair::is_tailnet` only ranks an address first when both of those are true.
 #
 # Steps
 #   1. up both routers, then both overlay nodes
@@ -13,7 +16,7 @@
 #   3. on node-b1-overlay: tcr peer join --stdin (the key, on stdin, never argv)
 #
 # Assertions
-#   - the key's FIRST address is the overlay one (10.99.0.11:7755), ranked
+#   - the key's FIRST address is the overlay one (100.64.99.11:7755), ranked
 #     ahead of the LAN address, because that is the one a friend elsewhere
 #     can dial
 #   - node-b1-overlay's join answers ok
@@ -21,10 +24,11 @@
 #     six-digit compare and no second command
 #   - the joiner's row for node-a1 carries the overlay address
 #
-# `pair::dial_addresses` ranks what it finds; there is no "overlay" kind,
-# both the home-a and overlay interfaces read as `lan`, and which one
-# `if-addrs` walks to first is the fact this scenario measures. If it is not
-# the overlay one, this is the scenario that says so.
+# `pair::dial_addresses` ranks a tailnet address ahead of a LAN one by
+# `pair::is_tailnet`, not by which interface `if-addrs` happens to walk to
+# first. This scenario measures whether that ranking holds for real; if the
+# harness's overlay address does not come first, this is the scenario that
+# says so.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -39,7 +43,7 @@ export SCENARIO
 SERVICES="node-a1-overlay node-b1-overlay router-a router-b"
 export SERVICES
 
-A1_OVERLAY="10.99.0.11:$LISTEN_PORT"
+A1_OVERLAY="100.64.99.11:$LISTEN_PORT"
 
 # The routers first: home-a and home-b are `internal: true`, so each node's
 # route to anything off its own home network goes through its router, and

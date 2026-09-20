@@ -40,6 +40,22 @@ if [ -n "${DEFAULT_VIA:-}" ]; then
   echo "node: default route via $DEFAULT_VIA"
 fi
 
+# The overlay network, when this node is on one, models a tailnet: an
+# address in 100.64.0.0/10 held by an interface named `utun*`, because
+# `pair::is_tailnet` (src/peer/pair.rs) ranks an address first only when
+# both of those are true. Docker attaches it as an ordinary bridge
+# interface (commonly `eth1`), so rename it here, under the NET_ADMIN
+# capability every node in the cast already has.
+overlay_if="$(ip -o -4 addr show | awk '{split($4, a, "."); if (a[1] == "100" && a[2] + 0 >= 64 && a[2] + 0 <= 127) { print $2; exit } }')"
+if [ -n "$overlay_if" ] && [ "$overlay_if" != "utun0" ]; then
+  overlay_cidr="$(ip -o -4 addr show dev "$overlay_if" | awk '{print $4}')"
+  ip link set "$overlay_if" down
+  ip link set "$overlay_if" name utun0
+  ip link set utun0 up
+  ip -o -4 addr show dev utun0 | grep -q "$overlay_cidr" || ip addr add "$overlay_cidr" dev utun0
+  echo "node: renamed overlay interface $overlay_if -> utun0 ($overlay_cidr)"
+fi
+
 cat > "$CONFIG" <<JSON
 {
   "proxy": { "port": ${PROXY_PORT} },

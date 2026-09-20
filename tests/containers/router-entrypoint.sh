@@ -74,6 +74,33 @@ enable_upnp=yes
 secure_mode=yes
 system_uptime=yes
 CONF
+
+  # miniupnpd does not create its own chains; it errors "chain MINIUPNPD not
+  # found" on the first AddPortMapping if they are missing. This is what its
+  # own miniupnpd/netfilter/iptables_init.sh (miniupnpd_2_3_3 tag) sets up
+  # for the same three chains and jumps:
+  #   iptables -t nat -N $CHAIN
+  #   iptables -t nat -A PREROUTING -i $EXTIF -j $CHAIN
+  #   iptables -t filter -N MINIUPNPD
+  #   iptables -t filter -A FORWARD -i $EXTIF ! -o $EXTIF -j $CHAIN
+  #   iptables -t nat -N $CHAIN-POSTROUTING
+  #   iptables -t nat -A POSTROUTING -o $EXTIF -j $CHAIN-POSTROUTING
+  #
+  # `iptables-legacy`, not the plain `iptables` above: this image's `iptables`
+  # is the nft-compat build (linked against libnftnl, managing nftables over
+  # netlink), while miniupnpd links against libip4tc, Alpine's legacy library
+  # that talks to the `ip_tables` kernel module directly. The two do not share
+  # state, so a chain the first creates reads as absent to the second
+  # ("chain MINIUPNPD not found" on the first AddPortMapping, every time,
+  # however the chain was made); `iptables-legacy` writes where miniupnpd
+  # reads.
+  iptables-legacy -t nat -N MINIUPNPD
+  iptables-legacy -t nat -A PREROUTING -i "$OUTSIDE_IF" -j MINIUPNPD
+  iptables-legacy -t filter -N MINIUPNPD
+  iptables-legacy -t filter -A FORWARD -i "$OUTSIDE_IF" ! -o "$OUTSIDE_IF" -j MINIUPNPD
+  iptables-legacy -t nat -N MINIUPNPD-POSTROUTING
+  iptables-legacy -t nat -A POSTROUTING -o "$OUTSIDE_IF" -j MINIUPNPD-POSTROUTING
+
   miniupnpd -d -f /etc/miniupnpd/miniupnpd.conf &
   echo "router: upnp: miniupnpd serving on ${INSIDE_IF}, natpmp refused"
 fi
