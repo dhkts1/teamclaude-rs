@@ -292,6 +292,9 @@ an ask too: pasting one runs `tcr peer join --stdin` and, instead of closing the
 link does, keeps the sheet open to show the sealed reply with a `Copy reply` button, because an
 ask does not join anything by itself: the reply is what has to be sent back.
 
+When a dial finds nobody, the same sheet says the exchange is spent and takes their invite in a
+field of its own, so answering it never means leaving the sheet or opening Settings.
+
 A Mac that already has a network key **refuses a link that carries a different one**, and says
 what accepting it would cut this Mac off from. Pasting a second office's key over the first is
 the commonest way a Mac vanishes from its own mesh, and it used to happen without a word. Pass

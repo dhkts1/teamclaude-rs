@@ -759,6 +759,19 @@ final class PeersPanelWiringTests: XCTestCase {
             "PeerInviteSheet promises a six-digit compare somewhere, and mode B has not "
                 + "compared digits since opening a reply started joining immediately "
                 + "(src/peer/ask.rs's own doc)")
+
+        // The swap: the `answered` arm used to be an `EmptyView()` because
+        // this sheet's own two verbs never produced that case. The swap
+        // makes `answerAsk` a third caller, so the arm has to draw
+        // something, and the button that runs it has to exist.
+        XCTAssertFalse(
+            sheet.contains("EmptyView()"),
+            "PeerInviteSheet's sealedModeContent still drops the answered arm on the floor; "
+                + "the swap's answerAsk press should have filled it in")
+        XCTAssertTrue(
+            sheet.contains("Answer invite"),
+            "PeerInviteSheet has no \"Answer invite\" control; the swap state should add one "
+                + "to the spent-dial screen")
     }
 
     // MARK: - Reading the source
