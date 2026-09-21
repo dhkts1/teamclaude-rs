@@ -1735,6 +1735,29 @@ impl Manager {
     /// [`Self::add_or_update_account`]'s Added path and for the same reason: a
     /// panic in [`build_serving_client`] (which tests inject) must not poison
     /// `self.accounts`.
+    /// Recycle account `idx`'s client after an HTTP/2 stream reset, before the
+    /// proxy's same-account retry sends on it again.
+    ///
+    /// An h2 stream reset (`RST_STREAM`) fails one stream; the connection
+    /// itself stays open and pooled, unlike a connection-level death, which
+    /// reqwest evicts from the pool as part of raising the error. Left alone,
+    /// every retry and every rotation would keep checking out that same
+    /// broken connection — the live incident this exists to fix: 477
+    /// stream-reset failures across every account over 11 minutes, cured only
+    /// by a full process restart, because nothing in the ladder ever swapped
+    /// the connection out. This is [`Self::recycle_client`] under its own
+    /// name so the log line can say why, mirroring the call already made by
+    /// the serve-budget path above.
+    pub fn recycle_client_after_reset(&self, idx: usize) {
+        tracing::info!(
+            account_index = idx,
+            account = self.account_name(idx).as_deref().unwrap_or("?"),
+            "retiring the upstream connection after an HTTP/2 stream reset — \
+             the connection survives the reset, so the retry needs a fresh one"
+        );
+        self.recycle_client(idx);
+    }
+
     fn recycle_client(&self, idx: usize) {
         let fresh = build_serving_client(self.http1_only());
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");

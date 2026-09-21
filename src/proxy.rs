@@ -423,6 +423,79 @@ pub(crate) fn is_offline_error(err: &reqwest::Error) -> bool {
     false
 }
 
+/// Which failure the transport-failure arm is actually looking at, decided
+/// ONCE per attempt rather than re-derived at each log/retry/recycle site.
+///
+/// The distinction this exists to draw: does the pooled connection survive
+/// the error, or not? A CONNECT-phase failure never had a connection to
+/// survive. Past connect, reqwest evicts a connection-level death (the socket
+/// itself closed) from its pool as part of raising the error — so the next
+/// pooled checkout is fresh by construction. An HTTP/2 stream reset is
+/// neither: the h2 CONNECTION stays open and pooled (only the one stream
+/// failed), so every retry and every rotation checks out the SAME broken
+/// connection until something explicitly recycles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportFailureReason {
+    /// No connection existed yet (`err.is_connect()`).
+    ConnectPhase,
+    /// Past connect, and the source chain names an HTTP/2 stream reset — the
+    /// connection is still pooled and must be recycled before a retry means
+    /// anything.
+    StreamReset,
+    /// Past connect, not a recognized stream reset: a genuine connection-level
+    /// death, already evicted from the pool by the error itself.
+    Other,
+}
+
+/// Substrings of an h2 stream-reset error's rendered `Display`, matched
+/// case-insensitively across the walked `source()` chain.
+///
+/// The h2 crate is only a transitive dependency here (pulled in through
+/// hyper), so its `h2::Error` type is not nameable from this crate without
+/// adding a new direct dependency — which this fix does not do. The h2 error
+/// type IS reachable in principle (`std::error::Error::source()` on
+/// `hyper::Error` returns it as a `dyn Error`), but without the crate in
+/// scope there is nothing to `downcast_ref` to. So this matches the rendered
+/// text instead, the same way [`is_offline_error`] above matches DNS text it
+/// cannot downcast to either.
+///
+/// Measured against the real crate (h2 0.4.16, `src/error.rs`), not guessed:
+/// the incident log's `Reset(StreamId(n), PROTOCOL_ERROR, Remote)` is the
+/// error's `Debug`, and `Reason::PROTOCOL_ERROR`'s own `Display` is the prose
+/// "unspecific protocol error detected" — neither `"protocol_error"` nor
+/// `"reset("` ever appears in what `source()` actually renders, so matching
+/// either would silently never fire. What IS reason-independent and always
+/// present: `Error`'s `Display` impl hard-codes the literal prefix
+/// `"stream error "` for a `Kind::Reset` regardless of which of the three
+/// `Initiator`s it names ("stream error sent by user: …", "stream error
+/// detected: …", "stream error received: …") and regardless of the reset
+/// reason, while every other `Kind` (`GoAway`, `Reason`, `User`, `Io`) always
+/// renders `"connection error …"` or something with neither phrase. One
+/// marker, not per-reason string matching.
+const H2_STREAM_RESET_MARKERS: [&str; 1] = ["stream error "];
+
+/// Classify a transport failure into [`TransportFailureReason`], walking the
+/// same `source()` chain [`is_offline_error`] walks, for the same reason: the
+/// h2 sub-kind lives strictly in a `source()` frame, never in `reqwest::Error`'s
+/// own `Display`.
+pub(crate) fn classify_transport_failure(err: &reqwest::Error) -> TransportFailureReason {
+    if err.is_connect() {
+        return TransportFailureReason::ConnectPhase;
+    }
+    let mut frame: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = frame {
+        let rendered = cause.to_string().to_ascii_lowercase();
+        if H2_STREAM_RESET_MARKERS
+            .iter()
+            .any(|marker| rendered.contains(marker))
+        {
+            return TransportFailureReason::StreamReset;
+        }
+        frame = cause.source();
+    }
+    TransportFailureReason::Other
+}
+
 /// How many times one account may be retried IN PLACE on a non-CONNECT
 /// transport failure before the request gives up on it and rotates. Counts
 /// RETRIES, not attempts, matching [`MAX_SAME_ACCOUNT_429`].
@@ -2448,6 +2521,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //     blackholed or timing out. That IS evidence about this route, so bench the
     //     account and let the rotation do its job.
     let mut transport_retried: HashMap<usize, u32> = HashMap::new();
+    // Accounts whose client has already been recycled for a stream reset THIS
+    // request. An h2 stream reset leaves the connection pooled (unlike a
+    // connection-level death), so the same-account retry above would otherwise
+    // check out the identical broken connection every time — this recycles it
+    // once before the retry, not on every retry, so a burst of resets on one
+    // account rebuilds the client a single time rather than once per attempt.
+    let mut reset_recycled: HashSet<usize> = HashSet::new();
     // In-place waits this request has spent on a name-resolution failure, and how
     // many such failures it saw at all. Per-REQUEST: an offline machine is one
     // condition shared by every account, so there is nothing to count per account.
@@ -3053,13 +3133,31 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 if !err.is_connect() {
                     unknown_outcome_transport_failure = true;
                 }
+                // Classified ONCE per attempt — see `TransportFailureReason`'s own
+                // doc for why a stream reset needs different handling than a
+                // connection-level death even though both are `!is_connect()`.
+                let transport_reason = classify_transport_failure(&err);
+                if transport_reason == TransportFailureReason::StreamReset
+                    && reset_recycled.insert(idx)
+                {
+                    // The h2 connection survives a stream reset (unlike a
+                    // connection-level death, which reqwest's own error already
+                    // evicted from the pool), so without this the retry below
+                    // would check out the SAME broken connection. Recycle once per
+                    // account per request — a second reset here finds `idx`
+                    // already in `reset_recycled` and goes straight to the retry,
+                    // which by then really is on the fresh connection.
+                    manager.recycle_client_after_reset(idx);
+                }
                 let transport_attempt = transport_retried.entry(idx).or_insert(0);
                 if !err.is_connect() && *transport_attempt < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES {
                     // A blip on this account this request: retry it on a fresh
                     // connection rather than benching an account that is probably fine.
-                    // The dead connection is already evicted from the pool by the
-                    // error, so each retry genuinely gets a new one — which is why
-                    // repeating is worth more than rotating (94.7% land a 200).
+                    // A connection-level death is already evicted from the pool by
+                    // the error itself; a stream reset was just recycled above —
+                    // either way each retry genuinely gets a new connection, which
+                    // is why repeating is worth more than rotating (94.7% land a
+                    // 200).
                     *transport_attempt += 1;
                     // Message text unchanged — `scripts/` parses it. The attempt
                     // fields are ADDED alongside, never a replacement, so an existing
@@ -11809,6 +11907,144 @@ mod tests {
             "a transport blip must retry the account it blipped on — landing on `b` \
              means one dead connection benched a healthy account and threw away its \
              warm prompt cache"
+        );
+    }
+
+    /// Issue a real GET over cleartext HTTP/2 (prior knowledge, no TLS) and
+    /// hand back the real `reqwest::Error`. Mirrors `transport_error_for` in
+    /// `manager/mod.rs`'s tests: a hand-built stub would prove nothing about
+    /// what the LIVE h2 error's `source()` chain actually renders.
+    async fn h2_transport_error_for(url: &str) -> reqwest::Error {
+        reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client builds")
+            .get(url)
+            .send()
+            .await
+            .expect_err("this request cannot succeed")
+    }
+
+    /// A minimal h2 server that resets every stream it opens instead of
+    /// answering it, by returning `Err` from the service — the shape of the
+    /// live incident (the connection survives, the STREAM does not). Real
+    /// `hyper` machinery (`hyper_util::server::conn::auto`, already used by
+    /// `mitm.rs`), not a hand-rolled frame, so the reset is the one hyper's
+    /// own h2 layer actually produces.
+    async fn spawn_stream_resetting_upstream() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        |_req: hyper::Request<hyper::body::Incoming>| async {
+                            Err::<hyper::Response<String>, _>(std::io::Error::other(
+                                "reset every stream on purpose",
+                            ))
+                        },
+                    );
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(sock), service)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// **Watch it fail**: before `classify_transport_failure` exists, this does
+    /// not compile. After the fix, a real HTTP/2 stream reset — the exact shape
+    /// of the live incident ("the connection stays open and pooled") — must
+    /// classify as `StreamReset`, and a genuine CONNECT-phase failure (nothing
+    /// ever opened) must not.
+    #[tokio::test]
+    async fn stream_reset_classifies_distinctly_from_connect_phase() {
+        let up_addr = spawn_stream_resetting_upstream().await;
+        let reset = h2_transport_error_for(&format!("http://{up_addr}/v1/messages")).await;
+        println!(
+            "reset case: reason={:?} is_connect={} err={reset:?}",
+            classify_transport_failure(&reset),
+            reset.is_connect()
+        );
+        assert!(
+            !reset.is_connect(),
+            "precondition: a stream reset happens AFTER the connection exists"
+        );
+        assert_eq!(
+            classify_transport_failure(&reset),
+            TransportFailureReason::StreamReset,
+            "an h2 stream reset must classify as StreamReset, not lumped in with a \
+             connection-level death: {reset:?}"
+        );
+
+        let connect = h2_transport_error_for(&format!(
+            "http://127.0.0.1:{}/v1/messages",
+            closed_loopback_port()
+        ))
+        .await;
+        println!(
+            "connect case: reason={:?} is_connect={} err={connect:?}",
+            classify_transport_failure(&connect),
+            connect.is_connect()
+        );
+        assert!(
+            connect.is_connect(),
+            "precondition: nothing is listening, so this never leaves the connect phase"
+        );
+        assert_eq!(
+            classify_transport_failure(&connect),
+            TransportFailureReason::ConnectPhase,
+            "a CONNECT failure must not be treated as a stream reset: {connect:?}"
+        );
+    }
+
+    /// **The seam the arm actually calls**: `recycle_client_after_reset` swaps
+    /// the account's client `Arc` (so the retry that follows genuinely lands on
+    /// a fresh connection), and only the StreamReset arm calls it — a
+    /// ConnectPhase failure must leave the client untouched, matching the live
+    /// arm's own gating (`err.is_connect()` never reaches the recycle call).
+    #[tokio::test]
+    async fn recycle_client_after_reset_swaps_the_arc_only_when_called() {
+        let up_addr = spawn_stream_resetting_upstream().await;
+        let manager = fleet(up_addr, &["a"]);
+
+        let before = manager.http_client(0).expect("account 0 exists");
+        let reset = h2_transport_error_for(&format!("http://{up_addr}/v1/messages")).await;
+        assert_eq!(
+            classify_transport_failure(&reset),
+            TransportFailureReason::StreamReset
+        );
+        manager.recycle_client_after_reset(0);
+        let after_reset = manager.http_client(0).expect("account 0 exists");
+        assert!(
+            !Arc::ptr_eq(&before, &after_reset),
+            "a stream reset's recycle must hand the next attempt a DIFFERENT client, \
+             or it checks out the same broken connection again"
+        );
+
+        // A ConnectPhase failure never reaches the recycle call in the live arm
+        // (mirrored here rather than re-driving the whole proxy loop): the
+        // client must be untouched.
+        let connect = h2_transport_error_for(&format!(
+            "http://127.0.0.1:{}/v1/messages",
+            closed_loopback_port()
+        ))
+        .await;
+        assert_eq!(
+            classify_transport_failure(&connect),
+            TransportFailureReason::ConnectPhase
+        );
+        let after_connect = manager.http_client(0).expect("account 0 exists");
+        assert!(
+            Arc::ptr_eq(&after_reset, &after_connect),
+            "a CONNECT failure must never recycle a client that was never pooled"
         );
     }
 
