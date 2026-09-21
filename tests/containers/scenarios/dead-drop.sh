@@ -37,11 +37,18 @@
 #   2. pair node-a1-overlay and node-b1-overlay over the overlay, sealed-
 #      invite's own mechanism (an ask that names no address, a reply sealed
 #      to it, opened on the spot): the cast `nat-no-mapping.sh` cannot use
-#   3. node-b1-overlay greets node-a1-overlay (`tcr peer hello`): a freshly
+#   3. node-a1-overlay greets node-b1-overlay (`tcr peer hello`): a freshly
 #      paired row carries no `rendezvous_secret` (`moved-link.sh` states this
 #      about the very same sealed-pairing shape), and that secret is the only
 #      input the drop's key ladder has. One greeting derives it from a real
-#      handshake and both sides keep a copy.
+#      handshake and both sides keep a copy. The direction matters: after a
+#      sealed pairing only one side has dialed, so the other side's row for
+#      its peer holds an ephemeral source port, not a listening port, and a
+#      greet sent that way is a single refused candidate. node-a1-overlay is
+#      the side that was dialed, so its row for node-b1-overlay already holds
+#      a dialable endpoint; greeting from there is the direction that works,
+#      and it is also how node-b1-overlay's row learns node-a1-overlay's real
+#      listening port, from node-a1-overlay's `Hello`.
 #   4. grant `control-drop` each way, `inspect` on node-a1-overlay for
 #      node-b1-overlay, `disclose` on node-b1-overlay for node-a1-overlay
 #   5. point both at the stub's `/drop/{name}` surface and turn the drop on
@@ -163,11 +170,11 @@ fi
 pass "$A sees $B as $b_id, $B sees $A as $a_id"
 
 # --- greet: the only way either row gets a rendezvous_secret ---------------
-greeted="$(nx "$B" tcr peer hello "$a_id" --peers "$PEERS" 2>&1 || true)"
+greeted="$(nx "$A" tcr peer hello "$b_id" --peers "$PEERS" 2>&1 || true)"
 case "$greeted" in
-  *"peer hello: ok"*) pass "$B greeted $A, so both rows hold this pair's shared secret" ;;
+  *"peer hello: ok"*) pass "$A greeted $B, so both rows hold this pair's shared secret" ;;
   *)
-    fail "$B greeting $A: $greeted"
+    fail "$A greeting $B: $greeted"
     finish
     exit 1
     ;;
