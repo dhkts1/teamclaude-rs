@@ -2247,7 +2247,8 @@ pub async fn dial_peer_within(
         candidates.push(endpoint);
     }
 
-    let race = run_direct_race(row, candidates, &rendezvous, per_attempt, borrow_timeout_ms).await;
+    let bound = Duration::from_millis(borrow_timeout_ms.max(1));
+    let race = run_direct_race(row, candidates, &rendezvous, per_attempt, bound).await;
     for endpoint in race.failed {
         crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
     }
@@ -2261,6 +2262,40 @@ pub async fn dial_peer_within(
 fn per_attempt_bound(borrow_timeout_ms: u64) -> Duration {
     Duration::from_millis((borrow_timeout_ms / u64::from(DIAL_ATTEMPTS_PER_ENDPOINT)).max(1))
 }
+
+/// What is left of `deadline`, zero once it has passed.
+///
+/// [`Instant::saturating_duration_since`] rather than a plain subtraction: a
+/// later stage that runs after the deadline nominally expired (a slow leading
+/// race that still returned) gets a real zero budget instead of a panic or a
+/// wrapped-around duration.
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// The leading direct race's share of the borrow deadline, as a divisor: the
+/// race is bounded by `borrow_timeout_ms / LEADING_RACE_SHARE`, not the whole
+/// deadline.
+///
+/// Not derived from the race's own mechanics, because the obvious derivation
+/// reproduces the bug it exists to fix. Each candidate's own attempt is not
+/// bounded by one `per_attempt`: [`try_direct_endpoint`] tries the recorded
+/// port and then this pair's other [`DIAL_ATTEMPTS_PER_ENDPOINT`] rendezvous
+/// ports, each up to `per_attempt`, and `per_attempt` is itself
+/// `borrow_timeout_ms / DIAL_ATTEMPTS_PER_ENDPOINT`
+/// ([`per_attempt_bound`]). Three attempts at a third of the deadline each is
+/// the whole deadline, so one blackholing candidate already costs about the
+/// whole `borrow_timeout_ms` on its own, and a bound built only from
+/// candidate count and stagger delay -- `(n - 1) * CONNECTION_ATTEMPT_DELAY +
+/// per_attempt` -- is smaller than that single-candidate cost. Using it as
+/// the race's own external bound would cut a real, merely slow, candidate
+/// off mid attempt rather than give a later step a turn, which is the exact
+/// failure this exists to end. A flat named share of the deadline is the
+/// honest choice instead: half, so the leading race still has room to catch
+/// a real but slow answer, and half is left for the dead-drop retry and a
+/// punch to have a real turn rather than chase a deadline that already
+/// passed.
+const LEADING_RACE_SHARE: u64 = 2;
 
 /// One recorded socket, then this pair's rendezvous ports against the same
 /// host, the whole of what "try this direct endpoint" means, in one place
@@ -2397,7 +2432,11 @@ where
 
 /// [`race_candidates`] over `candidates`' own [`try_direct_endpoint`]
 /// attempts, staggered by [`CONNECTION_ATTEMPT_DELAY`] and bounded as a whole
-/// by `borrow_timeout_ms`.
+/// by `bound`, which the caller decides and which is NOT always the whole
+/// borrow deadline: [`dial_peer_reaching_within`] hands the leading race only
+/// [`LEADING_RACE_SHARE`] of it, precisely so a later step -- the dead-drop
+/// retry, a punch -- still gets a turn when every leading candidate
+/// blackholes.
 ///
 /// The bound is on the race, not on any one attempt: a row with ten
 /// endpoints must not outlive the caller's patience just because staggered
@@ -2410,9 +2449,8 @@ async fn run_direct_race(
     candidates: Vec<Endpoint>,
     rendezvous: &[u16],
     per_attempt: Duration,
-    borrow_timeout_ms: u64,
+    bound: Duration,
 ) -> RaceOutcome<Endpoint, (SocketAddr, PeerStream)> {
-    let bound = Duration::from_millis(borrow_timeout_ms.max(1));
     let race = race_candidates(
         candidates,
         CONNECTION_ATTEMPT_DELAY,
@@ -2506,6 +2544,7 @@ pub async fn dial_peer_reaching_within(
     borrow_timeout_ms: u64,
 ) -> Option<(Reached, PeerStream)> {
     let per_attempt = per_attempt_bound(borrow_timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(borrow_timeout_ms.max(1));
     let rendezvous = crate::peer::reach::rendezvous_ports(&row.node, now_unix_seconds());
     let order = dial_order(row);
 
@@ -2524,12 +2563,13 @@ pub async fn dial_peer_reaching_within(
     let (leading, rest) = order.split_at(leading_run);
 
     if !leading.is_empty() {
+        let leading_bound = Duration::from_millis((borrow_timeout_ms / LEADING_RACE_SHARE).max(1));
         let race = run_direct_race(
             row,
             leading.to_vec(),
             &rendezvous,
             per_attempt,
-            borrow_timeout_ms,
+            leading_bound,
         )
         .await;
         for endpoint in race.failed {
@@ -2625,7 +2665,7 @@ pub async fn dial_peer_reaching_within(
                                                 retry_candidates,
                                                 &rendezvous,
                                                 per_attempt,
-                                                borrow_timeout_ms,
+                                                remaining(deadline),
                                             )
                                             .await;
                                             for endpoint in race.failed {
@@ -2678,7 +2718,8 @@ pub async fn dial_peer_reaching_within(
     // machine's bytes. It is bounded by the same borrow timeout everything
     // else here is: a punch waits for a slot boundary, so a dial with ten
     // seconds of patience takes the slots that fit inside it and no others.
-    match punch_dial(row, store, borrow_timeout_ms).await {
+    let punch_budget_ms = u64::try_from(remaining(deadline).as_millis()).unwrap_or(u64::MAX);
+    match punch_dial(row, store, punch_budget_ms).await {
         Ok((addr, stream)) => return Some((Reached::Punched(addr), stream)),
         Err(failure) => tracing::debug!(
             peer = %row.node.display(),

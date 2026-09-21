@@ -1747,6 +1747,96 @@ async fn with_no_secret_for_the_pair_nothing_but_the_recorded_endpoint_is_tried(
     );
 }
 
+/// **The gate for the leading race's own budget**: two endpoints that
+/// BLACKHOLE, rather than refuse, must not let the leading race spend the
+/// whole borrow deadline. `dial_peer_reaching_within` has a later step after
+/// the leading race even when nothing else is configured for this
+/// peer -- a punch attempt and the forwarder loop, both of which fail fast
+/// here since this row has no punch secret and no other peer is allowed to
+/// carry -- and this measures that the WHOLE call still returns with real
+/// time to spare before the ten second deadline, rather than landing right at
+/// it.
+///
+/// Both addresses are from the documentation range (RFC 5737 TEST-NET-3),
+/// which nobody answers on the real internet: a connect attempt gets no
+/// SYN-ACK and no RST, a genuine blackhole. A refused port returns almost
+/// instantly and would not reproduce this at all.
+///
+/// Watched red: today's `run_direct_race` bounds the leading race by the
+/// WHOLE `borrow_timeout_ms`, so with both candidates blackholing, the race's
+/// own external timeout does not fire until the full ten seconds are spent,
+/// and the call returns at essentially the whole deadline. This asserts the
+/// call returns comfortably under nine seconds instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_blackholing_endpoints_leave_a_later_step_time_to_run() {
+    let node = tcr_peer_wire::PeerId([0x59; 32]);
+    let blackhole_one: SocketAddr = "203.0.113.10:41000"
+        .parse()
+        .expect("a literal address parses");
+    let blackhole_two: SocketAddr = "203.0.113.11:41000"
+        .parse()
+        .expect("a literal address parses");
+
+    // A registered port secret so each candidate's own attempt tries the
+    // recorded port PLUS this pair's rendezvous ports
+    // (`DIAL_ATTEMPTS_PER_ENDPOINT`), which is what makes one blackholing
+    // candidate cost close to the whole borrow deadline on its own. Without
+    // this, `rendezvous_ports` answers empty, each candidate tries only the
+    // recorded port, and the leading race concludes in well under a second
+    // regardless of its bound, proving nothing about the bound at all.
+    let secret = [0x59_u8; 32];
+    reach::remember_port_secret(node, secret);
+
+    let mut row = peer_config::PeerRow {
+        node,
+        label: "far-mac".to_string(),
+        endpoints: Vec::new(),
+        added_at: 1,
+        rendezvous_secret: None,
+        sees_us_at: None,
+        allow: peer_config::Allow::default(),
+        lend: Vec::new(),
+    };
+    row.observe_endpoint(peer_config::Endpoint::direct(
+        blackhole_one,
+        1_000,
+        peer_config::EndpointSource::Paired,
+    ));
+    row.observe_endpoint(peer_config::Endpoint::direct(
+        blackhole_two,
+        1_000,
+        peer_config::EndpointSource::Paired,
+    ));
+
+    let dir = tempfile::tempdir().expect("a temp dir for the peers file");
+    let path = dir.path().join("tcr-peers.json");
+    let file = peer_config::PeerFile {
+        peers: vec![row],
+        ..Default::default()
+    };
+    peer_config::save(&path, &file).expect("the row writes");
+    let store = peer_config::PeerStore::open(&path).expect("the peer store opens");
+    let dial_row = store.row(&node).expect("the row reads back");
+
+    let deadline_ms: u64 = 10_000;
+    let start = Instant::now();
+    let reached =
+        teamclaude_rs::peer::serve::dial_peer_reaching_within(&dial_row, &store, deadline_ms).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        reached.is_none(),
+        "neither blackholing endpoint can answer, this row has no punch secret and no other \
+         peer is allowed to carry, so nothing can reach this peer"
+    );
+    assert!(
+        elapsed < Duration::from_millis(9_000),
+        "the leading race must not spend the whole {deadline_ms} ms deadline on two \
+         blackholing candidates: a later step (the punch attempt and the forwarder loop) must \
+         still get a turn with real time to spare, and this call took {elapsed:?}"
+    );
+}
+
 /// **The gate for the retry backoff, through the production dial**: a dead
 /// endpoint that just failed is cooled down, and the next order read from the
 /// same row drops it while the endpoint that answered is still there.
