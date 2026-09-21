@@ -655,7 +655,10 @@ pub fn client_hello_sni(bytes: &[u8]) -> Result<Option<String>> {
 /// is the operator's own act, not the peer's. Persisting it would put a
 /// per-peer traffic history on disk, which is a record of when somebody else's
 /// machine was working and is exactly the kind of thing this feature promises
-/// not to keep.
+/// not to keep. The cap resets on restart by design: it belongs to this
+/// lender's own process, a borrower cannot force this Mac to restart, so a
+/// reset costs this Mac at most one hour of its own bytes and gives nobody a
+/// timeline.
 /// # Open carries count against the hour too
 ///
 /// A closed tunnel's bytes are in [`Self::spent`]; an OPEN one's reservation is
@@ -962,6 +965,16 @@ pub fn path_meter() -> &'static std::sync::Mutex<PathMeter> {
     static METER: std::sync::OnceLock<std::sync::Mutex<PathMeter>> = std::sync::OnceLock::new();
     METER.get_or_init(|| std::sync::Mutex::new(PathMeter::new()))
 }
+
+/// How often the serving process sums [`path_meter`] into
+/// [`crate::peer::state::save_path_traffic`].
+///
+/// This subsystem owns the figure the way
+/// [`crate::peer::discovery::BROWSE_INTERVAL`] and
+/// [`crate::peer::probe::PROBE_INTERVAL`] own theirs; the schedule itself
+/// stays the serving process's act, which is what [`path_meter`]'s own doc
+/// above says.
+pub const PATH_TRAFFIC_SUM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // The gateway's half

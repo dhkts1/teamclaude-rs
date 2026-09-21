@@ -860,3 +860,104 @@ async fn a_carry_is_charged_to_the_path_it_arrived_over() {
          first: {charged:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The written row's shape is exactly what the privacy decision allows
+// ---------------------------------------------------------------------------
+
+/// After a real carry, the row `save_path_traffic` puts in `peer-state.json`
+/// carries nothing time-shaped beyond `updatedAtMs`.
+///
+/// `PathTraffic`'s own doc (`src/peer/state.rs:271-290`) is the privacy
+/// decision this file exists to keep true: the state file may hold the
+/// SUMMED totals and the instant they were summed, and nothing about when
+/// inside the hour the bytes moved. Read out of the written FILE, not out of
+/// the struct: asserting against `serde_json::to_value(&PathTraffic { .. })`
+/// would just restate whatever fields the struct declares, which guards
+/// nothing.
+///
+/// Watched red by adding a throwaway `retired_at_ms: i64` field to
+/// `PathTraffic` (with `#[serde(default)]` so it still compiles and
+/// deserializes old files): this test then names `"retiredAtMs"` as the extra
+/// key rather than passing. The field was removed again to restore, checked
+/// with `git status` and by re-reading the struct.
+#[tokio::test]
+async fn the_written_row_carries_nothing_time_shaped_beyond_updated_at_ms() {
+    let (requester, target_peer, me) = (node(), node(), node());
+    let now_ms = teamclaude_rs::now_ms();
+
+    let target_listener = loopback().await;
+    let target_addr = target_listener.local_addr().expect("the target address");
+    let target = target_on(target_listener, vec![5_u8; 16]);
+
+    let peers_path = peers_file(
+        "keyshape",
+        vec![
+            row_with(&requester.id, "requester", Vec::new(), true),
+            row_with(
+                &target_peer.id,
+                "target",
+                vec![Endpoint::direct(
+                    target_addr,
+                    PINNED_AT_MS,
+                    EndpointSource::Paired,
+                )],
+                false,
+            ),
+        ],
+    );
+    let budget = Arc::new(Mutex::new(TunnelBudget::new()));
+
+    carry_one_request(
+        &requester,
+        &me,
+        PeerStore::open(&peers_path).expect("open the peers file"),
+        target_peer.id,
+        &budget,
+        now_ms,
+    )
+    .await;
+    assert_eq!(
+        target.connections.load(Ordering::SeqCst),
+        1,
+        "the control: the carry has to actually reach the target, or a row here is not \
+         a real charge"
+    );
+
+    let rows = {
+        let mut meter = path_meter().lock().expect("the meter lock");
+        meter.rows(now_ms)
+    };
+    let state_path = serve::peer_state_path(&peers_path);
+    state::save_path_traffic(&state_path, &rows).expect("write the traffic section");
+
+    let raw = std::fs::read_to_string(&state_path).expect("read the state file");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("the state file is JSON");
+    let written = parsed["pathTraffic"]
+        .as_array()
+        .expect("a pathTraffic array")
+        .iter()
+        .find(|row| row["peer"] == serde_json::json!(target_peer.id.to_wire()))
+        .unwrap_or_else(|| panic!("no row for the target peer in {parsed}"));
+
+    let mut keys: Vec<&str> = written
+        .as_object()
+        .expect("a row is a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "addr",
+            "bytesLastHour",
+            "kind",
+            "peer",
+            "tokensLastHour",
+            "updatedAtMs",
+        ],
+        "the only key here shaped by time is updatedAtMs, the promise PathTraffic's own \
+         doc gives: {written}"
+    );
+}
