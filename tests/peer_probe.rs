@@ -819,6 +819,73 @@ fn the_shipped_dial_order_is_the_comparator_and_an_unmeasured_row_is_unchanged()
     );
 }
 
+/// **An endpoint that just failed a dial is skipped while it is cooling, and
+/// the other endpoint on the row is what is left to dial.**
+///
+/// The row-level gate for the retry backoff: `PathTable::cool_down` records
+/// the failure and `probe::drop_cooling_endpoints` is what `dial_order`
+/// applies to its own sorted order, so this drives the filter directly, the
+/// way the module doc says a test can.
+///
+/// Watched red: `PathTable::cool_down` and `probe::drop_cooling_endpoints` do
+/// not exist before this change.
+#[test]
+fn a_cooling_endpoint_is_skipped_and_the_other_one_on_the_row_is_dialled() {
+    let peer = PeerId([22_u8; 32]);
+    let older: SocketAddr = "127.0.0.1:9714".parse().expect("an addr");
+    let newer: SocketAddr = "127.0.0.1:9715".parse().expect("an addr");
+    let row = two_endpoint_row(peer, older, newer);
+
+    let mut table = PathTable::default();
+    let order = probe::order_endpoints(&row, &table);
+    assert_eq!(
+        order.first().and_then(Endpoint::direct_addr),
+        Some(newer),
+        "unfiltered, the newest endpoint leads"
+    );
+
+    table.cool_down(peer, Locator::Direct { addr: newer }, FIXED_MS + 60_000);
+    let awake = probe::drop_cooling_endpoints(order, &peer, &table, FIXED_MS);
+    assert_eq!(
+        awake
+            .iter()
+            .filter_map(Endpoint::direct_addr)
+            .collect::<Vec<_>>(),
+        vec![older],
+        "the endpoint that just failed is dropped while it cools, and the row's other \
+         endpoint is what is left to dial"
+    );
+}
+
+/// **Never strand a row: when every endpoint on it is cooling, the full order
+/// comes back rather than an empty list.**
+///
+/// The same rule `PathsConfig::max_loss_pct` already states for loss, "a
+/// lossy path that is the only path is still the way home", applies here: a
+/// cooling path that is the only path is still tried.
+///
+/// Watched red: `PathTable::cool_down` and `probe::drop_cooling_endpoints` do
+/// not exist before this change.
+#[test]
+fn every_endpoint_cooling_still_returns_the_row_whole() {
+    let peer = PeerId([23_u8; 32]);
+    let older: SocketAddr = "127.0.0.1:9716".parse().expect("an addr");
+    let newer: SocketAddr = "127.0.0.1:9717".parse().expect("an addr");
+    let row = two_endpoint_row(peer, older, newer);
+
+    let mut table = PathTable::default();
+    let order = probe::order_endpoints(&row, &table);
+    table.cool_down(peer, Locator::Direct { addr: newer }, FIXED_MS + 60_000);
+    table.cool_down(peer, Locator::Direct { addr: older }, FIXED_MS + 60_000);
+
+    let awake = probe::drop_cooling_endpoints(order.clone(), &peer, &table, FIXED_MS);
+    assert_eq!(
+        awake, order,
+        "every endpoint on the row is cooling, so the full order comes back instead of an \
+         empty list, and the row is still dialled"
+    );
+}
+
 /// The carry order PROBE hands EGRESS-PIN: measured first, and an unprobed
 /// fleet keeps the freshness order `resolve_via` has today.
 ///
