@@ -400,6 +400,76 @@ async fn a_peer_that_closes_the_session_gets_exactly_one_probe() {
     script.handle.await.expect("the far end").expect("no error");
 }
 
+/// **A peer that answers after the probe timeout is recorded as loss, and the
+/// session stops there: reading the stream again risks a torn frame.**
+///
+/// `probe_once`'s own read is wrapped in `tokio::time::timeout`, and
+/// `noise::recv_encrypted` is not cancel safe (its doc explains why), so a
+/// second read on the same stream after a timeout can take whatever bytes the
+/// cancelled read left behind. The only safe rule is the one the two sibling
+/// timeouts already follow: a timeout ends the session, here, not two rounds
+/// later.
+///
+/// The scripted far end answers well after `PROBE_TIMEOUT`, late enough that
+/// this test's own single round finishes and the test ends before that answer
+/// is ever written, so nothing here depends on whether it arrives.
+///
+/// Watched red: before the fix, `probe_session` only stops early on
+/// `ProbeOutcome::NotSupported`; a `NoAnswer` falls through to the next round
+/// instead, so this test's `run.sent` reads 2, not 1, and `run.stop` reads
+/// `Completed`, not `TimedOut`.
+#[tokio::test]
+async fn a_peer_that_answers_after_the_timeout_is_loss_and_the_session_stops() {
+    let script = scripted(FarEnd::EchoAfter(
+        probe::PROBE_TIMEOUT + Duration::from_secs(2),
+    ))
+    .await;
+    let (mut stream, mut session) =
+        open_control(script.addr, &script.dialer_secret, &script.far_public)
+            .await
+            .expect("a CONTROL stream to the far end");
+
+    let mut table = PathTable::default();
+    let locator = Locator::Direct { addr: script.addr };
+    let run = probe::probe_session(
+        &mut stream,
+        &mut session,
+        &mut table,
+        locator,
+        2,
+        Duration::ZERO,
+    )
+    .await
+    .expect("a timeout is not an error to the prober");
+
+    assert_eq!(
+        run.sent, 1,
+        "one probe sent, and the timeout ends the session before a second"
+    );
+    assert_eq!(
+        run.stop,
+        ProbeStop::TimedOut,
+        "a silent probe within the timeout is loss, not a build that cannot parse one"
+    );
+    assert_eq!(
+        script.probes.load(Ordering::SeqCst),
+        1,
+        "the peer read exactly one; the second round is never sent"
+    );
+    let stat = table
+        .stat(&PeerId(script.far_public), &locator)
+        .expect("a row after the timeout");
+    assert!(
+        (stat.loss_pct - 100.0).abs() < f64::EPSILON,
+        "one unanswered probe is total loss, not {}",
+        stat.loss_pct
+    );
+    assert!(
+        stat.rtt_ms.is_none(),
+        "nothing was acked within the timeout, so there is no round trip"
+    );
+}
+
 /// **The shipped listener answers a probe, and echoes both fields untouched.**
 ///
 /// `listener::serve_on_with` is the production accept loop, so what answers
