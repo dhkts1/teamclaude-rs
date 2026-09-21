@@ -1,0 +1,17 @@
+{
+  "lans": [
+    { "name": "home-a", "bridge": "br-home-a", "cidr": "10.77.1.0/24" },
+    { "name": "home-b", "bridge": "br-home-b", "cidr": "10.77.2.0/24" },
+    { "name": "internet", "bridge": "br-internet", "cidr": "5.5.5.0/24" }
+  ],
+  "hosts": [
+    { "name": "router-a", "lan": "home-a", "ip": "10.77.1.2", "role": "router", "upnp": "off",
+      "extra": [ { "lan": "internet", "ip": "5.5.5.2" } ] },
+    { "name": "router-b", "lan": "home-b", "ip": "10.77.2.2", "role": "router", "upnp": "off",
+      "extra": [ { "lan": "internet", "ip": "5.5.5.3" } ] },
+    { "name": "node-a1", "lan": "home-a", "ip": "10.77.1.11", "gw": "10.77.1.2", "role": "node", "listen": 7755, "proxy": 8088 },
+    { "name": "node-b1", "lan": "home-b", "ip": "10.77.2.11", "gw": "10.77.2.2", "role": "node", "listen": 7755, "proxy": 8088,
+      "extra": [ { "lan": "internet", "ip": "5.5.5.11" } ] },
+    { "name": "node-c1", "lan": "internet", "ip": "5.5.5.20", "role": "node", "listen": 7755, "proxy": 8088 }
+  ]
+}
