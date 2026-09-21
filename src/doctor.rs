@@ -709,6 +709,7 @@ mod tests {
             sessions,
             sessions_summary: Default::default(),
             peers: Vec::new(),
+            peers_error: None,
         }
     }
 

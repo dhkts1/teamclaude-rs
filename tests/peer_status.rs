@@ -1136,6 +1136,34 @@ fn a_mac_with_no_peers_file_reports_an_empty_block() {
     assert!(block.is_empty(), "no peers file, no peers: {block:#?}");
 }
 
+/// A6-8: a peers file that exists but does not parse must say so, not read as
+/// the same "nobody pinned" fact a fresh install reports.
+///
+/// Watch it fail on the pre-fix `peers_block`, which has no error to hand
+/// back at all: swap `peers_block_with_error` for `(peers_block(&peers_path,
+/// now_ms), None)` and this goes red, because `error` stays `None` for a file
+/// that is one invalid byte.
+#[test]
+fn an_unparseable_peers_file_names_its_own_parse_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let peers_path = dir.path().join("tcr-peers.json");
+    std::fs::write(&peers_path, b"\xff").expect("write one invalid byte");
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(&peers_path, perms).expect("set mode 0600");
+
+    let (block, error) =
+        teamclaude_rs::status::peers_block_with_error(&peers_path, 1_700_000_000_000);
+
+    assert!(block.is_empty(), "a broken file still reports zero peers");
+    let error = error.expect("a file that exists but will not parse must name why");
+    assert!(
+        error.contains("tcr-peers.json"),
+        "the parse error names the file: {error}"
+    );
+}
+
 // MARK: The `tcr peer ls --json` document, and the secret that used to ride it
 //
 // The same cross-language pin as the peers block above, for the other payload
@@ -1318,6 +1346,7 @@ fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
         )]
         .into_iter()
         .collect(),
+        peers_error: None,
     }
 }
 

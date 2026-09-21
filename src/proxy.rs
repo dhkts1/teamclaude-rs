@@ -1316,7 +1316,7 @@ async fn status_handler(
     // evening to a panel rendering a config the server had not re-read. A
     // reader who wants this cheaper should make the panel poll less often
     // rather than make the answer older than the question.
-    payload.peers = crate::status::peers_block(
+    (payload.peers, payload.peers_error) = crate::status::peers_block_with_error(
         &crate::peer::egress::peers_path(),
         (now.unix_timestamp_nanos() / 1_000_000) as i64,
     );

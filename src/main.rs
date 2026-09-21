@@ -1712,7 +1712,22 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         }
         PeerAction::Ls(a) => {
             let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
-            let store = peer::config::PeerStore::open(&peers_path)?;
+            // A peers file that exists but does not parse is reported IN the
+            // JSON document (`peers_error`) rather than as a command failure:
+            // the same reasoning `status::peers_block` gives for why an
+            // unreadable file is an empty block and not a refusal applies
+            // here too, and `--json` is what the panel and scripts parse.
+            // The human-readable branch keeps refusing outright, since there
+            // is no document for it to carry the error in.
+            let store = match peer::config::PeerStore::open(&peers_path) {
+                Ok(store) => store,
+                Err(err) if a.json => {
+                    let out = status::PeerLsJson::unreadable(err.to_string());
+                    println!("{}", serde_json::to_string(&out)?);
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
             let rows = store.peers();
             let state_path = peer_state_path(&peers_path);
             let state = peer::state::load(&state_path, peer::pair::now_ms())?;
@@ -1847,6 +1862,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                         knock_burst: peer::listener::KNOCK_BURST,
                         unauthenticated_sockets: peer::listener::MAX_UNAUTHENTICATED_SOCKETS,
                     },
+                    peers_error: None,
                 };
                 println!("{}", serde_json::to_string(&out)?);
             } else {
