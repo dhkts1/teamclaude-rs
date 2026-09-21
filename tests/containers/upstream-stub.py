@@ -27,6 +27,16 @@ here runs a model, it is `len(body) // 4`, a fixed and documented estimate a
 scenario can use to tell "some request landed" from "no request landed",
 never to check real billing.
 
+A third, disjoint protocol under `/drop/<name>`: the dead drop's own surface,
+a `PUT`/`GET` key-value store, never mixed into the ledger or the lever
+above. `PUT /drop/<name>` stores the raw body under `<name>`; `GET
+/drop/<name>` answers the stored bytes, or 404 when nothing is there yet, the
+same "absence is not an error" shape `DeadDropStore::get` expects. Both need
+the same bearer this stub's other endpoints already read with `_credential`,
+checked against `DROP_TOKEN`, an obviously-fake lab constant: a request
+carrying anything else, or nothing, is refused with 401 before it touches
+`DROPS`.
+
 Stdlib only, so the image is the stock python and there is nothing to build:
 the stub runs in a namespace of the one netlab image, so a dependency here
 would be a dependency in the node image too.
@@ -43,9 +53,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BODY = json.dumps({"type": "message", "id": "msg_fake"}).encode()
 
+# The dead drop's own bearer, obviously fake: a scenario configures
+# `tcr peer drop-store set http://.../drop/{name} --token DROP_TOKEN` and
+# nothing this lab handles is a real credential.
+DROP_TOKEN = "fake-netlab-drop-token"
+
 LOCK = threading.Lock()
 LEDGER = []
 LEVERS = {}
+DROPS = {}
 REQUEST_IDS = itertools.count(1)
 
 
@@ -90,6 +106,42 @@ class Stub(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # --- the dead drop: a disjoint PUT/GET key-value surface ---------------
+
+    def _drop_authorized(self):
+        return self._credential() == f"Bearer {DROP_TOKEN}"
+
+    def _serve_drop_put(self, name, raw):
+        if not self._drop_authorized():
+            self.send_response(401)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        with LOCK:
+            DROPS[name] = raw
+        self.send_response(204)
+        self.send_header("content-length", "0")
+        self.end_headers()
+
+    def _serve_drop_get(self, name):
+        if not self._drop_authorized():
+            self.send_response(401)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        with LOCK:
+            body = DROPS.get(name)
+        if body is None:
+            self.send_response(404)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("content-type", "application/octet-stream")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # --- the ordinary canned answer, and what a lever does to it -----------
 
     def _credential(self):
@@ -126,6 +178,13 @@ class Stub(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/_lever") and self.command == "POST":
             self._serve_lever(body_in)
+            return
+        if self.path.startswith("/drop/") and self.command in ("PUT", "GET"):
+            drop_name = self.path[len("/drop/") :]
+            if self.command == "PUT":
+                self._serve_drop_put(drop_name, body_in)
+            else:
+                self._serve_drop_get(drop_name)
             return
 
         with LOCK:
@@ -183,6 +242,7 @@ class Stub(BaseHTTPRequestHandler):
 
     do_GET = _answer
     do_POST = _answer
+    do_PUT = _answer
 
     def log_message(self, *_args):
         pass

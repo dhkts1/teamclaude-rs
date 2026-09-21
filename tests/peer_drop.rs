@@ -482,3 +482,108 @@ async fn a_fake_store_on_loopback_round_trips_a_record() {
          without an error: {log:?}"
     );
 }
+
+/// A friend this node no longer pins is refused before the store is ever
+/// asked, not merely refused to write.
+///
+/// The absence of an error is not the assertion here: a `fetch_for` that
+/// called the store unconditionally and then quietly dropped the answer for
+/// a row it could not find would also return `Ok(0)`. The call log is the
+/// independent check that the store was never reached at all.
+#[tokio::test]
+async fn a_record_from_a_revoked_peer_is_refused() {
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let addr = spawn_fake_store(Arc::clone(&calls));
+    let template = format!("http://{addr}/{{name}}");
+    let store = HttpsTemplateStore::new(&template, None).expect("a template store builds");
+
+    let friend = peer_id(0x44);
+    let dir = tempfile::tempdir().expect("a temp dir for the peers file");
+    let path = dir.path().join("tcr-peers.json");
+
+    // Pinned, switched on, and holding a rendezvous secret: everything a live
+    // fetch needs, so the row being gone is the only reason the fetch below
+    // finds nothing.
+    let mut file = teamclaude_rs::peer::config::PeerFile::default();
+    file.peers.push(teamclaude_rs::peer::config::PeerRow {
+        node: friend,
+        label: "revoked".to_string(),
+        endpoints: Vec::new(),
+        added_at: 0,
+        allow: teamclaude_rs::peer::config::Allow {
+            control: teamclaude_rs::peer::config::ControlGrants {
+                drop: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        lend: Vec::new(),
+        rendezvous_secret: Some(counting_secret()),
+        sees_us_at: None,
+    });
+    teamclaude_rs::peer::config::save(&path, &file).expect("the pinned row writes");
+
+    // `tcr peer forget`'s own effect: the row is gone.
+    let mut revoked = file.clone();
+    revoked.peers.clear();
+    teamclaude_rs::peer::config::save(&path, &revoked).expect("the revocation writes");
+
+    let fetched = drop::fetch_for(&store, &path, &friend, 1_758_240_000)
+        .await
+        .expect("a revoked peer is not an error, it is nothing to fetch");
+    assert!(fetched.is_empty(), "a revoked peer's drop writes nothing");
+
+    let log = calls
+        .lock()
+        .expect("the fake store's call log is never poisoned")
+        .clone();
+    assert!(
+        log.is_empty(),
+        "fetch_for must not call the store at all for a peer this node no longer pins, \
+         so the absence of an error here is not the assertion, the call count is: {log:?}"
+    );
+}
+
+/// **Both halves, or the test passes for a function that returns nothing at
+/// all**: an observed self address on an EPHEMERAL port is not published,
+/// and one on this Mac's own listening port is.
+///
+/// `observed_self_addresses` is keyed one entry per peer, so the two halves
+/// need two peer ids rather than one call recording twice. Watched red:
+/// before the port filter, both addresses land in `own_endpoints`'s output
+/// and the first assertion fails, naming the ephemeral address that should
+/// never have been there.
+#[test]
+fn own_endpoints_publishes_only_ports_this_mac_actually_accepts_on() {
+    let listen: SocketAddr = "203.0.113.1:4433"
+        .parse()
+        .expect("a literal socket address from the documentation range");
+
+    let ephemeral_peer = peer_id(0x91);
+    let ephemeral_observed: SocketAddr = "203.0.113.2:54211"
+        .parse()
+        .expect("a literal socket address from the documentation range");
+    teamclaude_rs::peer::reach::remember_observed_self(ephemeral_peer, ephemeral_observed);
+
+    let listening_peer = peer_id(0x92);
+    let listening_observed: SocketAddr = "203.0.113.3:4433".parse().expect(
+        "a literal socket address from the documentation range, on this Mac's own listening \
+         port",
+    );
+    teamclaude_rs::peer::reach::remember_observed_self(listening_peer, listening_observed);
+
+    let ephemeral_result = drop::own_endpoints(listen, &ephemeral_peer);
+    assert!(
+        !ephemeral_result.contains(&ephemeral_observed),
+        "an observed self address on an ephemeral port, {ephemeral_observed}, must not be \
+         published: nothing on this Mac listens there, so a friend dialling it spends its \
+         budget on an address that cannot answer: {ephemeral_result:?}"
+    );
+
+    let listening_result = drop::own_endpoints(listen, &listening_peer);
+    assert!(
+        listening_result.contains(&listening_observed),
+        "an observed self address on this Mac's own listening port, {listening_observed}, \
+         must still be published: {listening_result:?}"
+    );
+}

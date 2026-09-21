@@ -2247,7 +2247,8 @@ pub async fn dial_peer_within(
         candidates.push(endpoint);
     }
 
-    let race = run_direct_race(row, candidates, &rendezvous, per_attempt, borrow_timeout_ms).await;
+    let bound = Duration::from_millis(borrow_timeout_ms.max(1));
+    let race = run_direct_race(row, candidates, &rendezvous, per_attempt, bound).await;
     for endpoint in race.failed {
         crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
     }
@@ -2261,6 +2262,40 @@ pub async fn dial_peer_within(
 fn per_attempt_bound(borrow_timeout_ms: u64) -> Duration {
     Duration::from_millis((borrow_timeout_ms / u64::from(DIAL_ATTEMPTS_PER_ENDPOINT)).max(1))
 }
+
+/// What is left of `deadline`, zero once it has passed.
+///
+/// [`Instant::saturating_duration_since`] rather than a plain subtraction: a
+/// later stage that runs after the deadline nominally expired (a slow leading
+/// race that still returned) gets a real zero budget instead of a panic or a
+/// wrapped-around duration.
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// The leading direct race's share of the borrow deadline, as a divisor: the
+/// race is bounded by `borrow_timeout_ms / LEADING_RACE_SHARE`, not the whole
+/// deadline.
+///
+/// Not derived from the race's own mechanics, because the obvious derivation
+/// reproduces the bug it exists to fix. Each candidate's own attempt is not
+/// bounded by one `per_attempt`: [`try_direct_endpoint`] tries the recorded
+/// port and then this pair's other [`DIAL_ATTEMPTS_PER_ENDPOINT`] rendezvous
+/// ports, each up to `per_attempt`, and `per_attempt` is itself
+/// `borrow_timeout_ms / DIAL_ATTEMPTS_PER_ENDPOINT`
+/// ([`per_attempt_bound`]). Three attempts at a third of the deadline each is
+/// the whole deadline, so one blackholing candidate already costs about the
+/// whole `borrow_timeout_ms` on its own, and a bound built only from
+/// candidate count and stagger delay -- `(n - 1) * CONNECTION_ATTEMPT_DELAY +
+/// per_attempt` -- is smaller than that single-candidate cost. Using it as
+/// the race's own external bound would cut a real, merely slow, candidate
+/// off mid attempt rather than give a later step a turn, which is the exact
+/// failure this exists to end. A flat named share of the deadline is the
+/// honest choice instead: half, so the leading race still has room to catch
+/// a real but slow answer, and half is left for the dead-drop retry and a
+/// punch to have a real turn rather than chase a deadline that already
+/// passed.
+const LEADING_RACE_SHARE: u64 = 2;
 
 /// One recorded socket, then this pair's rendezvous ports against the same
 /// host, the whole of what "try this direct endpoint" means, in one place
@@ -2397,7 +2432,11 @@ where
 
 /// [`race_candidates`] over `candidates`' own [`try_direct_endpoint`]
 /// attempts, staggered by [`CONNECTION_ATTEMPT_DELAY`] and bounded as a whole
-/// by `borrow_timeout_ms`.
+/// by `bound`, which the caller decides and which is NOT always the whole
+/// borrow deadline: [`dial_peer_reaching_within`] hands the leading race only
+/// [`LEADING_RACE_SHARE`] of it, precisely so a later step -- the dead-drop
+/// retry, a punch -- still gets a turn when every leading candidate
+/// blackholes.
 ///
 /// The bound is on the race, not on any one attempt: a row with ten
 /// endpoints must not outlive the caller's patience just because staggered
@@ -2410,9 +2449,8 @@ async fn run_direct_race(
     candidates: Vec<Endpoint>,
     rendezvous: &[u16],
     per_attempt: Duration,
-    borrow_timeout_ms: u64,
+    bound: Duration,
 ) -> RaceOutcome<Endpoint, (SocketAddr, PeerStream)> {
-    let bound = Duration::from_millis(borrow_timeout_ms.max(1));
     let race = race_candidates(
         candidates,
         CONNECTION_ATTEMPT_DELAY,
@@ -2427,6 +2465,29 @@ async fn run_direct_race(
             won: None,
             failed: Vec::new(),
         },
+    }
+}
+
+/// Clear the process-local cooldown for exactly the locators a dead-drop
+/// fetch just wrote, and no other.
+///
+/// A cooldown records that an address failed a moment ago, while a fresh
+/// signed record from the peer itself is new evidence about where it is NOW,
+/// and new evidence outranks a stale failure. Without this, [`dial_order`]'s
+/// own cooldown filter hides a re-taught address for
+/// [`crate::peer::probe::PATH_RETRY_COOLDOWN`], the common case for a peer
+/// whose router mapping moved and moved back, and the retry below would look
+/// like it fetched nothing.
+///
+/// A named function and not an inline loop so a test can prove it clears
+/// exactly `written`'s own locators and nothing else: `written` came from
+/// [`crate::peer::drop::fetch_for`], which is the one place that knows which
+/// locators actually landed on the row, so a blanket clear here would be a
+/// second, looser answer to a question that function already answered
+/// precisely.
+fn clear_cooldowns_for_fetch(peer: PeerId, written: &[Endpoint]) {
+    for endpoint in written {
+        crate::peer::probe::clear_cooldown(peer, endpoint.locator);
     }
 }
 
@@ -2468,6 +2529,11 @@ pub enum Reached {
 ///    peer that moved and whose every recorded address is stale has no `Via`
 ///    endpoint to follow, because nothing in this build writes one, and a
 ///    mutual friend that IS reachable is the only way home left.
+/// 3. If both of those still answered nothing and the dead drop is on for
+///    this peer, this Mac fetches the friend's drop once and, on a write,
+///    retries the direct candidates once more before a punch. See the
+///    dead-drop block below for the two things that make that retry see the
+///    address it just learned rather than nothing.
 ///
 /// Reports WHICH path answered for the same reason [`dial_peer_with_endpoint`]
 /// reports which socket did: a boxed stream cannot be asked afterwards, and a
@@ -2478,6 +2544,7 @@ pub async fn dial_peer_reaching_within(
     borrow_timeout_ms: u64,
 ) -> Option<(Reached, PeerStream)> {
     let per_attempt = per_attempt_bound(borrow_timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(borrow_timeout_ms.max(1));
     let rendezvous = crate::peer::reach::rendezvous_ports(&row.node, now_unix_seconds());
     let order = dial_order(row);
 
@@ -2496,12 +2563,13 @@ pub async fn dial_peer_reaching_within(
     let (leading, rest) = order.split_at(leading_run);
 
     if !leading.is_empty() {
+        let leading_bound = Duration::from_millis((borrow_timeout_ms / LEADING_RACE_SHARE).max(1));
         let race = run_direct_race(
             row,
             leading.to_vec(),
             &rendezvous,
             per_attempt,
-            borrow_timeout_ms,
+            leading_bound,
         )
         .await;
         for endpoint in race.failed {
@@ -2542,13 +2610,116 @@ pub async fn dial_peer_reaching_within(
         }
     }
 
+    // The dead drop, only after every endpoint already on the row (direct or
+    // `Via`), the leading race included, failed, and only for a peer this Mac
+    // is allowed to trade addresses with. It is tried here, after the row's
+    // own endpoints and before a punch or a third Mac's carried bytes are
+    // spent, on the design's own flowchart.
+    let dead_drop_file = store.file();
+    if dead_drop_file.dead_drop.is_live() && row.allow.control.drop {
+        let now_s = now_unix_seconds();
+        let drop_slot = crate::peer::drop::current_slot(now_s);
+        if !crate::peer::drop::fetched_this_slot(&row.node, drop_slot) {
+            match dead_drop_file.dead_drop.open_store() {
+                Ok(drop_store) => {
+                    match crate::peer::drop::fetch_for(&drop_store, store.path(), &row.node, now_s)
+                        .await
+                    {
+                        Ok(written) if !written.is_empty() => {
+                            clear_cooldowns_for_fetch(row.node, &written);
+
+                            // `PeerStore` caches the file it read and reloads it
+                            // on the file's mtime; `fetch_for` just wrote that
+                            // same file directly, and the write can land inside
+                            // one filesystem tick, too fast for mtime to have
+                            // moved. Read the row back off disk, bypassing the
+                            // cache entirely, rather than trust a reload that
+                            // may see nothing new.
+                            match crate::peer::config::read_or_default(store.path()) {
+                                Ok(fresh_file) => {
+                                    if let Some(fresh) =
+                                        fresh_file.peers.iter().find(|r| r.node == row.node)
+                                    {
+                                        // The addresses the drop just taught are
+                                        // dialled as their own ranked band among
+                                        // the direct candidates, not as a second
+                                        // bespoke path: one race, over whichever
+                                        // direct endpoints the row's own order
+                                        // now returns. `EndpointSource::Drop` is
+                                        // the weakest band in `source_rank`, so a
+                                        // drop-learned address sorts behind
+                                        // everything a handshake proved and
+                                        // behind a brief, and a cooled address
+                                        // this fetch did not just clear is
+                                        // filtered out of the order exactly as it
+                                        // was above.
+                                        let retry_candidates: Vec<Endpoint> = dial_order(fresh)
+                                            .into_iter()
+                                            .filter(|endpoint| {
+                                                matches!(endpoint.locator, Locator::Direct { .. })
+                                            })
+                                            .collect();
+                                        if !retry_candidates.is_empty() {
+                                            let race = run_direct_race(
+                                                fresh,
+                                                retry_candidates,
+                                                &rendezvous,
+                                                per_attempt,
+                                                remaining(deadline),
+                                            )
+                                            .await;
+                                            for endpoint in race.failed {
+                                                crate::peer::probe::cool_down(
+                                                    fresh.node,
+                                                    endpoint.locator,
+                                                    crate::now_ms(),
+                                                );
+                                            }
+                                            if let Some((endpoint, (addr, stream))) = race.won {
+                                                crate::peer::probe::clear_cooldown(
+                                                    fresh.node,
+                                                    endpoint.locator,
+                                                );
+                                                return Some((Reached::Direct(addr), stream));
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(err) => tracing::debug!(
+                                    peer = %row.node.display(),
+                                    error = %err,
+                                    "peer serve: the peers file did not read back after a dead \
+                                     drop write, so the retry tried no addresses"
+                                ),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => tracing::debug!(
+                            peer = %row.node.display(),
+                            error = %err,
+                            "peer serve: dead drop fetch failed; the dial continues to a punch \
+                             exactly as it does today"
+                        ),
+                    }
+                }
+                Err(refusal) => tracing::debug!(
+                    peer = %row.node.display(),
+                    error = %refusal,
+                    "peer serve: dead drop store did not open; the dial continues as it does \
+                     today"
+                ),
+            }
+        }
+    }
+
     // Step 2 of the dial order: a hole punched straight through both routers.
     // Before the carry below and after the row's own endpoints, because a
     // direct socket that works is the better answer and a carry spends a THIRD
     // machine's bytes. It is bounded by the same borrow timeout everything
     // else here is: a punch waits for a slot boundary, so a dial with ten
     // seconds of patience takes the slots that fit inside it and no others.
-    match punch_dial(row, store, borrow_timeout_ms).await {
+    let punch_budget_ms = u64::try_from(remaining(deadline).as_millis()).unwrap_or(u64::MAX);
+    match punch_dial(row, store, punch_budget_ms).await {
         Ok((addr, stream)) => return Some((Reached::Punched(addr), stream)),
         Err(failure) => tracing::debug!(
             peer = %row.node.display(),
@@ -3216,6 +3387,84 @@ mod tests {
         assert!(
             elapsed < slow,
             "the race must not wait for the cancelled candidate's own clock: took {elapsed:?}"
+        );
+    }
+
+    /// **`clear_cooldowns_for_fetch` clears exactly the locators it is
+    /// handed, and no other.**
+    ///
+    /// Two locators on one peer, both cooling. Only one is passed as
+    /// `written`. Read back through [`crate::peer::probe::dial_order`], the
+    /// same public function the dead-drop retry calls: if the cleared
+    /// locator alone comes back, the clear was scoped; if the untouched
+    /// locator ALSO comes back, either nothing was cleared (so
+    /// `dial_order`'s own "every path is cooling, try them all anyway"
+    /// fallback fired) or the clear was a blanket one.
+    ///
+    /// Watched red: comment out the `clear_cooldown` call inside
+    /// `clear_cooldowns_for_fetch`. The untouched locator's cooldown then
+    /// never lifts, both locators stay cooling, `dial_order`'s fallback
+    /// returns BOTH, and this test's `assert!(!order.iter().any(...))` for
+    /// the untouched locator fails: `left: true` where the assertion
+    /// expects it absent.
+    #[test]
+    fn clear_cooldowns_for_fetch_only_clears_the_locators_it_is_given() {
+        let peer = PeerId([0x60; 32]);
+        let cleared_addr: SocketAddr = "127.0.0.1:1".parse().expect("a socket address");
+        let untouched_addr: SocketAddr = "127.0.0.1:2".parse().expect("a socket address");
+        let cleared_locator = Locator::Direct { addr: cleared_addr };
+        let untouched_locator = Locator::Direct {
+            addr: untouched_addr,
+        };
+
+        let until_ms = crate::now_ms() + 60_000;
+        crate::peer::probe::with_table(|table| {
+            table.cool_down(peer, cleared_locator, until_ms);
+            table.cool_down(peer, untouched_locator, until_ms);
+        })
+        .expect("the process-local path table is not poisoned");
+
+        let written = vec![Endpoint::direct(
+            cleared_addr,
+            crate::now_ms(),
+            crate::peer::config::EndpointSource::Drop,
+        )];
+        clear_cooldowns_for_fetch(peer, &written);
+
+        let mut row = PeerRow {
+            node: peer,
+            label: "clear-cooldowns-for-fetch-test".to_string(),
+            endpoints: Vec::new(),
+            added_at: 0,
+            allow: crate::peer::config::Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        };
+        row.observe_endpoint(Endpoint::direct(
+            cleared_addr,
+            1_000,
+            crate::peer::config::EndpointSource::Drop,
+        ));
+        row.observe_endpoint(Endpoint::direct(
+            untouched_addr,
+            1_000,
+            crate::peer::config::EndpointSource::Drop,
+        ));
+
+        let order = dial_order(&row);
+        assert!(
+            order
+                .iter()
+                .any(|endpoint| endpoint.locator == cleared_locator),
+            "the locator the fetch wrote must be dialable again: {order:?}"
+        );
+        assert!(
+            !order
+                .iter()
+                .any(|endpoint| endpoint.locator == untouched_locator),
+            "a locator the fetch did NOT write must stay excluded, not swept in by a blanket \
+             clear or by dial_order's own cooling-fallback: {order:?}"
         );
     }
 }

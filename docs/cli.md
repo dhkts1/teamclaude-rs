@@ -1096,7 +1096,7 @@ Grants or revokes one thing for one peer.
 | flag | type | default | effect |
 |---|---|---|---|
 | `<peer>` | positional | | the peer id, in its full wire form: the `node` field of `tcr peer ls --json`, never the short `tcr-…` form the text output prints |
-| `<grant>` | enum | | `gateway` (carry this peer's bytes out, blind), `forward` (relay to peers this Mac has pinned, transitive), `inspect` (accept this peer's requests and serve them here, reading them in full), `disclose` (send requests to this peer, letting it read them in full), `accept-move` (accept an account this peer moves here, the only grant under which a credential crosses a host boundary), `control-briefs` (tell this peer about this Mac's other peers, one hop out), `control-lendable` (tell this peer how much this Mac could lend), `control-diag` (tell this peer this Mac's build and boot id) |
+| `<grant>` | enum | | `gateway` (carry this peer's bytes out, blind), `forward` (relay to peers this Mac has pinned, transitive), `inspect` (accept this peer's requests and serve them here, reading them in full), `disclose` (send requests to this peer, letting it read them in full), `accept-move` (accept an account this peer moves here, the only grant under which a credential crosses a host boundary), `control-briefs` (tell this peer about this Mac's other peers, one hop out), `control-lendable` (tell this peer how much this Mac could lend), `control-diag` (tell this peer this Mac's build and boot id), `control-drop` (leave this peer this Mac's current address at the dead drop, and apply the address it leaves back; read on both sides, so a peer this Mac does not publish for does not get to write endpoints onto its row either) |
 | `<on\|off>` | positional | | grant or revoke |
 | `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
 
@@ -1191,6 +1191,39 @@ whichever protocol granted the mapping, and `on` starts a keeper and asks the ro
 flag used to be read once at boot, which meant `off` ran in the CLI, deleted over NAT-PMP, and
 the server's next renewal simply created the mapping again; `on` then reached nothing at all
 until the next restart.
+
+### `tcr peer drop <on\|off>`
+
+Turns the dead drop on or off: leaving a friend that has also moved this Mac's current address
+on an HTTPS surface you own, and reading theirs back. Off by default, the same shape as `tcr peer
+internet <on\|off>`.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<on\|off>` | positional | | turn the dead drop on or off |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+Turning it on with no store configured prints what to run first and changes nothing, the shape
+`tcr peer find on` uses when it has nothing to open a port with. Set a store first with `tcr peer
+drop-store set`, and grant each peer `control-drop` with `tcr peer allow <peer> control-drop on`
+(both Macs; see [peers.md](peers.md) § "Reaching a Mac off your network"). The running server
+re-reads this flag whenever the peers file's mtime moves, so no restart is needed.
+
+### `tcr peer drop-store <set\|show\|clear> [value]`
+
+Points the dead drop's store at an HTTPS surface, or shows or clears the one already set.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<set\|show\|clear>` | positional | | what to do |
+| `[value]` | positional | | `set` only: the URL template containing `{name}`, used for both the publish and the fetch |
+| `--token <token>` | string | none | `set` only: the bearer token. Give the flag with no value to read it from standard input instead, so it never enters this process's argv or the shell history |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+`set` refuses a template with no `{name}` placeholder at the command line, before it is ever
+written to the peers file. `show` prints the kind and the template with the token redacted as
+`set` or `not-set`, never the token itself. The store credential lives in `tcr-peers.json`, mode
+0600, the same as `networkKey` and every `rendezvousSecret`.
 
 ### `tcr peer pending`
 
@@ -1332,6 +1365,13 @@ order the mapping itself falls back through, and the line names which protocol a
 `reach: external-address: <addr> (nat-pmp)` or `reach: external-address: <addr> (upnp)`. A
 router that answers neither prints `reach: external-address: unavailable: <nat-pmp refusal>
 (nat-pmp), <upnp refusal> (upnp)`.
+
+It also prints the dead drop: `off` when `tcr peer drop` is off, or `on` with the current drop
+slot and, per pinned peer that holds `control-drop`, that peer's drop name for this slot (the
+name this Mac reads from, not the one it writes to) and the last time a fetch actually wrote a
+new address from it. There is no separate `tcr peer drop-status` verb; this readout is where it
+lives, on `--json` under a `deadDrop` key. Publishing itself leaves nothing on this Mac to read
+back: the write lands on the store, never on the peers file, so no last-publish time is printed.
 
 ### `tcr peer graph <--json\|--serve>`
 

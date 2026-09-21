@@ -1095,6 +1095,27 @@ async fn boot_peer_listener(
     // charged into the same state file.
     spawn_path_traffic(&state_path, shutdown, background);
 
+    // The dead drop's publisher, beside the internet keeper and started
+    // after the path-meter task above. Boot-time gated the way
+    // `file.dead_drop`'s own doc states: a Mac that never turned this on, or
+    // turned it on with no store, starts no task and its behaviour is
+    // bit-for-bit what it is today. `is_live` is the one check both this
+    // boot decision and `keep_drops_published`'s own re-read make, so a Mac
+    // that flips the switch off mid-boot stops publishing at the next tick
+    // without needing a second gate here.
+    if file.dead_drop.is_live() {
+        match file.dead_drop.open_store() {
+            Ok(store) => {
+                spawn_dead_drop_publisher(peers_path, store, key.id(), local, shutdown, background)
+            }
+            Err(refusal) => tracing::warn!(
+                error = %refusal,
+                "dead drop: peer.drop is on but the configured store would not open, so \
+                 nothing is published this boot"
+            ),
+        }
+    }
+
     // The reverse carriers, for a Mac nothing can dial.
     //
     // Asked against the two facts `reach` measures: a router mapping this
@@ -1485,6 +1506,50 @@ fn path_traffic_rows_match(
     a.sort();
     b.sort();
     a == b
+}
+
+/// How often the dead-drop publisher wakes and, for every friend it is
+/// allowed to, writes this Mac's current address.
+///
+/// [`crate::peer::drop::publish_for`] has no floor of its own: it writes
+/// every time it is called and allowed to, so this interval is the entire
+/// cadence. Five minutes, well above the store round trip and well under
+/// [`crate::peer::drop::MAX_RECORD_AGE`] (two slots, two hours), so a record
+/// this Mac holds is refreshed several times before the slot it published
+/// into stops being accepted.
+const DEAD_DROP_PUBLISH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Keep this Mac's dead drop current, for every friend `allow.control.drop`
+/// covers, until shutdown.
+///
+/// The loop is [`crate::peer::drop::keep_drops_published`]; what is here is
+/// the wiring, [`spawn_internet_keeper`]'s shape. The boot-time gate on
+/// [`crate::peer::config::DeadDropConfig::is_live`] is the caller's, not
+/// this function's, so a Mac that never turned the drop on never calls this
+/// at all.
+fn spawn_dead_drop_publisher(
+    peers_path: &std::path::Path,
+    store: crate::peer::drop::HttpsTemplateStore,
+    us: tcr_peer_wire::PeerId,
+    local: SocketAddr,
+    shutdown: &watch::Sender<bool>,
+    background: &mut Vec<JoinHandle<()>>,
+) {
+    let peers_path = peers_path.to_path_buf();
+    let mut stop = shutdown.subscribe();
+    background.push(tokio::spawn(supervise("peer-dead-drop", async move {
+        let publishing = crate::peer::drop::keep_drops_published(
+            store,
+            peers_path,
+            us,
+            local,
+            DEAD_DROP_PUBLISH_INTERVAL,
+        );
+        tokio::select! {
+            _ = publishing => {}
+            _ = stop.changed() => {}
+        }
+    })));
 }
 
 /// Keep this process's router mapping in step with `peer.internet`.
