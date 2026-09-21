@@ -781,17 +781,28 @@ impl DeadDropStore for HttpsTemplateStore {
 /// `listen` supplies the port for the IPv6 addresses, which
 /// `global_v6_addresses` does not carry: it answers which address the kernel
 /// would source a connection from, not which port this Mac listens on.
+///
+/// An observed self address is published only when its PORT is one this Mac
+/// actually accepts on: `listen.port()`, or a router mapping's external port.
+/// `observed_self_addresses` is the source address a peer saw this Mac arrive
+/// FROM, and this Mac dials out from an ephemeral port on every outbound
+/// connection, so that source address routinely carries a port nothing is
+/// listening on. Publishing it anyway spends a friend's dial budget on an
+/// address that was never going to answer; a Mac reached over a mapped or
+/// listening port instead teaches something that can.
 pub fn own_endpoints(listen: SocketAddr, peer: &PeerId) -> Vec<SocketAddr> {
     let mut found: Vec<SocketAddr> = Vec::new();
+    let mapped = crate::peer::reach::external_socket();
 
     for addr in crate::peer::reach::global_v6_addresses() {
         found.push(SocketAddr::new(IpAddr::V6(addr), listen.port()));
     }
-    if let Some(mapped) = crate::peer::reach::external_socket() {
+    if let Some(mapped) = mapped {
         found.push(mapped);
     }
+    let accepted_ports = [Some(listen.port()), mapped.map(|addr| addr.port())];
     for (node, addr) in crate::peer::reach::observed_self_addresses() {
-        if &node == peer {
+        if &node == peer && accepted_ports.contains(&Some(addr.port())) {
             found.push(addr);
         }
     }

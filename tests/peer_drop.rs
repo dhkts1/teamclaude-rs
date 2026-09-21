@@ -543,3 +543,47 @@ async fn a_record_from_a_revoked_peer_is_refused() {
          so the absence of an error here is not the assertion, the call count is: {log:?}"
     );
 }
+
+/// **Both halves, or the test passes for a function that returns nothing at
+/// all**: an observed self address on an EPHEMERAL port is not published,
+/// and one on this Mac's own listening port is.
+///
+/// `observed_self_addresses` is keyed one entry per peer, so the two halves
+/// need two peer ids rather than one call recording twice. Watched red:
+/// before the port filter, both addresses land in `own_endpoints`'s output
+/// and the first assertion fails, naming the ephemeral address that should
+/// never have been there.
+#[test]
+fn own_endpoints_publishes_only_ports_this_mac_actually_accepts_on() {
+    let listen: SocketAddr = "203.0.113.1:4433"
+        .parse()
+        .expect("a literal socket address from the documentation range");
+
+    let ephemeral_peer = peer_id(0x91);
+    let ephemeral_observed: SocketAddr = "203.0.113.2:54211"
+        .parse()
+        .expect("a literal socket address from the documentation range");
+    teamclaude_rs::peer::reach::remember_observed_self(ephemeral_peer, ephemeral_observed);
+
+    let listening_peer = peer_id(0x92);
+    let listening_observed: SocketAddr = "203.0.113.3:4433".parse().expect(
+        "a literal socket address from the documentation range, on this Mac's own listening \
+         port",
+    );
+    teamclaude_rs::peer::reach::remember_observed_self(listening_peer, listening_observed);
+
+    let ephemeral_result = drop::own_endpoints(listen, &ephemeral_peer);
+    assert!(
+        !ephemeral_result.contains(&ephemeral_observed),
+        "an observed self address on an ephemeral port, {ephemeral_observed}, must not be \
+         published: nothing on this Mac listens there, so a friend dialling it spends its \
+         budget on an address that cannot answer: {ephemeral_result:?}"
+    );
+
+    let listening_result = drop::own_endpoints(listen, &listening_peer);
+    assert!(
+        listening_result.contains(&listening_observed),
+        "an observed self address on this Mac's own listening port, {listening_observed}, \
+         must still be published: {listening_result:?}"
+    );
+}
