@@ -531,7 +531,7 @@ async fn a_record_from_a_revoked_peer_is_refused() {
     let fetched = drop::fetch_for(&store, &path, &friend, 1_758_240_000)
         .await
         .expect("a revoked peer is not an error, it is nothing to fetch");
-    assert_eq!(fetched, 0, "a revoked peer's drop writes nothing");
+    assert!(fetched.is_empty(), "a revoked peer's drop writes nothing");
 
     let log = calls
         .lock()

@@ -888,37 +888,45 @@ fn remember_fetched(friend: PeerId, slot: u64) {
 /// Fetch one friend's record and record what it holds.
 ///
 /// Tries [`accepted_slots`] of `current_slot(now_s)` in order and stops at
-/// the first record that opens. Returns how many endpoints were WRITTEN,
-/// which is not how many the record carried:
-/// [`crate::peer::discovery::admissible_drop_endpoints`] decides that.
+/// the first record that opens. Returns the endpoints that were WRITTEN, not
+/// how many the record carried: [`crate::peer::discovery::admissible_drop_endpoints`]
+/// decides that.
 ///
-/// A store that answers nothing is `Ok(0)`, not an error. Absence is never
-/// read as "the friend is gone".
+/// The caller that just re-taught a locator needs to know WHICH one, not
+/// merely that something changed: a dial that cooled that same locator down a
+/// moment earlier has to clear that cooldown and no other, or the fetch looks
+/// like it fetched nothing. A count would make the caller re-derive the list
+/// by re-reading the row and guessing which entries are new; returning the
+/// list itself is the one place that already knows it.
+///
+/// A store that answers nothing is `Ok(vec![])`, not an error. Absence is
+/// never read as "the friend is gone".
 ///
 /// **A peer this node does not pin is refused before the store is ever
 /// asked.** The row is read first; a missing row, or one with no
-/// `rendezvous_secret`, returns `Ok(0)` with zero calls made against `store`.
-/// A fetch racing `tcr peer forget` therefore touches neither the file (the
-/// eventual write goes through [`crate::peer::config::observe_endpoints`],
-/// which independently refuses to create a row) nor the store.
+/// `rendezvous_secret`, returns `Ok(vec![])` with zero calls made against
+/// `store`. A fetch racing `tcr peer forget` therefore touches neither the
+/// file (the eventual write goes through
+/// [`crate::peer::config::observe_endpoints`], which independently refuses to
+/// create a row) nor the store.
 pub async fn fetch_for<S: DeadDropStore + Sync>(
     store: &S,
     peers_path: &std::path::Path,
     friend: &PeerId,
     now_s: u64,
-) -> Result<usize> {
+) -> Result<Vec<Endpoint>> {
     let slot = current_slot(now_s);
     if fetched_this_slot(friend, slot) {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let file = crate::peer::config::read_or_default(peers_path)
         .context("dead drop: the peers file did not read, so nothing was fetched")?;
     let Some(row) = file.peers.iter().find(|row| &row.node == friend) else {
-        return Ok(0);
+        return Ok(Vec::new());
     };
     let Some(secret) = row.rendezvous_secret else {
-        return Ok(0);
+        return Ok(Vec::new());
     };
 
     remember_fetched(*friend, slot);
@@ -959,14 +967,14 @@ pub async fn fetch_for<S: DeadDropStore + Sync>(
             .collect();
         let admissible = crate::peer::discovery::admissible_drop_endpoints(row, &learned);
         if admissible.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         return match crate::peer::config::observe_endpoints(peers_path, friend, &admissible)? {
-            Observed::Written { added } => Ok(added),
-            Observed::NothingDialable | Observed::NoRow => Ok(0),
+            Observed::Written { .. } => Ok(admissible),
+            Observed::NothingDialable | Observed::NoRow => Ok(Vec::new()),
         };
     }
-    Ok(0)
+    Ok(Vec::new())
 }
 
 /// Keep every switched-on friend's drop current, until shutdown.
