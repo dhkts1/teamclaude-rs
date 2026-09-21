@@ -1091,6 +1091,10 @@ async fn boot_peer_listener(
     // file this process already owns.
     spawn_browse(peers_path, &state_path, shutdown, background);
 
+    // The path traffic summary, on its own schedule, writing what the meter
+    // charged into the same state file.
+    spawn_path_traffic(&state_path, shutdown, background);
+
     // The reverse carriers, for a Mac nothing can dial.
     //
     // Asked against the two facts `reach` measures: a router mapping this
@@ -1369,6 +1373,118 @@ fn spawn_browse(
             _ = stop.changed() => {}
         }
     })));
+}
+
+/// Sum this process's path meter into `peer-state.json`, on
+/// [`crate::peer::tunnel::PATH_TRAFFIC_SUM_INTERVAL`], for as long as this
+/// process serves.
+///
+/// A twin of [`spawn_browse`]: `supervise`, a ticker with
+/// `MissedTickBehavior::Skip`, `tokio::select!` against `stop.changed()`. It
+/// needs only `state_path`, because the meter
+/// [`crate::peer::tunnel::path_meter`] reads is process-global rather than
+/// threaded from boot; nothing here charges it, three other call sites do.
+///
+/// The byte cap itself stays in memory: see [`crate::peer::tunnel::TunnelBudget`]'s
+/// own doc for why a restart resetting it is the design, not a gap this task
+/// is meant to close.
+///
+/// Each wake calls [`path_traffic_tick`], the one place that decides whether
+/// this wake's rows are worth a write.
+fn spawn_path_traffic(
+    state_path: &std::path::Path,
+    shutdown: &watch::Sender<bool>,
+    background: &mut Vec<JoinHandle<()>>,
+) {
+    let state_path = state_path.to_path_buf();
+    let mut stop = shutdown.subscribe();
+    background.push(tokio::spawn(supervise("peer-path-traffic", async move {
+        let summing = async move {
+            let mut ticker = tokio::time::interval(crate::peer::tunnel::PATH_TRAFFIC_SUM_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_written: Vec<crate::peer::state::PathTraffic> = Vec::new();
+            loop {
+                ticker.tick().await;
+                path_traffic_tick(&state_path, &mut last_written);
+            }
+        };
+        tokio::select! {
+            _ = summing => {}
+            _ = stop.changed() => {}
+        }
+    })));
+}
+
+/// One wake of [`spawn_path_traffic`]'s loop, and the whole of its wiring: sum
+/// the process-global meter, and write it to `state_path` only when the rows
+/// changed since `last_written`, updating `last_written` on a landed write.
+///
+/// A named function called from exactly one place rather than inlined in the
+/// loop above, so a test can drive the production wire directly instead of
+/// standing up a whole task and waiting on its ticker.
+///
+/// "Changed" ignores `updated_at_ms`: [`path_traffic_rows_match`] compares
+/// peer, locator, `bytes_last_hour` and `tokens_last_hour`, because
+/// `updated_at_ms` is the instant this call summed at and differs on every
+/// wake by construction. A path whose traffic rolled off since the last write
+/// still counts as changed: [`crate::peer::tunnel::PathMeter::rows`] trims the
+/// window first, so a stale row comes back with zeroes, and zero is a
+/// different fact from the figure last written.
+fn path_traffic_tick(
+    state_path: &std::path::Path,
+    last_written: &mut Vec<crate::peer::state::PathTraffic>,
+) {
+    let now_ms = crate::now_ms();
+    let rows = match crate::peer::tunnel::path_meter().lock() {
+        Ok(mut meter) => meter.rows(now_ms),
+        Err(_) => {
+            tracing::warn!(
+                "peer path traffic: the path meter's lock is poisoned, so this wake summed \
+                 nothing"
+            );
+            return;
+        }
+    };
+    if path_traffic_rows_match(&rows, last_written) {
+        return;
+    }
+    match crate::peer::state::save_path_traffic(state_path, &rows) {
+        Ok(()) => *last_written = rows,
+        Err(err) => tracing::warn!(
+            path = %state_path.display(),
+            error = %err,
+            "peer path traffic: this wake's totals did not write, so peer-state.json is behind \
+             this process's meter"
+        ),
+    }
+}
+
+/// Whether `rows` says nothing beyond what `last_written` already says,
+/// ignoring `updated_at_ms` for [`path_traffic_tick`]'s reason.
+///
+/// Order-independent: [`crate::peer::tunnel::PathMeter::rows`] iterates a set,
+/// so two sweeps over the same paths are not guaranteed to list them in the
+/// same order.
+fn path_traffic_rows_match(
+    rows: &[crate::peer::state::PathTraffic],
+    last_written: &[crate::peer::state::PathTraffic],
+) -> bool {
+    if rows.len() != last_written.len() {
+        return false;
+    }
+    let key = |row: &crate::peer::state::PathTraffic| {
+        (
+            row.peer.to_wire(),
+            format!("{:?}", row.locator),
+            row.bytes_last_hour,
+            row.tokens_last_hour,
+        )
+    };
+    let mut a: Vec<_> = rows.iter().map(key).collect();
+    let mut b: Vec<_> = last_written.iter().map(key).collect();
+    a.sort();
+    b.sort();
+    a == b
 }
 
 /// Keep this process's router mapping in step with `peer.internet`.
@@ -3047,6 +3163,124 @@ mod tests {
         assert_eq!(
             resolved.file_name(),
             crate::peer::config::default_path().file_name()
+        );
+    }
+
+    /// Serializes every test below that reads [`crate::peer::tunnel::path_meter`]'s
+    /// full row set.
+    ///
+    /// [`crate::peer::tunnel::PathMeter::rows`] returns every (peer, path)
+    /// the PROCESS has ever charged, not one test's own, because that is
+    /// exactly the process-wide meter a real serving process has exactly one
+    /// of. Two of these tests charging it and reading it back concurrently
+    /// would see each other's rows; this lock makes the process-wide meter
+    /// behave, for the length of one test, the way it behaves in a real
+    /// process with exactly one path-traffic task.
+    fn path_traffic_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// [`path_traffic_tick`] drives the production writer: a charge on the
+    /// process-global meter reaches a temp state file after one call.
+    ///
+    /// Watch it fail by commenting out this test's own call to
+    /// [`path_traffic_tick`] below: the state file then never exists, since
+    /// nothing else in this test writes it. That is the same failure a
+    /// commented-out `save_path_traffic` call inside `path_traffic_tick`
+    /// itself would produce, which is the one this test exists to catch: see
+    /// this unit's report for the forced-red run against the real function
+    /// body.
+    #[test]
+    fn path_traffic_tick_writes_a_real_charge_to_the_state_file() {
+        let _guard = path_traffic_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-server-path-traffic-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let state_path = dir.join("tcr-peer-state.json");
+
+        let peer = tcr_peer_wire::PeerId([9_u8; 32]);
+        let path = crate::peer::config::Locator::Direct {
+            addr: "127.0.0.1:9321".parse().expect("a socket address"),
+        };
+        let now_ms = crate::now_ms();
+        match crate::peer::tunnel::path_meter().lock() {
+            Ok(mut meter) => meter.charge_bytes(&peer, path, 4_096, now_ms),
+            Err(_) => panic!("the path meter's lock is poisoned before this test could charge it"),
+        }
+
+        let mut last_written: Vec<crate::peer::state::PathTraffic> = Vec::new();
+        path_traffic_tick(&state_path, &mut last_written);
+
+        let state = crate::peer::state::load(&state_path, now_ms).expect("read the state file");
+        let row = state
+            .path_traffic
+            .iter()
+            .find(|row| row.peer == peer && row.locator == path)
+            .expect("the charge landed as a row");
+        assert_eq!(row.bytes_last_hour, 4_096, "the charge is the row's figure");
+        assert!(
+            last_written
+                .iter()
+                .any(|row| row.peer == peer && row.locator == path && row.bytes_last_hour == 4_096),
+            "the tick records what it wrote, for the next wake's comparison: {last_written:?}"
+        );
+    }
+
+    /// A second tick with nothing new charged does not touch the file: the
+    /// mtime is untouched, which is what [`path_traffic_rows_match`] exists to
+    /// buy.
+    ///
+    /// Watch it fail by deleting the `path_traffic_rows_match` guard from
+    /// [`path_traffic_tick`]: the second tick then writes again, moving the
+    /// mtime for no change in the rows.
+    #[test]
+    fn a_second_tick_with_nothing_new_does_not_move_the_files_mtime() {
+        let _guard = path_traffic_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-server-path-traffic-quiet-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let state_path = dir.join("tcr-peer-state.json");
+
+        let peer = tcr_peer_wire::PeerId([10_u8; 32]);
+        let path = crate::peer::config::Locator::Direct {
+            addr: "127.0.0.1:9322".parse().expect("a socket address"),
+        };
+        let now_ms = crate::now_ms();
+        match crate::peer::tunnel::path_meter().lock() {
+            Ok(mut meter) => meter.charge_bytes(&peer, path, 1_024, now_ms),
+            Err(_) => panic!("the path meter's lock is poisoned before this test could charge it"),
+        }
+
+        let mut last_written: Vec<crate::peer::state::PathTraffic> = Vec::new();
+        path_traffic_tick(&state_path, &mut last_written);
+        let first_write = std::fs::metadata(&state_path)
+            .expect("the first tick wrote the file")
+            .modified()
+            .expect("the file has an mtime");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        path_traffic_tick(&state_path, &mut last_written);
+        let second_write = std::fs::metadata(&state_path)
+            .expect("the file still exists")
+            .modified()
+            .expect("the file has an mtime");
+
+        assert_eq!(
+            first_write, second_write,
+            "the second tick charged nothing new, so it must not have written again"
         );
     }
 }
