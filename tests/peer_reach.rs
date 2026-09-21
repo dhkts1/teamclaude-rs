@@ -1822,6 +1822,65 @@ async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {
     );
 }
 
+/// **The gate for the race itself, through the production dial**: a row with
+/// two LIVE loopback listeners must come back from [`dial_order`] with BOTH
+/// endpoints after the dial, because whichever one lost the race was
+/// cancelled, not refused.
+///
+/// Both listeners are live on purpose: a dead second endpoint would leave the
+/// race's own semantics unproven, since a candidate that fails outright is
+/// supposed to be cooled and its absence from the next order would not tell
+/// the two cases apart. Here neither endpoint is ever refused, so if EITHER
+/// went missing from the next order, that would be the race cooling a
+/// candidate it only cancelled.
+///
+/// Watched red: make the race cool down every candidate it started (both the
+/// winner and whatever it did not use), not only the ones whose own attempt
+/// answered nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_that_races_two_live_endpoints_does_not_cool_the_one_it_did_not_use() {
+    let node = tcr_peer_wire::PeerId([0x36; 32]);
+
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the first live listener");
+    let first_addr = first.local_addr().expect("its address");
+
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the second live listener");
+    let second_addr = second.local_addr().expect("its address");
+
+    let mut row = row_at(node, first_addr);
+    row.observe_endpoint(peer_config::Endpoint::direct(
+        second_addr,
+        2_000,
+        peer_config::EndpointSource::Paired,
+    ));
+
+    let reached = teamclaude_rs::peer::serve::dial_peer_within(&row, 3_000)
+        .await
+        .map(|(addr, _stream)| addr);
+    assert!(
+        reached == Some(first_addr) || reached == Some(second_addr),
+        "one of the two live listeners must answer the race: {reached:?}"
+    );
+
+    let order = teamclaude_rs::peer::serve::dial_order(&row);
+    let remaining: Vec<SocketAddr> = order
+        .iter()
+        .filter_map(peer_config::Endpoint::direct_addr)
+        .collect();
+    assert!(
+        remaining.contains(&first_addr) && remaining.contains(&second_addr),
+        "whichever endpoint the race did not use was cancelled, not refused, and must not be \
+         cooling: {remaining:?}"
+    );
+
+    drop(first);
+    drop(second);
+}
+
 /// Run `tcr peer internet on|off` against a temp peers file: `(stdout, stderr, ok)`.
 fn run_internet(peers: &std::path::Path, state: &str) -> (String, String, bool) {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
