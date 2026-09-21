@@ -2230,8 +2230,10 @@ pub async fn dial_peer_within(
             continue;
         };
         if let Some(reached) = try_direct_endpoint(row, addr, &rendezvous, per_attempt).await {
+            crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
             return Some(reached);
         }
+        crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
     }
     None
 }
@@ -2330,8 +2332,10 @@ pub async fn dial_peer_reaching_within(
                 if let Some((reached, stream)) =
                     try_direct_endpoint(row, addr, &rendezvous, per_attempt).await
                 {
+                    crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
                     return Some((Reached::Direct(reached), stream));
                 }
+                crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
             }
             // Both go out through another Mac and by the same call: a
             // `Reverse` endpoint names the friend holding a carrier for this
@@ -2343,8 +2347,10 @@ pub async fn dial_peer_reaching_within(
                 if let Some(stream) =
                     forward_through(&node, &row.node, store, borrow_timeout_ms).await
                 {
+                    crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
                     return Some((Reached::Via(node), stream));
                 }
+                crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
             }
         }
     }

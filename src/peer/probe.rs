@@ -29,6 +29,20 @@
 //! [`crate::peer::probe::ProbeOutcome::NotSupported`] is its own answer, it
 //! records NOTHING, and [`crate::peer::probe::probe_session`] stops probing that
 //! peer for the rest of that session.
+//!
+//! # A cooldown is not a failure detector either
+//!
+//! [`PathTable::cool_down`] is the one exception to "nothing here evicts a
+//! row", and it is a narrower thing than that sentence guards against: an
+//! endpoint that just failed to answer a DIAL, not a probe, is skipped by
+//! [`dial_order`] for [`PATH_RETRY_COOLDOWN`], while another endpoint on the
+//! row is not cooling. It never empties a row. When every endpoint is
+//! cooling, [`dial_order`] returns the row whole, on the same rule
+//! [`PathsConfig::max_loss_pct`] already states for loss: a path that is the
+//! only path home is still tried. Nothing is declared dead, nothing is
+//! evicted, and no work is rescheduled away from a Mac; a cooling endpoint is
+//! dialled again the moment its window closes or the moment it is the last
+//! one left.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -52,6 +66,14 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long one probe waits for its ack before it is recorded as loss.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a dial that failed to reach one endpoint skips that same
+/// endpoint, while another endpoint on the row is not cooling.
+///
+/// Matches [`PROBE_INTERVAL`] on purpose: a path that comes back is picked up
+/// by the next measurement rather than by a dial that keeps paying the
+/// connect timeout to find out.
+pub const PATH_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// How many samples the EWMA remembers.
 ///
@@ -193,6 +215,24 @@ fn rtt_key(rtt_ms: Option<f64>) -> u32 {
     })
 }
 
+/// One endpoint's cooldown: the instant [`dial_order`] may try it again.
+///
+/// Keyed by peer AND locator, on the same rule [`PathStat`] states: the same
+/// peer reached directly and through a forwarder are two paths, and one dead
+/// endpoint must not silence the other. Process-local only, so no
+/// `Serialize`/`Deserialize`: see the module's dial-loop callers for why this
+/// never reaches the peers file or the state file.
+#[derive(Debug, Clone, PartialEq)]
+struct PathCooldown {
+    /// The peer at the far end.
+    peer: PeerId,
+    /// The path that failed.
+    locator: Locator,
+    /// Unix milliseconds. Before this instant, [`dial_order`] skips the path
+    /// unless it is the only one left on the row.
+    until_ms: i64,
+}
+
 /// The policy and the measurements together: everything the dial order reads.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PathTable {
@@ -201,12 +241,50 @@ pub struct PathTable {
     /// One row per (peer, locator) this process has probed, or restored from
     /// the state file at boot.
     pub stats: Vec<PathStat>,
+    /// One row per (peer, locator) whose last dial failed and has not yet
+    /// answered again. Never persisted: see [`PathCooldown`].
+    cooldowns: Vec<PathCooldown>,
 }
 
 impl PathTable {
     /// A table with the operator's policy and no measurements yet.
     pub fn new(config: PathsConfig, stats: Vec<PathStat>) -> Self {
-        Self { config, stats }
+        Self {
+            config,
+            stats,
+            cooldowns: Vec::new(),
+        }
+    }
+
+    /// Record that `locator` on `peer`'s row just failed to answer a dial: it
+    /// is skipped by [`dial_order`] until `until_ms`, unless it becomes the
+    /// only endpoint left on the row.
+    pub fn cool_down(&mut self, peer: PeerId, locator: Locator, until_ms: i64) {
+        match self
+            .cooldowns
+            .iter_mut()
+            .find(|row| row.peer == peer && row.locator == locator)
+        {
+            Some(row) => row.until_ms = until_ms,
+            None => self.cooldowns.push(PathCooldown {
+                peer,
+                locator,
+                until_ms,
+            }),
+        }
+    }
+
+    /// Clear a cooldown: `locator` on `peer`'s row just answered.
+    pub fn clear_cooldown(&mut self, peer: &PeerId, locator: &Locator) {
+        self.cooldowns
+            .retain(|row| !(&row.peer == peer && &row.locator == locator));
+    }
+
+    /// Whether `locator` on `peer`'s row is inside its cooldown at `now_ms`.
+    fn is_cooling(&self, peer: &PeerId, locator: &Locator, now_ms: i64) -> bool {
+        self.cooldowns
+            .iter()
+            .any(|row| &row.peer == peer && &row.locator == locator && row.until_ms > now_ms)
     }
 
     /// The row for one path, if this process has measured it.
@@ -423,14 +501,46 @@ fn kind_rank(endpoint: &Endpoint, config: &PathsConfig) -> u8 {
     }
 }
 
-/// [`order_endpoints`] against the process-local table, which is what
+/// Drop the endpoints in `order` that are cooling on `table` at `now_ms`,
+/// **except when every one of them is**, in which case `order` comes back
+/// whole.
+///
+/// Its own small function, apart from [`order_endpoints`], so a test can
+/// drive the never-strand rule without a dial or the process-local table:
+/// [`PathsConfig::max_loss_pct`]'s doc already settled this question for
+/// loss, "a lossy path that is the only path is still the way home", and a
+/// cooling row is the same case. `order_endpoints` stays a pure sort; this is
+/// the filter [`dial_order`] applies to its answer.
+pub fn drop_cooling_endpoints(
+    order: Vec<Endpoint>,
+    peer: &PeerId,
+    table: &PathTable,
+    now_ms: i64,
+) -> Vec<Endpoint> {
+    let awake: Vec<Endpoint> = order
+        .iter()
+        .filter(|endpoint| !table.is_cooling(peer, &endpoint.locator, now_ms))
+        .cloned()
+        .collect();
+    if awake.is_empty() {
+        order
+    } else {
+        awake
+    }
+}
+
+/// [`order_endpoints`] against the process-local table, with cooling
+/// endpoints dropped by [`drop_cooling_endpoints`], which is what
 /// [`crate::peer::serve::dial_order`] calls.
 ///
 /// A poisoned lock falls back to the policy defaults and SAYS SO: the dial has
 /// to produce an order, the default order is the one every build before this
 /// module used, and a silent fallback is the thing this codebase does not do.
 pub fn dial_order(row: &PeerRow) -> Vec<Endpoint> {
-    match with_table(|table| order_endpoints(row, table)) {
+    match with_table(|table| {
+        let order = order_endpoints(row, table);
+        drop_cooling_endpoints(order, &row.node, table, crate::now_ms())
+    }) {
         Ok(order) => order,
         Err(err) => {
             tracing::warn!(
@@ -441,6 +551,38 @@ pub fn dial_order(row: &PeerRow) -> Vec<Endpoint> {
             );
             order_endpoints(row, &PathTable::default())
         }
+    }
+}
+
+/// Record, in the process-local table, that `locator` on `peer`'s row just
+/// failed a dial: [`dial_order`] skips it for [`PATH_RETRY_COOLDOWN`].
+///
+/// A poisoned lock is logged and otherwise ignored: losing one path's
+/// cooldown is not worth failing the dial that just called this, and
+/// [`dial_order`] already falls back to the same defaults when the lock
+/// cannot be read.
+pub fn cool_down(peer: PeerId, locator: Locator, now_ms: i64) {
+    let window_ms = i64::try_from(PATH_RETRY_COOLDOWN.as_millis()).unwrap_or(i64::MAX);
+    if let Err(err) =
+        with_table(|table| table.cool_down(peer, locator, now_ms.saturating_add(window_ms)))
+    {
+        tracing::warn!(
+            peer = %peer.display(),
+            error = %err,
+            "peer probe: could not record a path cooldown"
+        );
+    }
+}
+
+/// Clear a cooldown, in the process-local table: `locator` on `peer`'s row
+/// just answered a dial.
+pub fn clear_cooldown(peer: PeerId, locator: Locator) {
+    if let Err(err) = with_table(|table| table.clear_cooldown(&peer, &locator)) {
+        tracing::warn!(
+            peer = %peer.display(),
+            error = %err,
+            "peer probe: could not clear a path cooldown"
+        );
     }
 }
 

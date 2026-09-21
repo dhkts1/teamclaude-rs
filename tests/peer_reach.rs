@@ -1747,6 +1747,81 @@ async fn with_no_secret_for_the_pair_nothing_but_the_recorded_endpoint_is_tried(
     );
 }
 
+/// **The gate for the retry backoff, through the production dial**: a dead
+/// endpoint that just failed is cooled down, and the next order read from the
+/// same row drops it while the endpoint that answered is still there.
+///
+/// No port secret is registered for this row, so the dial tries only the
+/// row's own two recorded endpoints and stops there, which is what keeps this
+/// deterministic: `with_no_secret_for_the_pair_nothing_but_the_recorded_endpoint_is_tried`
+/// above is the control for that half. The dead endpoint is observed AFTER
+/// the live one, so it sorts first on `dial_order`'s newest-first tiebreak
+/// and is the one the dial tries and fails before it reaches the live
+/// listener.
+///
+/// This is the half the compile-error red in `probe.rs` could not prove:
+/// both `PathTable::cool_down` and `probe::drop_cooling_endpoints` are
+/// exercised directly by unit tests in `tests/peer_probe.rs`, so a dial that
+/// forgot to call `peer::probe::cool_down` on failure would still leave those
+/// green. Only a real dial that writes into the INSTALLED table and a second
+/// read of `dial_order` against that same table can show the wiring works.
+///
+/// Watched red: comment out the two `crate::peer::probe::cool_down(...)`
+/// calls in `src/peer/serve.rs` and the dead endpoint is still in the second
+/// order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_that_fails_one_endpoint_cools_it_and_the_next_order_drops_it() {
+    let node = tcr_peer_wire::PeerId([0x35; 32]);
+    // Deliberately no `reach::remember_port_secret`: this process holds no
+    // rendezvous ports for this pair, so the dial tries only the row's two
+    // recorded endpoints.
+
+    let listening = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a live loopback listener");
+    let live = listening.local_addr().expect("its address");
+    let accepting = tokio::spawn(async move { listening.accept().await.map(|(_, from)| from) });
+
+    let dead = a_closed_loopback_port().await;
+
+    let mut row = row_at(node, live);
+    row.observe_endpoint(peer_config::Endpoint::direct(
+        dead,
+        2_000,
+        peer_config::EndpointSource::Paired,
+    ));
+
+    let reached = teamclaude_rs::peer::serve::dial_peer_within(&row, 3_000)
+        .await
+        .map(|(addr, _stream)| addr);
+    assert_eq!(
+        reached,
+        Some(live),
+        "the dead endpoint is tried first (it is the newer observation) and fails, so the \
+         dial must fall through to the live listener"
+    );
+    accepting
+        .await
+        .expect("the accept task")
+        .expect("the listener accepted the dial");
+
+    let order = teamclaude_rs::peer::serve::dial_order(&row);
+    let remaining: Vec<SocketAddr> = order
+        .iter()
+        .filter_map(peer_config::Endpoint::direct_addr)
+        .collect();
+    assert!(
+        !remaining.contains(&dead),
+        "the endpoint that just failed a dial must be cooling and dropped from the next \
+         order: {remaining:?}"
+    );
+    assert!(
+        remaining.contains(&live),
+        "and the endpoint that answered must still be there, with its own cooldown cleared: \
+         {remaining:?}"
+    );
+}
+
 /// Run `tcr peer internet on|off` against a temp peers file: `(stdout, stderr, ok)`.
 fn run_internet(peers: &std::path::Path, state: &str) -> (String, String, bool) {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tcr"))
