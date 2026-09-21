@@ -169,6 +169,13 @@ if [ -z "$a_id" ] || [ -z "$b_id" ]; then
 fi
 pass "$A sees $B as $b_id, $B sees $A as $a_id"
 
+# `tcr peer reach --json` prints the SHORT form of a node id
+# (`short_of()`, `tests/containers/lib/netlab.sh`), not the full wire id
+# `pinned_wire_id` reads above, so the two comparisons below key on the short
+# form. Without this the comparison can never match on any run, red or
+# green, and `lastFetchedAtMs` reads empty always.
+a_short_id="$(short_of "$a_id")"
+
 # --- greet: the only way either row gets a rendezvous_secret ---------------
 greeted="$(nx "$A" tcr peer hello "$b_id" --peers "$PEERS" 2>&1 || true)"
 case "$greeted" in
@@ -322,7 +329,7 @@ before_fetch="$(printf '%s' "$before_json" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for p in data.get('deadDrop', {}).get('peers', []):
-    if p.get('node') == '$a_id':
+    if p.get('node') == '$a_short_id':
         print(p.get('lastFetchedAtMs'))
         break
 else:
@@ -375,7 +382,7 @@ after_fetch="$(printf '%s' "$after_json" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for p in data.get('deadDrop', {}).get('peers', []):
-    if p.get('node') == '$a_id':
+    if p.get('node') == '$a_short_id':
         print(p.get('lastFetchedAtMs'))
         break
 else:
