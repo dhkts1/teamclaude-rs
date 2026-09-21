@@ -1742,7 +1742,7 @@ impl Manager {
     /// itself stays open and pooled, unlike a connection-level death, which
     /// reqwest evicts from the pool as part of raising the error. Left alone,
     /// every retry and every rotation would keep checking out that same
-    /// broken connection — the live incident this exists to fix: 477
+    /// broken connection, the live incident this exists to fix: 477
     /// stream-reset failures across every account over 11 minutes, cured only
     /// by a full process restart, because nothing in the ladder ever swapped
     /// the connection out. This is [`Self::recycle_client`] under its own
@@ -1752,7 +1752,7 @@ impl Manager {
         tracing::info!(
             account_index = idx,
             account = self.account_name(idx).as_deref().unwrap_or("?"),
-            "retiring the upstream connection after an HTTP/2 stream reset — \
+            "retiring the upstream connection after an HTTP/2 stream reset, \
              the connection survives the reset, so the retry needs a fresh one"
         );
         self.recycle_client(idx);
