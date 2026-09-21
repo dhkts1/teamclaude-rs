@@ -99,6 +99,8 @@
 //! own path. `tests/peer_lease.rs` measures it against a tightened per-org
 //! bucket rather than asserting it in prose.
 
+use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +110,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use tcr_peer_wire::{
     Control, Hello, Lease, LeaseRefusal, PeerId, StreamHeader, StreamKind, Window, MAX_FRAME_BYTES,
@@ -2184,6 +2187,17 @@ fn borrow_timeout_default_ms() -> u64 {
 /// own connect timeout, which on a route that blackholes is over a minute.
 const DIAL_ATTEMPTS_PER_ENDPOINT: u32 = 3;
 
+/// How long a dial waits for one direct candidate to answer before starting
+/// the next one, without cancelling the one already in flight.
+///
+/// RFC 8305 section 5 ("Happy Eyeballs Version 2") names 250 milliseconds as
+/// the default Connection Attempt Delay, and this is that figure, not a
+/// number this codebase chose. It is deliberately not an operator knob: a
+/// value this small is not a timeout an operator would ever want to reach
+/// for, and exposing it would invite tuning a number that already has a
+/// settled answer.
+const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
 /// [`dial_peer_with_endpoint`] with the operator's borrow timeout handed in.
 ///
 /// # What this adds over dialling the recorded endpoints
@@ -2215,8 +2229,9 @@ pub async fn dial_peer_within(
 ) -> Option<(SocketAddr, PeerStream)> {
     let per_attempt = per_attempt_bound(borrow_timeout_ms);
     let rendezvous = crate::peer::reach::rendezvous_ports(&row.node, now_unix_seconds());
+    let mut candidates = Vec::new();
     for endpoint in dial_order(row) {
-        let Some(addr) = endpoint.direct_addr() else {
+        if endpoint.direct_addr().is_none() {
             // Logged rather than dropped silently, because "the row had a way
             // back and nothing used it" is exactly the failure the forward-dial
             // path exists to end. A caller here cannot follow it:
@@ -2228,14 +2243,17 @@ pub async fn dial_peer_within(
                  handed no peers file to read the forwarder's row from; skipping it"
             );
             continue;
-        };
-        if let Some(reached) = try_direct_endpoint(row, addr, &rendezvous, per_attempt).await {
-            crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
-            return Some(reached);
         }
+        candidates.push(endpoint);
+    }
+
+    let race = run_direct_race(row, candidates, &rendezvous, per_attempt, borrow_timeout_ms).await;
+    for endpoint in race.failed {
         crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
     }
-    None
+    let (endpoint, reached) = race.won?;
+    crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
+    Some(reached)
 }
 
 /// Each attempt's share of the borrow timeout. See
@@ -2274,6 +2292,142 @@ async fn try_direct_endpoint(
         }
     }
     None
+}
+
+/// The two halves a candidate race learns: who won, and who was asked and
+/// came back with nothing.
+///
+/// Both in one value rather than a bool plus an out-parameter: a caller that
+/// only wrote the winner's outcome would have to invent its own second pass
+/// over the candidates to find out which ones to cool down, and a second pass
+/// invented at the call site is a second answer to a question this type
+/// already has.
+struct RaceOutcome<C, T> {
+    /// The candidate that answered first, with what its own attempt returned.
+    won: Option<(C, T)>,
+    /// Candidates whose own attempt completed and returned nothing. A
+    /// candidate still running when another won is not in here: it was
+    /// dropped, not refused.
+    failed: Vec<C>,
+}
+
+/// Runs one attempt per candidate, starting the next `stagger` after the one
+/// before it without waiting for an answer first, and returns the moment any
+/// one attempt answers.
+///
+/// Every attempt still in flight at that moment is DROPPED, which is what
+/// cancels it: `FuturesUnordered` holds each attempt's future and dropping
+/// the whole race function's stack drops every future it owns. Nothing here
+/// is ever `tokio::spawn`ed, because a spawned task keeps running, and
+/// answering, after its handle is dropped, and "the rest are dropped" would
+/// stop being true the moment one candidate outlived this function.
+///
+/// A candidate whose own attempt completes and returns [`None`] before
+/// another candidate wins goes into [`RaceOutcome::failed`]; a candidate
+/// still running when the race ends does not, because it was cancelled, not
+/// refused.
+///
+/// Generic over the candidate (`C`), the attempt (`F`) and what it returns
+/// (`T`), so the two production callers can hand this [`Endpoint`] values
+/// without this function knowing what an endpoint is, and so a test can
+/// drive it with scripted delays and no sockets at all.
+async fn race_candidates<C, F, Fut, T>(
+    candidates: Vec<C>,
+    stagger: Duration,
+    mut attempt: F,
+) -> RaceOutcome<C, T>
+where
+    C: Clone,
+    F: FnMut(C) -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    async fn run_one<C, T>(
+        candidate: C,
+        attempt: impl Future<Output = Option<T>>,
+    ) -> (C, Option<T>) {
+        (candidate, attempt.await)
+    }
+
+    let mut queued: VecDeque<C> = candidates.into();
+    let mut running = FuturesUnordered::new();
+    let mut failed = Vec::new();
+
+    let Some(first) = queued.pop_front() else {
+        return RaceOutcome { won: None, failed };
+    };
+    running.push(run_one(first.clone(), attempt(first)));
+
+    let mut next_start = if queued.is_empty() {
+        None
+    } else {
+        Some(Box::pin(tokio::time::sleep(stagger)))
+    };
+
+    loop {
+        tokio::select! {
+            Some((candidate, outcome)) = running.next(), if !running.is_empty() => {
+                match outcome {
+                    Some(value) => return RaceOutcome { won: Some((candidate, value)), failed },
+                    None => {
+                        failed.push(candidate);
+                        if running.is_empty() && next_start.is_none() {
+                            return RaceOutcome { won: None, failed };
+                        }
+                    }
+                }
+            }
+            () = async {
+                match next_start.as_mut() {
+                    Some(sleep) => sleep.await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if next_start.is_some() => {
+                if let Some(candidate) = queued.pop_front() {
+                    running.push(run_one(candidate.clone(), attempt(candidate)));
+                }
+                next_start = if queued.is_empty() {
+                    None
+                } else {
+                    Some(Box::pin(tokio::time::sleep(stagger)))
+                };
+            }
+        }
+    }
+}
+
+/// [`race_candidates`] over `candidates`' own [`try_direct_endpoint`]
+/// attempts, staggered by [`CONNECTION_ATTEMPT_DELAY`] and bounded as a whole
+/// by `borrow_timeout_ms`.
+///
+/// The bound is on the race, not on any one attempt: a row with ten
+/// endpoints must not outlive the caller's patience just because staggered
+/// attempts made ten of them cheap to start. On a timeout nothing is known to
+/// have failed as opposed to merely being cut off mid-attempt, so nothing is
+/// reported failed: the caller cools down what [`RaceOutcome::failed`] names
+/// and nothing else.
+async fn run_direct_race(
+    row: &PeerRow,
+    candidates: Vec<Endpoint>,
+    rendezvous: &[u16],
+    per_attempt: Duration,
+    borrow_timeout_ms: u64,
+) -> RaceOutcome<Endpoint, (SocketAddr, PeerStream)> {
+    let bound = Duration::from_millis(borrow_timeout_ms.max(1));
+    let race = race_candidates(
+        candidates,
+        CONNECTION_ATTEMPT_DELAY,
+        |endpoint: Endpoint| async move {
+            let addr = endpoint.direct_addr()?;
+            try_direct_endpoint(row, addr, rendezvous, per_attempt).await
+        },
+    );
+    match tokio::time::timeout(bound, race).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => RaceOutcome {
+            won: None,
+            failed: Vec::new(),
+        },
+    }
 }
 
 /// How a dial got through: a socket this node opened, or a pinned Mac that
@@ -2325,8 +2479,41 @@ pub async fn dial_peer_reaching_within(
 ) -> Option<(Reached, PeerStream)> {
     let per_attempt = per_attempt_bound(borrow_timeout_ms);
     let rendezvous = crate::peer::reach::rendezvous_ports(&row.node, now_unix_seconds());
+    let order = dial_order(row);
 
-    for endpoint in dial_order(row) {
+    // The leading contiguous run of `Locator::Direct` endpoints is raced
+    // together; everything from the first non-direct endpoint onward is
+    // untouched below. A direct endpoint can still occur later in `order`
+    // (an unranked `Reverse` sorts in the same band as `Direct`, see
+    // `probe::kind_rank`), which is exactly why this is a leading RUN and not
+    // a filter: only the front of the list is raced, so a later direct
+    // endpoint keeps trying sequentially in its own position rather than
+    // jumping the queue ahead of whatever `probe` ranked above it.
+    let leading_run = order
+        .iter()
+        .take_while(|endpoint| matches!(endpoint.locator, Locator::Direct { .. }))
+        .count();
+    let (leading, rest) = order.split_at(leading_run);
+
+    if !leading.is_empty() {
+        let race = run_direct_race(
+            row,
+            leading.to_vec(),
+            &rendezvous,
+            per_attempt,
+            borrow_timeout_ms,
+        )
+        .await;
+        for endpoint in race.failed {
+            crate::peer::probe::cool_down(row.node, endpoint.locator, crate::now_ms());
+        }
+        if let Some((endpoint, (addr, stream))) = race.won {
+            crate::peer::probe::clear_cooldown(row.node, endpoint.locator);
+            return Some((Reached::Direct(addr), stream));
+        }
+    }
+
+    for endpoint in rest {
         match endpoint.locator {
             Locator::Direct { addr } => {
                 if let Some((reached, stream)) =
@@ -2970,6 +3157,65 @@ mod tests {
             1,
             "the second relay is still in flight: a guard must not give back a slot its \
              caller already returned"
+        );
+    }
+
+    /// **The stagger, through the private race itself, with no sockets at
+    /// all.**
+    ///
+    /// Two scripted candidates: the first takes 600 ms to answer, the second
+    /// only 5 ms. The second is started [`CONNECTION_ATTEMPT_DELAY`] after
+    /// the first, so at 255 ms it is already ahead of the first candidate's
+    /// own 600 ms clock, and must win. A stagger short enough to let the
+    /// slow candidate finish before the fast one even starts (anything at or
+    /// above 595 ms) would prove nothing but the order of two futures; 600 ms
+    /// leaves headroom above the real 250 ms delay while still failing loudly
+    /// if the delay were ever raised past it.
+    ///
+    /// Watched red: raise [`CONNECTION_ATTEMPT_DELAY`] to 10 seconds. The
+    /// second candidate then starts long after the first's own 600 ms clock
+    /// has already answered, so the first (slow) candidate wins instead:
+    ///
+    /// ```text
+    /// assertion `left == right` failed: the second candidate started
+    /// CONNECTION_ATTEMPT_DELAY after the first and still answers first: it
+    /// must win
+    ///   left: Some(600ms)
+    ///  right: Some(5ms)
+    /// ```
+    #[tokio::test]
+    async fn the_race_starts_its_next_candidate_a_stagger_after_the_previous_one() {
+        let slow = Duration::from_millis(600);
+        let fast = Duration::from_millis(5);
+        let candidates = vec![slow, fast];
+
+        let started = Instant::now();
+        let outcome = race_candidates(
+            candidates,
+            CONNECTION_ATTEMPT_DELAY,
+            |delay: Duration| async move {
+                tokio::time::sleep(delay).await;
+                Some(delay)
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome.won.map(|(_, value)| value),
+            Some(fast),
+            "the second candidate started CONNECTION_ATTEMPT_DELAY after the first and still \
+             answers first: it must win"
+        );
+        assert!(
+            outcome.failed.is_empty(),
+            "the slow candidate was still running when the fast one won; it was cancelled, \
+             not refused, so it must not be in the failed list: {:?}",
+            outcome.failed
+        );
+        assert!(
+            elapsed < slow,
+            "the race must not wait for the cancelled candidate's own clock: took {elapsed:?}"
         );
     }
 }
