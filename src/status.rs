@@ -197,6 +197,19 @@ pub struct StatusPayload {
     /// the structural zeros this endpoint exists to end.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerStatusRow>,
+    /// Why [`Self::peers`] is empty when the peers file itself could not be
+    /// read (a bad edit, a permission mismatch) rather than because this Mac
+    /// has never paired with anything. `None` on the ordinary paths: no
+    /// peers file at all, or one that parsed fine and simply lists nobody.
+    ///
+    /// Follows [`AccountStatus::probe_error`]'s shape and, per this struct's
+    /// `build` doc-comment on when a bump is and is not warranted, this must
+    /// NOT bump [`STATUS_KIND`]: an OLD client skips the unknown key, and a
+    /// NEW client reading an OLD server reads `None`, which is the truth
+    /// ("that server never reported a read failure") rather than a
+    /// fabricated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peers_error: Option<String>,
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -438,6 +451,7 @@ impl StatusPayload {
             // this call; an empty list is the honest answer for every other
             // caller (the CLI's own round-trip tests, `into_snapshot`).
             peers: Vec::new(),
+            peers_error: None,
         }
     }
 
@@ -841,8 +855,23 @@ pub fn peer_status_rows(
 /// and a missing peers file is the ORDINARY state of a Mac that has never
 /// paired with anything. So a read that fails is logged at warn with the path
 /// and the error, which is a surfaced error and not a swallowed one, and the
-/// block is empty: no peers file, no peers.
+/// block is empty: no peers file, no peers. [`Self::peers_error`] on
+/// [`StatusPayload`] is how that empty block is told apart from the ordinary
+/// "no peers file at all" case; see [`peers_block_with_error`], which this
+/// calls.
 pub fn peers_block(peers_path: &std::path::Path, now_ms: i64) -> Vec<PeerStatusRow> {
+    peers_block_with_error(peers_path, now_ms).0
+}
+
+/// [`peers_block`], plus the parse error when the peers file itself could not
+/// be read, for [`StatusPayload::peers_error`]. A separate function rather
+/// than changing `peers_block`'s own return type: every existing caller of
+/// `peers_block` wants the rows only, and `payload.peers = peers_block(..)`
+/// reads as what it does.
+pub fn peers_block_with_error(
+    peers_path: &std::path::Path,
+    now_ms: i64,
+) -> (Vec<PeerStatusRow>, Option<String>) {
     // `PeerStore` and not a bare `read_or_default`: it is the reader every
     // other surface goes through, and it is what derives each grant's `ended`
     // against the clock. A second reader here would be a second answer to
@@ -856,7 +885,7 @@ pub fn peers_block(peers_path: &std::path::Path, now_ms: i64) -> Vec<PeerStatusR
                 "status: the peers file could not be read, so the status payload's peers \
                  block is empty; the accounts it reports are unaffected"
             );
-            return Vec::new();
+            return (Vec::new(), Some(err.to_string()));
         }
     };
     let state_path = crate::peer::serve::peer_state_path(peers_path);
@@ -875,7 +904,7 @@ pub fn peers_block(peers_path: &std::path::Path, now_ms: i64) -> Vec<PeerStatusR
             crate::peer::state::PeerState::default()
         }
     };
-    peer_status_rows(&store.peers(), &state, now_ms)
+    (peer_status_rows(&store.peers(), &state, now_ms), None)
 }
 
 /// [`peer_graph`], derived off the two files on disk rather than values a
@@ -1632,6 +1661,45 @@ pub struct PeerLsJson {
     /// Every account that has an exit lock, keyed by the label a `--scope`
     /// names it by.
     pub exits: std::collections::BTreeMap<String, PeerExitJson>,
+    /// Why every field above reads empty when the peers file itself could
+    /// not be parsed, rather than because nothing is pinned. Follows
+    /// [`StatusPayload::peers_error`]'s shape, `None` on the ordinary path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers_error: Option<String>,
+}
+
+impl PeerLsJson {
+    /// The whole document when the peers file itself could not be read: every
+    /// count and row is the honest "nothing to report" default, and
+    /// [`Self::peers_error`] is the only field that says this is a read
+    /// failure and not an empty mesh. `caps` still reports the real
+    /// compile-time limits: they describe this build, not the file.
+    pub fn unreadable(error: String) -> Self {
+        Self {
+            supported: true,
+            peers: Vec::new(),
+            pending: Vec::new(),
+            pending_count: 0,
+            blocked: Vec::new(),
+            blocked_count: 0,
+            muted: Vec::new(),
+            muted_count: 0,
+            limited: 0,
+            caps: PeerCapsJson {
+                found_rows: crate::peer::discovery::MAX_FOUND_ROWS,
+                found_per_address: crate::peer::discovery::MAX_FOUND_PER_ADDRESS,
+                pending: crate::peer::state::MAX_PENDING_KNOCKS,
+                knock_interval_ms: crate::peer::listener::KNOCK_INTERVAL_MS,
+                knock_burst: crate::peer::listener::KNOCK_BURST,
+                unauthenticated_sockets: crate::peer::listener::MAX_UNAUTHENTICATED_SOCKETS,
+            },
+            lent_to: std::collections::BTreeMap::new(),
+            internet: false,
+            network: network_fact::network_present(),
+            exits: std::collections::BTreeMap::new(),
+            peers_error: Some(error),
+        }
+    }
 }
 
 #[cfg(test)]

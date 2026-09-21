@@ -104,7 +104,13 @@ use crate::peer::tunnel::{self, NoiseStream};
 
 /// The ONLY origins a gateway will carry. Deny by default: a host absent from
 /// this list is refused, not tunnelled.
-pub const PEER_EGRESS_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
+///
+/// Its own named constant for the deny-by-default property the module doc
+/// above argues for, but the VALUES are [`crate::mitm::ALLOWED_HOSTS`]
+/// itself, not a second literal: two arrays that merely agreed today would
+/// drift silently, and the only thing that fails when they do is this
+/// deny-by-default boundary.
+pub const PEER_EGRESS_HOSTS: &[&str] = crate::mitm::ALLOWED_HOSTS;
 
 /// The only port those origins are carried on.
 ///
