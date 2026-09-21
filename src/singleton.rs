@@ -997,6 +997,26 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
 mod tests {
     use super::*;
 
+    /// How long [`port_listeners_finds_this_process_on_an_ephemeral_port`]
+    /// retries a miss before failing. On Linux, `port_listeners` joins two
+    /// separate `/proc` snapshots that are not read atomically:
+    /// `build_inode_proc_map` (`listeners-0.6.1/src/platform/linux/mod.rs:17`)
+    /// walks every process's fd table FIRST, then `ProtoListener::get_all`
+    /// (same file, line 19) reads `/proc/net/tcp` SECOND, and the two are
+    /// joined by socket inode. On a loaded CI runner that first walk touches
+    /// every process on the box and can itself take real wall-clock time; a
+    /// transient failure partway through it (the per-process `openat` calls
+    /// in `helpers.rs` each silently `continue` on error) can drop THIS
+    /// process's own fd from the map even though the listener this test just
+    /// bound is definitely open and definitely LISTENing for the socket-table
+    /// read that follows. The retry re-runs the whole two-snapshot join; it
+    /// never touches production code, and a holder that is genuinely absent
+    /// still fails after this bound elapses.
+    const PORT_LISTENERS_RETRY_BOUND: Duration = Duration::from_millis(500);
+
+    /// How often the retry above re-samples `port_listeners` inside its bound.
+    const PORT_LISTENERS_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
     /// The `listeners` integration itself, not just the pure logic around it:
     /// bind an ephemeral port IN-PROCESS (port 0 — never a literal port, and
     /// never the live proxy's `127.0.0.1:3456`) and assert `port_listeners`
@@ -1005,6 +1025,11 @@ mod tests {
     /// `listeners::get_process_by_port` (which we deliberately do not call) even
     /// errors outright on `port == 0`, and port 0 is not a real listener's port
     /// in the socket table either way.
+    ///
+    /// Retries for up to [`PORT_LISTENERS_RETRY_BOUND`]: see that constant's
+    /// doc for the two non-atomic `/proc` reads this works around. The listener
+    /// stays bound for the whole retry window, so every retry is a fresh,
+    /// independent read of a socket that is, in reality, continuously held.
     #[test]
     fn port_listeners_finds_this_process_on_an_ephemeral_port() {
         let listener =
@@ -1014,10 +1039,16 @@ mod tests {
             .expect("a bound listener has a local address")
             .port();
 
-        let holders = port_listeners(port);
+        let deadline = std::time::Instant::now() + PORT_LISTENERS_RETRY_BOUND;
+        let mut holders = port_listeners(port);
+        while !holders.contains(&std::process::id()) && std::time::Instant::now() < deadline {
+            sleep(PORT_LISTENERS_RETRY_INTERVAL);
+            holders = port_listeners(port);
+        }
         assert!(
             holders.contains(&std::process::id()),
-            "port {port} should be reported as held by this process (pid {}); got {holders:?}",
+            "port {port} should be reported as held by this process (pid {}); got {holders:?} \
+             after retrying for {PORT_LISTENERS_RETRY_BOUND:?}",
             std::process::id()
         );
 
