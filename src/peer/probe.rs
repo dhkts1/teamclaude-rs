@@ -549,6 +549,14 @@ pub enum ProbeStop {
     Completed,
     /// The peer does not probe, so no further probe is sent on this session.
     PeerDoesNotProbe,
+    /// This round's answer did not arrive within `PROBE_TIMEOUT`, recorded as
+    /// loss, and no further round is sent on this session: a timed-out read
+    /// leaves the stream in a state a second read cannot trust, the same
+    /// reason [`crate::peer::noise::FrameReader`] exists for the loop that
+    /// reads control frames on every other cadence. A silent peer is not a
+    /// build that cannot parse a probe, so this is its own reason and never
+    /// [`Self::PeerDoesNotProbe`].
+    TimedOut,
 }
 
 /// What one session's probing did.
@@ -658,6 +666,14 @@ where
 /// Stops at the FIRST [`ProbeOutcome::NotSupported`], for the reason the
 /// module docs explain: one close is enough to know the
 /// far end's build, and asking again costs another session.
+///
+/// Stops at the FIRST [`ProbeOutcome::NoAnswer`] too, and for a different
+/// reason: `probe_once`'s read is cancelled by `PROBE_TIMEOUT`, and
+/// `noise::recv_encrypted` is not cancel safe, so a second read on the same
+/// stream after a timeout can take bytes the cancelled read left behind
+/// (`peer/noise.rs`'s [`crate::peer::noise::FrameReader`] doc has the failure
+/// in full). The round is still recorded as loss before this returns; only
+/// the NEXT round is skipped.
 pub async fn probe_session<S>(
     stream: &mut S,
     session: &mut PeerSession,
@@ -684,6 +700,12 @@ where
             });
         }
         table.record(session.peer, locator, outcome, crate::now_ms());
+        if outcome == ProbeOutcome::NoAnswer {
+            return Ok(ProbeRun {
+                sent,
+                stop: ProbeStop::TimedOut,
+            });
+        }
     }
     Ok(ProbeRun {
         sent,

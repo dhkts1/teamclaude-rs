@@ -182,4 +182,30 @@ check_pin() {
 check_pin node-a1 "$a1_ls" node-a2 "10.77.1.12:$LISTEN_PORT"
 check_pin node-a2 "$a2_ls" node-a1 "10.77.1.11:$LISTEN_PORT"
 
+# --- a greeted session measures its own path -------------------------------
+# `tcr peer hello` is a completed CONTROL session, the same one the prober
+# rides. After it, the round trip it measured must read as a number on
+# `tcr peer graph`, not the placeholder a session that never probed leaves.
+a2_wire_id="$(pinned_wire_id "$a1_ls" || true)"
+if [ -z "$a2_wire_id" ]; then
+  fail "node-a1: no pinned wire id to greet node-a2 with"
+else
+  hello_out="$SCRATCH/a1-hello.txt"
+  if nx node-a1 tcr peer hello "$a2_wire_id" --peers "$PEERS" > "$hello_out" 2>&1; then
+    pass "node-a1 said hello to node-a2: $(cat "$hello_out")"
+  else
+    fail "node-a1: peer hello to node-a2 refused: $(cat "$hello_out")"
+  fi
+
+  graph_out="$SCRATCH/a1-graph.txt"
+  nx node-a1 tcr peer graph --peers "$PEERS" > "$graph_out" 2>&1 || true
+  cat "$graph_out"
+  measured_line="$(grep 'peer graph: edge path ' "$graph_out" | grep -v 'rtt_ms=unmeasured' || true)"
+  if [ -n "$measured_line" ]; then
+    pass "node-a1 measured a round trip on the greeted path: $measured_line"
+  else
+    fail "node-a1: no edge path line carries a measured rtt_ms: $(cat "$graph_out")"
+  fi
+fi
+
 finish
