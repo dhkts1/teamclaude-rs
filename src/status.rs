@@ -1673,7 +1673,7 @@ impl PeerLsJson {
     /// count and row is the honest "nothing to report" default, and
     /// [`Self::peers_error`] is the only field that says this is a read
     /// failure and not an empty mesh. `caps` still reports the real
-    /// compile-time limits — they describe this build, not the file.
+    /// compile-time limits: they describe this build, not the file.
     pub fn unreadable(error: String) -> Self {
         Self {
             supported: true,
