@@ -128,6 +128,11 @@ const SSE_TEE_CAPACITY: usize = 256;
 /// apart from "we never saw the terminator" (trustworthy only when we also
 /// know we saw everything there was to see — see the handler's use of this).
 const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
+/// The content-block type Anthropic uses for a tool IT runs — `--advisor` today, `web_search`
+/// next. Its result block travels with an `encrypted_content` that only the minting
+/// organization can decrypt, which is why the id has to be remembered at all: see
+/// [`crate::server_tool_pins`].
+const SERVER_TOOL_USE_BLOCK_TYPE: &str = "server_tool_use";
 /// A transient `429` whose `retry-after` is within this bound is waited out
 /// inline on the same account; anything longer throttles + rotates instead of
 /// tying up the client connection.
@@ -2257,7 +2262,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // `RawValue` rather than materializing the whole conversation — see `session_wire.rs`'s
     // module doc. A body that fails to parse here yields "no session, no tool events" rather
     // than rejecting the request: this is an observability peek, never a validation gate.
-    let (wire_session_id, wire_tool_uses, wire_tool_results) = {
+    // The fourth value is NOT observability: `server_tool_ids` is every `server_tool_use` id
+    // this conversation carries, and it decides which account may serve this request at all —
+    // see `crate::server_tool_pins` and the bench below. Scanned from the same borrowed
+    // `messages` in the same pass, over ALL messages rather than the tail window the tool
+    // events use, because the block that pins the conversation was minted on its FIRST turn.
+    let (wire_session_id, wire_tool_uses, wire_tool_results, server_tool_ids) = {
         #[derive(serde::Deserialize)]
         struct RequestSessionPeek<'a> {
             metadata: Option<RequestSessionMeta>,
@@ -2278,9 +2288,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     .messages
                     .map(crate::session_wire::extract_tool_events)
                     .unwrap_or_default();
-                (session_id, uses, results)
+                let server_tool_ids = peek
+                    .messages
+                    .map(crate::session_wire::extract_server_tool_use_ids)
+                    .unwrap_or_default();
+                (session_id, uses, results, server_tool_ids)
             }
-            Err(_) => (None, Vec::new(), Vec::new()),
+            Err(_) => (None, Vec::new(), Vec::new(), Vec::new()),
         }
     };
     // Whether THIS request targets a Fable model — the same classification
@@ -2425,6 +2439,48 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             of = account_count,
             "account-set scope: this request may be served only by the accounts it names"
         );
+    }
+    // A conversation that carries a `server_tool_use` id is served by the account that MINTED
+    // that id, or by nobody.
+    //
+    // The result block travelling with the id (`advisor_tool_result`'s `encrypted_content`)
+    // decrypts only on the organization that produced it, so every other account answers the
+    // whole request `400 invalid_request_error: "Advisor tool result content could not be
+    // processed."` — 1,246 of them on 2026-09-22 alone, one per turn for the rest of each
+    // re-keyed conversation. An eligible sibling is therefore never the right answer, and a 429
+    // ("no eligible account") is the honest one when the minting account is hard-ineligible:
+    // the client retries, and a 429 costs a retry where a 400 costs the turn.
+    //
+    // Enforced by BENCHING every other account into `tried`, exactly as the account-set scope
+    // above does and for the same three reasons — it can only narrow, the affinity fast-path
+    // honours it (a pinned session whose pin is not the minting account DIVERTS for this one
+    // request, and the pin itself is left alone: the map, not the pin, is the authority here),
+    // and if the minting account is gone from this fleet every account ends up benched and the
+    // client gets the same honest 429 an exhausted fleet produces.
+    //
+    // An id this process has never seen — minted before this shipped, or expired out of the map
+    // — benches nothing: the rule must never block a conversation it knows nothing about.
+    if let Some((minting_idx, minting_id)) = manager.server_tool_pin_account(&server_tool_ids) {
+        if manager.server_tool_pins_disagree(&server_tool_ids) {
+            tracing::warn!(
+                ids = server_tool_ids.len(),
+                chose = %minting_id,
+                "server-tool ids in one conversation name different accounts; taking the newest mint"
+            );
+        }
+        let affinity_would_have_picked = session_key.and_then(|key| manager.affinity_pin(key));
+        for idx in 0..account_count {
+            if idx != minting_idx {
+                tried.insert(idx);
+            }
+        }
+        if affinity_would_have_picked.is_some_and(|pinned| pinned != minting_idx) {
+            tracing::info!(
+                account = manager.account_name(minting_idx).as_deref().unwrap_or("?"),
+                minted = %minting_id,
+                "server-tool result pins request to account"
+            );
+        }
     }
     // Accounts that already got their one force-refresh on a 401.
     let mut forced_401: HashSet<usize> = HashSet::new();
@@ -3609,7 +3665,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         .await
                         .map(|bytes| (Ok::<Bytes, Infallible>(bytes), rx))
                 });
-                let (parsed, stream_error, response_tool_uses) = parse_sse_usage(byte_stream).await;
+                let SseParse {
+                    usage: parsed,
+                    stream_error,
+                    tool_uses: response_tool_uses,
+                    server_tool_ids,
+                } = parse_sse_usage(byte_stream).await;
+                // Who minted the server-side tool calls in this turn. Recorded before anything
+                // else the parse learned, because it is the only one of them that changes how a
+                // LATER request is routed: every following turn of this conversation echoes
+                // these ids back, and any account but `idx` answers them with a 400.
+                manager_side.record_minted_server_tools(&server_tool_ids, idx, crate::now_ms());
                 // RUNNING NOW: every tool this turn asked for starts HERE — the stream has
                 // just ended, so the client is beginning them as this line runs. Outside the
                 // usage guard below on purpose: a turn that emitted tool calls but reported
@@ -3836,6 +3902,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 wire_session_id.as_deref(),
                 OffsetDateTime::now_utc(),
                 &response_tool_uses_from_json(&bytes),
+            );
+            // Non-streamed twin of the mint record on the SSE arm above.
+            manager.record_minted_server_tools(
+                &response_server_tool_ids_from_json(&bytes),
+                idx,
+                crate::now_ms(),
             );
             let parsed = usage_from_json(&bytes);
             if parsed.input_total > 0 || parsed.output > 0 {
@@ -4684,10 +4756,44 @@ fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUs
         .collect()
 }
 
+/// Parse the `server_tool_use` ids out of a non-streamed messages body — the JSON-path twin of
+/// [`parse_sse_usage`]'s fourth return value, feeding
+/// [`crate::manager::Manager::record_minted_server_tools`].
+///
+/// A separate pass over the same bytes for the same reason
+/// [`response_tool_uses_from_json`] is one: these bodies are already buffered and capped, and
+/// Claude Code itself always streams, so the cost lands only on the rare non-streamed 2xx.
+fn response_server_tool_ids_from_json(bytes: &[u8]) -> Vec<String> {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(blocks) = value.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| {
+            b.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == SERVER_TOOL_USE_BLOCK_TYPE)
+        })
+        .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
+        .take(crate::session_wire::SERVER_TOOL_ID_SCAN_CAP)
+        .collect()
+}
+
 /// Parse the total usage breakdown from an SSE messages stream, plus — out of
 /// band, so [`ParsedUsage`] can stay `Copy` — the FIRST in-band `error` event's
-/// `error.type`, if any arrived, and every COMPLETED `tool_use` block the turn
-/// emitted.
+/// `error.type`, if any arrived, every COMPLETED `tool_use` block the turn
+/// emitted, and the id of every `server_tool_use` block it opened.
+///
+/// The server-tool ids are the fourth value and not part of the third: a `server_tool_use` is
+/// Anthropic's own tool, run inside the API, so it is not a client-side call the Tools tab has
+/// anything to show. What it IS, is the thing that decides which account may serve the REST of
+/// this conversation — see [`crate::server_tool_pins`]. It is taken at
+/// `content_block_start`, not at `content_block_stop`, because the id is the whole payload and
+/// it is complete the moment the block opens; a stream severed mid-turn has still told us who
+/// minted it, and that account is still the only one that can serve the retry.
 ///
 /// The tool blocks are what the Tools tab's RUNNING NOW section is built from,
 /// and the response is the only place they can come from: a Claude Code request
@@ -4739,13 +4845,7 @@ fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUs
 /// was seen (truncated mid-turn) OR nothing was ever seen (severed before the
 /// first event) — and stays silent only when events arrived that affirmatively
 /// were not `message_start`.
-async fn parse_sse_usage<S, B, E>(
-    stream: S,
-) -> (
-    ParsedUsage,
-    Option<String>,
-    Vec<crate::session_wire::ToolUseEvent>,
-)
+async fn parse_sse_usage<S, B, E>(stream: S) -> SseParse
 where
     S: futures::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
@@ -4765,6 +4865,10 @@ where
     let mut open_tool_blocks: std::collections::HashMap<u64, OpenToolBlock> =
         std::collections::HashMap::new();
     let mut tool_uses: Vec<crate::session_wire::ToolUseEvent> = Vec::new();
+    // Ids of the SERVER-side tool blocks this turn opened — complete at `content_block_start`,
+    // so unlike `open_tool_blocks` above there is nothing to assemble and nothing to lose when
+    // a stream is cut short.
+    let mut server_tool_ids: Vec<String> = Vec::new();
     while let Some(item) = events.next().await {
         let Ok(event) = item else {
             break; // malformed/utf8/transport error — stop parsing, keep totals
@@ -4805,14 +4909,23 @@ where
             }
             Some("content_block_start") => {
                 let block = value.get("content_block");
-                let is_tool_use = block
-                    .and_then(|b| b.get("type"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t == "tool_use");
+                let block_type = block.and_then(|b| b.get("type")).and_then(Value::as_str);
+                let is_tool_use = block_type.is_some_and(|t| t == "tool_use");
                 let id = block
                     .and_then(|b| b.get("id"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                // A SERVER-side tool call (`--advisor` today; `web_search` is the next block
+                // type to add here). Recorded by id alone: it is Anthropic's own call, nothing
+                // the client runs, and the only thing that matters about it later is which
+                // account minted it.
+                if let (Some(SERVER_TOOL_USE_BLOCK_TYPE), Some(id)) = (block_type, id.as_deref()) {
+                    if server_tool_ids.len() < crate::session_wire::SERVER_TOOL_ID_SCAN_CAP
+                        && !server_tool_ids.iter().any(|seen| seen == id)
+                    {
+                        server_tool_ids.push(id.to_string());
+                    }
+                }
                 if let (true, Some(index), Some(id)) = (is_tool_use, block_index(&value), id) {
                     // A stream can only carry so many tool blocks before the cap that bounds
                     // the table itself applies; stop accumulating rather than grow with the
@@ -4901,7 +5014,30 @@ where
     }
     // Blocks still open here never reached `content_block_stop` — the turn was cut off before
     // the tool call was complete, so the client never ran it and it is not "running".
-    (parsed, stream_error, tool_uses)
+    SseParse {
+        usage: parsed,
+        stream_error,
+        tool_uses,
+        server_tool_ids,
+    }
+}
+
+/// What one pass of [`parse_sse_usage`] learned about a streamed turn.
+///
+/// A struct rather than a tuple because the fourth value (`server_tool_ids`) is the one that
+/// decides ROUTING, and a caller that silently binds it to the wrong position would pin
+/// conversations to the wrong account — the exact failure this whole feature exists to prevent.
+/// Named fields make that misbinding impossible to write.
+struct SseParse {
+    usage: ParsedUsage,
+    /// The FIRST in-band `error` event's `error.type`, or the fixed
+    /// [`TRUNCATED_STREAM_ERROR_KIND`] when the turn's end was never observed.
+    stream_error: Option<String>,
+    /// Every COMPLETED client-side `tool_use` block — what the Tools tab's RUNNING NOW is built
+    /// from.
+    tool_uses: Vec<crate::session_wire::ToolUseEvent>,
+    /// Every `server_tool_use` id the turn opened — see [`crate::server_tool_pins`].
+    server_tool_ids: Vec<String>,
 }
 
 /// One `tool_use` content block being assembled across SSE events — see [`parse_sse_usage`].
@@ -6201,8 +6337,11 @@ mod tests {
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[..split])),
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[split..])),
         ];
-        let (parsed, stream_error, _tool_uses) =
-            parse_sse_usage(futures::stream::iter(chunks)).await;
+        let SseParse {
+            usage: parsed,
+            stream_error,
+            ..
+        } = parse_sse_usage(futures::stream::iter(chunks)).await;
         assert_eq!(
             stream_error, None,
             "a stream that reaches message_stop has no error event"
@@ -6233,7 +6372,11 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let (parsed, stream_error, _tool_uses) = parse_sse_usage(stream).await;
+        let SseParse {
+            usage: parsed,
+            stream_error,
+            ..
+        } = parse_sse_usage(stream).await;
         assert_eq!(
             stream_error, None,
             "a stream that reaches message_stop has no error event"
@@ -6261,7 +6404,11 @@ mod tests {
         // non-Messages endpoint that happens to emit `text/event-stream`.
         let full = concat!("event: heartbeat\n", "data: {\"type\":\"heartbeat\"}\n\n",);
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let (parsed, stream_error, _tool_uses) = parse_sse_usage(stream).await;
+        let SseParse {
+            usage: parsed,
+            stream_error,
+            ..
+        } = parse_sse_usage(stream).await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error, None,
@@ -6286,7 +6433,11 @@ mod tests {
     #[tokio::test]
     async fn sse_stream_severed_before_any_event_records_truncation() {
         let stream = futures::stream::iter(Vec::<Result<Bytes, Infallible>>::new());
-        let (parsed, stream_error, _tool_uses) = parse_sse_usage(stream).await;
+        let SseParse {
+            usage: parsed,
+            stream_error,
+            ..
+        } = parse_sse_usage(stream).await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error.as_deref(),
@@ -6322,8 +6473,11 @@ mod tests {
             Ok::<Bytes, Infallible>(Bytes::from(head)),
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&[0xFFu8])),
         ];
-        let (parsed, stream_error, _tool_uses) =
-            parse_sse_usage(futures::stream::iter(chunks)).await;
+        let SseParse {
+            usage: parsed,
+            stream_error,
+            ..
+        } = parse_sse_usage(futures::stream::iter(chunks)).await;
         assert_eq!(
             parsed.input_total, 5,
             "usage from message_start is retained even though the stream ends malformed"
@@ -6359,7 +6513,11 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let (_parsed, stream_error, tool_uses) = parse_sse_usage(stream).await;
+        let SseParse {
+            stream_error,
+            tool_uses,
+            ..
+        } = parse_sse_usage(stream).await;
         assert_eq!(stream_error, None);
         assert_eq!(tool_uses.len(), 1, "one completed tool_use block");
         assert_eq!(tool_uses[0].id, "toolu_1");
@@ -6389,7 +6547,11 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \\\"ls\"}}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let (_parsed, stream_error, tool_uses) = parse_sse_usage(stream).await;
+        let SseParse {
+            stream_error,
+            tool_uses,
+            ..
+        } = parse_sse_usage(stream).await;
         assert_eq!(
             stream_error.as_deref(),
             Some(TRUNCATED_STREAM_ERROR_KIND),
@@ -6421,7 +6583,7 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let (_parsed, _stream_error, tool_uses) = parse_sse_usage(stream).await;
+        let SseParse { tool_uses, .. } = parse_sse_usage(stream).await;
         let heads: Vec<(&str, Option<&str>)> = tool_uses
             .iter()
             .map(|t| (t.id.as_str(), t.command_head.as_deref()))
@@ -6434,6 +6596,85 @@ mod tests {
             ],
             "the text block contributes nothing; interleaved deltas land on their own index"
         );
+    }
+
+    /// A SERVER-side tool block, in the shape captured off the wire on 2026-09-22: the id is
+    /// carried by `content_block_start` and the block is closed by the API itself, with the
+    /// encrypted result arriving as a block of its own. It must be collected as a server-tool
+    /// id (it decides routing) and must NOT become a client tool event (nothing runs it here).
+    #[tokio::test]
+    async fn a_server_tool_use_block_is_collected_by_id_and_is_not_a_client_tool() {
+        let full = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_fake_1\",\"name\":\"advisor\",\"input\":{}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"advisor_tool_result\",\"tool_use_id\":\"srvtoolu_fake_1\",\"content\":{\"type\":\"advisor_redacted_result\",\"encrypted_content\":\"AAAA\"}}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_fake_1\",\"name\":\"Read\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\": \\\"/tmp/example.rs\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
+        let SseParse {
+            tool_uses,
+            server_tool_ids,
+            ..
+        } = parse_sse_usage(stream).await;
+        assert_eq!(server_tool_ids, vec!["srvtoolu_fake_1".to_string()]);
+        assert_eq!(
+            tool_uses.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["toolu_fake_1"],
+            "the server-side call is Anthropic's, not a tool this client runs"
+        );
+    }
+
+    /// A stream cut off before `content_block_stop` has still named its minting account — the
+    /// id is complete the moment the block opens, and the retry of that very turn has to land
+    /// on the same account.
+    #[tokio::test]
+    async fn a_truncated_stream_still_reports_the_server_tool_id() {
+        let full = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_fake_1\",\"name\":\"advisor\",\"input\":{}}}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
+        let SseParse {
+            stream_error,
+            server_tool_ids,
+            ..
+        } = parse_sse_usage(stream).await;
+        assert_eq!(stream_error.as_deref(), Some(TRUNCATED_STREAM_ERROR_KIND));
+        assert_eq!(server_tool_ids, vec!["srvtoolu_fake_1".to_string()]);
+    }
+
+    /// The non-streamed twin of the id scan.
+    #[test]
+    fn non_streamed_server_tool_ids_come_off_the_content_array() {
+        let body = br#"{
+            "id": "msg_1",
+            "type": "message",
+            "content": [
+                {"type": "text", "text": "on it"},
+                {"type": "server_tool_use", "id": "srvtoolu_fake_1", "name": "advisor", "input": {}},
+                {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_fake_1",
+                 "content": {"type": "advisor_redacted_result", "encrypted_content": "AAAA"}},
+                {"type": "tool_use", "id": "toolu_fake_1", "name": "Grep", "input": {"pattern": "fn main"}}
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 2}
+        }"#;
+        assert_eq!(
+            response_server_tool_ids_from_json(body),
+            vec!["srvtoolu_fake_1".to_string()]
+        );
+        assert!(response_server_tool_ids_from_json(b"not json at all").is_empty());
     }
 
     /// The non-streamed twin: `tool_use` blocks come off the response body's
@@ -9758,6 +9999,261 @@ mod tests {
             );
         }
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    // --- a server-tool result pins the conversation to its minting account ---
+
+    /// An upstream that answers every request with a Messages body carrying ONE
+    /// `server_tool_use` block — the shape Anthropic returns for `--advisor` — and records the
+    /// `authorization` header of each request it saw, which is how these tests read WHICH
+    /// account served a turn. The encrypted content is a placeholder: a real one decodes only
+    /// on the org that minted it and has no business in a public repo.
+    ///
+    /// Each response mints its OWN id (`srvtoolu_fake_<nth hit>`), as the real API does. One
+    /// fixed id across every response would let a LATER turn re-mint the same id onto whichever
+    /// account served it, which is exactly the routing this is meant to prevent and would make
+    /// the test agree with a broken implementation.
+    async fn spawn_advisor_upstream() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = Arc::clone(&hits);
+        let recorder = Arc::clone(&seen);
+        let upstream = Router::new().fallback(move |req: Request| {
+            let counter = Arc::clone(&counter);
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let nth = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let mint_id = format!("srvtoolu_fake_{nth}");
+                let body = serde_json::json!({
+                    "id": format!("msg_fake_{nth}"),
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "server_tool_use", "id": mint_id, "name": "advisor", "input": {}},
+                        {"type": "advisor_tool_result", "tool_use_id": mint_id,
+                         "content": {"type": "advisor_redacted_result", "encrypted_content": "AAAA"}},
+                    ],
+                    "usage": {"input_tokens": 5, "output_tokens": 1},
+                })
+                .to_string();
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                recorder
+                    .lock()
+                    .expect("upstream recorder poisoned")
+                    .push(auth);
+                ([(CONTENT_TYPE, "application/json")], body)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind advisor upstream");
+        let addr = listener.local_addr().expect("advisor upstream addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        (format!("http://{addr}"), hits, seen)
+    }
+
+    /// Two accounts over `upstream`, `disabled` applied by position.
+    fn two_accounts_over(upstream: &str, disabled: &[bool]) -> Config {
+        let mut config = Config {
+            accounts: two_account_config(None).accounts,
+            ..dummy_config(None, upstream)
+        };
+        for (account, disable) in config.accounts.iter_mut().zip(disabled.iter()) {
+            account.disabled = disable.then_some(true);
+        }
+        config
+    }
+
+    /// One turn of a conversation: `user_id` is the session's stable identity (tier 2 of
+    /// `stable_session_key`), and `server_tool_ids` are echoed back inside an assistant message
+    /// exactly as Claude Code echoes them.
+    fn advisor_turn_body(user_id: &str, server_tool_ids: &[&str]) -> String {
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        for id in server_tool_ids {
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "server_tool_use", "id": id, "name": "advisor", "input": {}},
+                    {"type": "advisor_tool_result", "tool_use_id": id,
+                     "content": {"type": "advisor_redacted_result", "encrypted_content": "AAAA"}},
+                ],
+            }));
+        }
+        serde_json::json!({
+            "model": "claude-sonnet-5",
+            "metadata": {"user_id": user_id},
+            "messages": messages,
+        })
+        .to_string()
+    }
+
+    /// Drive `/v1/messages` as a real client session would: a loopback peer and the
+    /// `SessionKey` extension `mitm::serve_http` attaches, without which `stable_session_key`
+    /// is never consulted and nothing is ever pinned.
+    async fn drive_conversation(manager: Arc<Manager>, body: &str) -> (StatusCode, Bytes) {
+        use tower::ServiceExt as _;
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+        req.extensions_mut().insert(SessionKey(1));
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, bytes)
+    }
+
+    /// The whole feature, end to end on a two-account fleet: a turn whose history carries a
+    /// `server_tool_use` id is served by the account that minted it — even when this session's
+    /// own affinity pin names the other one — and the pin itself is left alone, because the
+    /// divert is for THIS request and the session is still warm where it was.
+    #[tokio::test]
+    async fn a_server_tool_result_pins_later_turns_to_the_minting_account() {
+        let (upstream, hits, seen) = spawn_advisor_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+
+        // Turn 1 mints the id on whichever account rotation picked.
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &advisor_turn_body("sess-mint", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        let minting_auth = seen
+            .lock()
+            .expect("recorder")
+            .first()
+            .cloned()
+            .expect("a hit");
+        assert!(
+            manager
+                .server_tool_pin_account(&["srvtoolu_fake_1".to_string()])
+                .is_some(),
+            "the response's server_tool_use block must have been recorded"
+        );
+
+        // A DIFFERENT session, pinned to the OTHER account. Rotation on its own would hand it
+        // the same account as turn 1 (priority order, not round-robin), so the other one is
+        // made the only choice for exactly this turn and released again straight after: what
+        // this test needs is a session whose pin disagrees with the mint, by whatever route.
+        manager.mark_rate_limited(0, 60);
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &advisor_turn_body("sess-other", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        manager.clear_rate_limited(0);
+        let other_auth = seen.lock().expect("recorder")[1].clone();
+        assert_ne!(
+            other_auth, minting_auth,
+            "the control this test rests on: with no pin, rotation moves to the other account"
+        );
+        let pin_key = stable_hash("uid:", "sess-other");
+        let pinned_before = manager.affinity_pin(pin_key);
+        assert!(pinned_before.is_some(), "that turn must have left a pin");
+
+        // The same session, now carrying the id minted on the OTHER account. Its pin says one
+        // thing, the minting account says another, and the minting account wins.
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &advisor_turn_body("sess-other", &["srvtoolu_fake_1"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.lock().expect("recorder")[2],
+            minting_auth,
+            "a request carrying the id must reach the account that minted it"
+        );
+        assert_eq!(
+            manager.affinity_pin(pin_key),
+            pinned_before,
+            "a divert serves one request; it must not rewrite the session's pin"
+        );
+
+        // And the pin is still doing its job for turns that carry no server-tool history.
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &advisor_turn_body("sess-other", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.lock().expect("recorder")[3],
+            other_auth,
+            "with no id to honour, the session goes back to its own pinned account"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// When the minting account cannot serve, the honest answer is a 429 — never an eligible
+    /// sibling, which would answer `400 invalid_request_error` and burn the turn. The hit
+    /// counter is the assertion that matters: no upstream may be touched at all.
+    #[tokio::test]
+    async fn a_hard_ineligible_minting_account_answers_429_instead_of_a_sibling() {
+        let (upstream, hits, _seen) = spawn_advisor_upstream().await;
+        // Account 0 is out of rotation; the id was minted on it before it went out.
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[true, false]), None);
+        manager.record_minted_server_tools(&["srvtoolu_fake_1".to_string()], 0, crate::now_ms());
+
+        let (status, body) = drive_conversation(
+            Arc::clone(&manager),
+            &advisor_turn_body("sess-pinned", &["srvtoolu_fake_1"]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a body that only the disabled account can answer gets a 429: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the eligible sibling must never be handed a foreign advisor result"
+        );
+
+        // The control, on the same manager: the same session with no server-tool history is
+        // served normally by the account that IS eligible.
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &advisor_turn_body("sess-pinned", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An id this process never minted — from before this shipped, or aged out of the map —
+    /// benches nothing. The rule must never block a conversation it knows nothing about.
+    #[tokio::test]
+    async fn an_unknown_server_tool_id_changes_nothing() {
+        let (upstream, hits, seen) = spawn_advisor_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+
+        for _ in 0..2 {
+            let (status, _) = drive_conversation(
+                Arc::clone(&manager),
+                &advisor_turn_body("sess-unknown", &["srvtoolu_fake_never_minted"]),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let seen = seen.lock().expect("recorder").clone();
+        assert_eq!(
+            seen[0], seen[1],
+            "unchanged routing here means the session's own pin decided, not a bench"
+        );
     }
 
     /// The segment-boundary fix on the wire, in both directions. The bare `/v1/code`

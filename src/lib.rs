@@ -39,6 +39,7 @@ pub mod proxy;
 pub mod quota;
 pub mod schedule;
 pub mod server;
+pub mod server_tool_pins;
 pub mod session_wire;
 pub mod session_wire_persist;
 pub mod singleton;

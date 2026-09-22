@@ -60,6 +60,7 @@ mod pins;
 mod probing;
 mod refresh;
 mod select;
+mod server_tools;
 mod snapshot;
 mod state;
 mod throttle;
@@ -1124,6 +1125,19 @@ pub struct Manager {
     /// only ordering that matters is "a change eventually causes a write", and a
     /// tick that observes the flag late simply writes on the next one.
     affinity_dirty: AtomicBool,
+    /// `server_tool_use` id → (account index, mint ms): who minted each server-side tool call
+    /// the fleet has served. See [`crate::server_tool_pins`] for the rule — a conversation
+    /// carrying one of these ids is served by its minting account or by nobody, because the
+    /// result block travelling with it decrypts only on the org that produced it.
+    ///
+    /// Positional like [`Self::affinity`], and for the same reason: the response path learns an
+    /// index, and the request path needs an index to bench the rest of the fleet. The file half
+    /// stores identities. Written from the response path, read from the request path; a plain
+    /// `std::sync::Mutex`, **never** held while the accounts lock is taken.
+    server_tool_pins: Mutex<HashMap<String, (usize, i64)>>,
+    /// Set whenever [`Self::server_tool_pins`] is mutated, cleared by the flusher task that
+    /// writes it to disk — same debounce contract as [`Self::affinity_dirty`].
+    server_tool_pins_dirty: AtomicBool,
     /// Per-session serving stats (session key → account/count/last-seen), for
     /// live per-session visibility in the TUI. Separate from `affinity` so the
     /// routing pin stays byte-for-byte unchanged; bounded in `record_served`.
@@ -1458,6 +1472,8 @@ impl Manager {
             affinity: Mutex::new(HashMap::new()),
             affinity_extended: Mutex::new(HashSet::new()),
             affinity_dirty: AtomicBool::new(false),
+            server_tool_pins: Mutex::new(HashMap::new()),
+            server_tool_pins_dirty: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
             wire_sessions_dirty: AtomicBool::new(false),
