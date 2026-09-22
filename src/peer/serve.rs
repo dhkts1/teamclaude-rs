@@ -3029,19 +3029,37 @@ async fn punch_dial(
 ) -> Result<(SocketAddr, PeerStream), crate::peer::reach::PunchFailure> {
     use crate::peer::reach::{self, PunchFailure};
 
-    // **The one refusal worth a second question.** `PeerAddressUnknown` is the
-    // only one an exchange can answer: it means nothing on this Mac knows where
-    // that peer is, which is precisely the state a hint fixes. Every other
-    // refusal is about the pair, the slot or this Mac, so asking the peer
-    // anything would spend a carried round trip to learn what is already
-    // known, and each returns exactly as it did before this step existed.
+    // **The one refusal worth a second question, and only from a row that
+    // names some way to that peer.** `PeerAddressUnknown` is the only refusal
+    // an exchange can answer: it means nothing on this Mac knows where that
+    // peer is, which is precisely the state a hint fixes. Every other refusal
+    // is about the pair, the slot or this Mac, so asking the peer anything
+    // would spend a carried round trip to learn what is already known, and
+    // each returns exactly as it did before this step existed.
+    //
+    // **A row with NO endpoint at all is the carry case and not a punch, so it
+    // is not asked.** An empty row is what a lender that parked a socket at a
+    // friend looks like from here, and the step below this one already answers
+    // it by asking that friend to carry ([`dial_peer_reaching_within`]'s last
+    // loop). Asking first spends the same friend twice: one more connection
+    // from this address against its pre-authentication allowance
+    // ([`crate::peer::listener::unauthenticated_allowance`]), and on the
+    // reverse path one of the carriers parked on its desk, both of them the
+    // borrow's own and both spent on a punch that a Mac nobody can dial cannot
+    // answer. Measured, not reasoned: with the question asked on an empty row,
+    // `an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs`
+    // (`tests/peer_e2e.rs`) fails on both platforms of one run with the carrier
+    // refusing a connection at an allowance of two, and
+    // `a_row_with_no_endpoints_is_reached_through_a_carry_grantee`
+    // (`tests/peer_forward.rs`) only passes if its fixture accepts a carried
+    // stream the borrow never gets to use.
     //
     // ONE exchange, never a loop. A second ask against a peer that did not
     // answer the first spends a slot's worth of the caller's budget for
     // nothing, and there is no third thing to learn from asking twice.
     let (peer_ip, secret) = match reach::punch_target(&row.node, &row.endpoints) {
         Ok(found) => found,
-        Err(PunchFailure::PeerAddressUnknown) => {
+        Err(PunchFailure::PeerAddressUnknown) if row.has_endpoint() => {
             let learned = exchange_addresses(row, store, borrow_timeout_ms).await;
             tracing::debug!(
                 peer = %row.node.display(),
@@ -3262,6 +3280,12 @@ const HINT_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 /// friend, so the hint goes out over the friend and the answer comes back on
 /// the same stream: one round trip, and then a direct path between the two of
 /// them that the friend carries nothing more of.
+///
+/// The row has to name SOME way to that peer for the question to be asked at
+/// all, which is [`punch_dial`]'s own guard and is recorded there: a row with
+/// nothing on it is a peer the dial reaches by asking a friend to carry, and
+/// spending that friend on a hint first is what takes the borrow's own carrier
+/// away.
 ///
 /// # One exchange, one answer read
 ///

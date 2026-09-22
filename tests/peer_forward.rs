@@ -1293,11 +1293,12 @@ fn via_row(peer: &PeerId, label: &str, via: PeerId) -> PeerRow {
 /// differ only in what A's own peers file says about how to get to B.
 ///
 /// `carried` is how many carried streams A will open before it is done, and
-/// every caller says its own number rather than inheriting one. A dial whose
-/// row holds no dialable endpoint now opens two, because the punch step asks
-/// that peer for its current address through this same friend first
-/// (`serve::exchange_addresses`), and a fixture that accepted one read the
-/// missing second accept as the carry refusing.
+/// every caller says its own number rather than inheriting one. ONE is the
+/// number a dial spends on the friend it carries through, and it is the
+/// assertion rather than a fixture detail: the punch step's address exchange
+/// (`serve::exchange_addresses`) asks the same friend over its own connection,
+/// so a dial that asked it here would open two and leave the borrow the
+/// second, which is what the reverse path has no spare carrier for.
 async fn forwarder_and_target(
     tag: &str,
     a: &PeerId,
@@ -1486,11 +1487,16 @@ async fn a_row_with_no_endpoints_is_reached_through_a_carry_grantee() {
     let dir = scratch("client-carry");
     let key = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
     let (forwarder_addr, forwarding, target) =
-        // Two carried streams, and the second is the one under assertion. This
-        // row holds nothing dialable, which is the state the punch step names
-        // `PeerAddressUnknown`, so the dial asks B for its current address
-        // through C first and only then carries to it.
-        forwarder_and_target("client-carry-forwarder", &key.id(), &b, &c, 2).await;
+        // ONE carried stream, and it is the borrow's own. This row holds
+        // nothing at all, which is the state the punch step names
+        // `PeerAddressUnknown` and deliberately does not ask about: asking B
+        // for its address through C first would spend a second connection on C
+        // and, where C holds a carrier B parked, the carrier this dial needs.
+        // The fixture accepts exactly one round, so a dial that opened two
+        // fails here with the carry reading as refused, which is what the
+        // three-process reverse-path case reports as a borrow that never got
+        // served.
+        forwarder_and_target("client-carry-forwarder", &key.id(), &b, &c, 1).await;
 
     let a_store = store_in(
         &dir,
