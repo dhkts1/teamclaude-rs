@@ -162,14 +162,16 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     );
     assert!(addr.ip().is_loopback(), "the proxy binds loopback only");
 
-    // The three loops this config enables: affinity flush + wire-sessions flush
-    // + quota probe. The keep-warm loop is off, so it must NOT have been
-    // spawned.
+    // The four loops this config enables: affinity flush + server-tool-pin flush +
+    // wire-sessions flush + quota probe. The server-tool-pin flusher joined them when a
+    // `server_tool_use` id became routing state that has to survive a restart
+    // (`teamclaude_rs::server_tool_pins`); it is keyed on the same `affinity_path` this
+    // config sets. The keep-warm loop is off, so it must NOT have been spawned.
     assert_eq!(
         handle.background_task_count(),
-        3,
-        "expected the affinity flusher, the wire-sessions flusher and the quota \
-         prober, and no keep-warm loop"
+        4,
+        "expected the affinity flusher, the server-tool-pin flusher, the wire-sessions \
+         flusher and the quota prober, and no keep-warm loop"
     );
 
     // One real request, over a real socket, through the real listener.
@@ -205,8 +207,8 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
         .await
         .expect("shutdown did not finish: a background task ignored the shutdown signal");
     assert_eq!(
-        report.tasks_joined, 4,
-        "the accept loop plus all three background loops must be joined"
+        report.tasks_joined, 5,
+        "the accept loop plus all four background loops must be joined"
     );
     assert_eq!(
         report.tasks_aborted, 0,
@@ -262,8 +264,8 @@ async fn dropping_the_handle_stops_the_accept_loop_and_every_background_loop() {
         .expect_started();
     let port = handle.addr().port();
     assert_ne!(port, LIVE_PROXY_PORT);
-    // Affinity flusher + wire-sessions flusher + quota prober.
-    assert_eq!(handle.background_task_count(), 3);
+    // Affinity flusher + server-tool-pin flusher + wire-sessions flusher + quota prober.
+    assert_eq!(handle.background_task_count(), 4);
 
     // Every task `serve` spawned captured one of these.
     let manager = handle.manager().clone();
