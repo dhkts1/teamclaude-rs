@@ -2544,7 +2544,8 @@ fn lend_to(lender: &Mac, borrower: &mut Mac, label: &str) -> String {
 /// with no re-pairing.**
 ///
 /// `lender` and `mover` pair the way `a_borrowed_request_...` does (join, so
-/// the joiner's row carries a dialable address from the start; see gap 1).
+/// both rows carry a dialable address from the start: the joiner's own Hello
+/// on the enrolment stream announces its listen port to the accepting side).
 /// `mover` then shuts down and reboots on a FRESH port, so `lender`'s row
 /// for it names a socket nothing answers on any more. `mover` calls the verb
 /// this test is written against, `tcr peer hello <lender>`, which dials
@@ -2571,8 +2572,8 @@ async fn a_moved_peer_is_reached_through_a_refreshed_hello_endpoint() {
 
     step(
         2,
-        "mover joins lender; lender's row for it exists, but names only the ephemeral \
-         port the join arrived FROM, never mover's own listen port",
+        "mover joins lender; lender's row for it names mover's own listen port, the one \
+         the joiner's Hello announced, never the ephemeral port the join arrived FROM",
     );
     let minted = lender.peer_ok(&["invite", "--label", "mover-mac", "--ttl", "300"]);
     let key = minted
@@ -2589,12 +2590,12 @@ async fn a_moved_peer_is_reached_through_a_refreshed_hello_endpoint() {
         Some(1),
         "the join must leave exactly one endpoint on lender's row for mover: {before}"
     );
-    assert_ne!(
+    assert_eq!(
         before[0]["addr"].as_str(),
         Some(format!("127.0.0.1:{}", mover.peer_port).as_str()),
-        "a join's endpoint on the ACCEPTING side is the ephemeral port the connection \
-         arrived from, never the joiner's own listen port; that gap is what a Hello round \
-         trip closes: {before}"
+        "a join's endpoint on the ACCEPTING side is the port the joiner's own Hello \
+         announced; it used to be the ephemeral port the connection arrived from, and \
+         this assertion was the inverse until that was fixed: {before}"
     );
 
     step(
