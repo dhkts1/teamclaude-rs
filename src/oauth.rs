@@ -815,11 +815,30 @@ pub struct Profile {
     pub seat_tier: Option<String>,
 }
 
+impl Profile {
+    /// `account.email`, or `None` when the fetch failed or the endpoint sent none.
+    pub fn email(&self) -> Option<&str> {
+        self.email.as_deref()
+    }
+
+    /// `account.uuid`, or `None` when the fetch failed or the endpoint sent none.
+    pub fn account_uuid(&self) -> Option<&str> {
+        self.account_uuid.as_deref()
+    }
+}
+
 /// Fetch the account+org identity from the profile endpoint. Returns an
 /// all-`None` [`Profile`] on any failure (network, non-2xx, or malformed body)
 /// so the caller can still prompt for a name and login without org info. Serde
 /// ignores unknown fields, so extra profile keys are harmless.
 pub async fn fetch_profile(access_token: &str) -> Profile {
+    fetch_profile_at(PROFILE_URL, access_token).await
+}
+
+/// [`fetch_profile`] against an explicit profile URL — the proxy's client-identity
+/// check resolves a client bearer against its configured upstream, which in tests
+/// is a local fake rather than [`PROFILE_URL`].
+pub async fn fetch_profile_at(url: &str, access_token: &str) -> Profile {
     #[derive(Deserialize)]
     struct ProfileResponse {
         account: Option<ProfileAccount>,
@@ -839,10 +858,10 @@ pub async fn fetch_profile(access_token: &str) -> Profile {
         seat_tier: Option<String>,
     }
 
-    async fn inner(access_token: &str) -> Option<ProfileResponse> {
+    async fn inner(url: &str, access_token: &str) -> Option<ProfileResponse> {
         let client = reqwest::Client::builder().no_proxy().build().ok()?;
         let response = client
-            .get(PROFILE_URL)
+            .get(url)
             .header("Authorization", format!("Bearer {access_token}"))
             .send()
             .await
@@ -854,7 +873,7 @@ pub async fn fetch_profile(access_token: &str) -> Profile {
     }
 
     let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
-    match inner(access_token).await {
+    match inner(url, access_token).await {
         Some(profile) => {
             let account = profile.account;
             let organization = profile.organization;

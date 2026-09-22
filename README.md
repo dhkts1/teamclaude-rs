@@ -270,8 +270,12 @@ intentional (Claude Code needs it), but treat it as a tunnel rather than a firew
 hosts actually terminate depends on the leaf certificate in use, which
 [`MITM-DESIGN.md`](MITM-DESIGN.md) works through.
 
-**Credentials.** The client's own `authorization` and `x-api-key` headers are dropped before
-the pooled Bearer is injected, so a client credential is never forwarded alongside ours.
+**Credentials.** On the two inference paths the client's own `authorization` and `x-api-key`
+headers are dropped before the pooled Bearer is injected, so a client credential is never
+forwarded alongside ours. Everything else a client sends with its own bearer — connector
+list, plugins, settings, bootstrap — is relayed under that bearer untouched, because those
+calls are about the client's identity, and the proxy checks that identity against
+`controlAccount` (`controlIdentity` in [`docs/configuration.md`](docs/configuration.md)).
 `git config core.hooksPath .githooks` enables a pre-commit secret scan and the other gates
 listed in [CONTRIBUTING.md](CONTRIBUTING.md#git-hooks). Treat it as a backstop: it only sees
 what you stage, and `--no-verify` exists.

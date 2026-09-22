@@ -292,6 +292,7 @@ fn fleet(accounts: Vec<Account>) -> Arc<Manager> {
         control_account: None,
         control_reserve: CONTROL_RESERVE,
         control_pooled: false,
+        control_identity: Default::default(),
         reset_urgency_tier_hours: 24,
         http1_only: false,
         accounts,

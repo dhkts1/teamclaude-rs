@@ -44,6 +44,7 @@ section below.
 | `accountThrottle` | object | `{minSpacingMs: 350, burst: 8}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
 | `fleetThrottle` | object | `{minSpacingMs: 100, burst: 16}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
 | `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` |
+| `controlIdentity` | `"refuse"` \| `"warn"` \| `"off"` | **`"refuse"`** | no | what to do with a client whose own login is not `controlAccount`, see below |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
 | `pricing` | object | `{}` → the built-in table only | no | per-model price overrides for the usage figures, see below |
 | `usageRetentionDays` | u32 | **`90`** | no | how many days of usage ledger files to keep |
@@ -349,7 +350,7 @@ Consequences worth knowing before you tune either number:
 | `sessionAffinity` | bool | **`true`** (ON) | no | pin a session to the account it started on |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
-| `throttleExemptNoise` | bool | **`false`** (OFF) | no | let `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) skip the **per-org** bucket instead of queueing behind inference. It still pays `fleetThrottle`, so exempt traffic is never entirely unpaced |
+| `throttleExemptNoise` | bool | **`false`** (OFF) | no | let `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) skip the **per-org** bucket instead of queueing behind inference. It still pays `fleetThrottle`, so exempt traffic is never entirely unpaced. Only a request with **no client bearer** is classified at all — one that carries its own is relayed under it and never enters a bucket (see [`controlIdentity`](#controlidentity-the-client-must-be-the-control-account)) |
 | `divertBudget` | u32 | **`0`** (unlimited) | no | max distinct destination accounts one session may be diverted to inside a single hold episode; `0` = unlimited, today's behaviour byte-for-byte |
 
 ### `sessionAffinity` also pins identity-less loopback requests
@@ -446,7 +447,10 @@ below if you relied on that.
 The trap is `controlAccount`. That account is the identity plane's designated account, and by
 default inference requests **never** select it — not when it is enabled, not when it is idle.
 That is the point: it exists so login and quota bookkeeping keep coming from one stable
-account, and letting inference spend its quota is how you lose that. So by default a group
+account, and letting inference spend its quota is how you lose that. (Which account the
+connectors, plugins and settings come from is decided by the CLIENT's own login, not by this
+setting — see [`controlIdentity`](#controlidentity-the-client-must-be-the-control-account)
+for how the two are held together.) So by default a group
 whose only member is the control account can never serve inference. Every request asking for
 it refuses, on every request. Nothing about the group looks wrong: it has a member, a
 colour, and a healthy line in `tcr status`.
@@ -517,6 +521,43 @@ Two things it deliberately is not:
 - **Not a per-account write.** Parking never touches `accounts[].disabled`, so unparking does
   not re-enable a member you benched by hand: that row stays disabled until `tcr enable`
   says otherwise, and `tcr status` keeps reporting it as `disabled` rather than `parked`.
+
+## `controlIdentity`: the client must BE the control account
+
+`controlAccount` cannot choose which account a client's connectors come from. The claude.ai
+connector transport (`mcp-proxy.anthropic.com`) never passes through the proxy — it is a
+blind tunnel carrying the client's own token — and the connector list (`/v1/mcp_servers`),
+plugins, skills, settings and the bootstrap are all relayed with the client's own bearer for
+the same reason: they are questions about the CLIENT's identity, and a pooled account
+answers them for somebody else. So "quota from many accounts, MCP from one" is arranged by
+the client being **logged in as** the control account, and the proxy can only check that it
+is. `controlIdentity` is that check.
+
+On the first request carrying a given bearer, the proxy resolves the identity behind it
+once, via `/api/oauth/profile` on the configured `upstream`, caches the answer under a hash
+of the bearer (the bearer itself is never stored), and compares it to `controlAccount` —
+by `accountUuid` when both sides carry one, otherwise by the email half of the account
+name. A refreshed token is a new bearer and is checked once more; nothing is re-asked per
+request.
+
+| value | on a mismatch |
+|---|---|
+| `"refuse"` (default) | `403` naming both identities and the fix: `/logout`, then `/login` as the control account. Applies to bookkeeping calls AND inference, so a wrong-account session fails at its first request rather than running for hours on the wrong connectors |
+| `"warn"` | served; one `WARN` line per bearer |
+| `"off"` | never resolved |
+
+Inert without a `controlAccount`, and for a request that carries no `Authorization:
+Bearer` (an API-key client). Fail-open on anything that is not a verified mismatch: a
+profile fetch that fails, or answers with neither email nor uuid, is served and is not
+cached, so a transient upstream failure neither blocks traffic nor pins a wrong answer. A
+control account whose name is not an email and whose row has no `accountUuid` cannot be
+verified against anything and is never refused.
+
+Measured before this existed (2026-09-22): a Claude Code keychain login that silently
+flipped to another account produced two hours of wrong-org 401/403/404 answers on every
+bookkeeping call, forced-refresh storms on the control account, and `Server not found` on
+every connector — and nothing anywhere named the cause. Boot-time snapshot: an edit needs a
+restart, and the `server started` line reports `control_identity=`.
 
 ## `controlPooled`: spends the control account's quota
 

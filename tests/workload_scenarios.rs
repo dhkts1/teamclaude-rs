@@ -231,6 +231,7 @@ impl Fleet {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts: accounts.iter().map(|(n, p)| account(n, *p)).collect(),
