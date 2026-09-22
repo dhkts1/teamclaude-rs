@@ -46,11 +46,21 @@ on every machine that already installed the app.
 
 ## Cutting a release
 
-One command, from the Mac that holds the keys:
+One command, from the Mac that holds the keys, in a checkout on `main` whose `Cargo.toml` already
+names the version:
 
 ```sh
-apps/macos/scripts/release-local.sh v0.2.0
+apps/macos/scripts/ship-release.sh 1.2.0              # add --dry-run to check without changing anything
+apps/macos/scripts/ship-release.sh 1.2.0 --install    # also install it here (restarts the local proxy)
 ```
+
+It checks that `ci` and `macos` passed on that exact commit, tags it, runs `release-local.sh`, opens
+the one PR that carries the appcast entry and the bump to the next version, merges it once its four
+required checks pass by name, and publishes the feed, read back through the GitHub API. It refuses
+rather than guesses at every step; its header says why each check exists. Signing stays on this
+Mac: the script chains the steps that used to be run by hand, and moves nothing to CI.
+
+The rest of this section is what each step does, for when one of them fails part-way.
 
 `release-local.sh` is a credential wrapper and nothing else. It reads the App Store Connect API key
 out of 1Password, materialises the `.p8` as a 0600 file in a private temp dir — `notarytool` takes
@@ -189,8 +199,9 @@ only once notes were actually shown. A fresh install records the current version
 7. **Sparkle signature** — `sign_update` produces the EdDSA signature and byte length.
 8. **Appcast** — a new `<item>` is inserted at the marker comment in `apps/macos/appcast.xml`.
 9. **Publish** — `gh release upload` puts the DMG and `appcast.xml` on the release for the tag.
-10. **Publish the feed** — a separate, manual step: once that `<item>` is committed to main,
-    `apps/macos/scripts/publish-appcast-feed.sh` pushes it to `gh-pages`. This is the step
+10. **Publish the feed** — outside `release-tcrbar.sh` (which makes no git writes): once that
+    `<item>` is committed to main, `apps/macos/scripts/publish-appcast-feed.sh` pushes it to
+    `gh-pages`. `ship-release.sh` runs it; a hand release has to. This is the step
     `SUFeedURL` actually reads; step 9's upload now exists only to keep pre-migration installs
     working. See "The update feed" above.
 
