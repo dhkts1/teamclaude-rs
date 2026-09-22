@@ -681,7 +681,10 @@ fn prefix_session_key(
 /// session survives reconnects on one account (warm prompt cache). Priority:
 ///   1. the `x-api-key` header (distinct team keys → distinct accounts) — but
 ///      SKIPPED when it equals the configured proxy key, since the shared proxy
-///      secret is not a per-client identity (every remote client sends it), else
+///      secret is not a per-client identity (every remote client sends it), and
+///      DEMOTED below tier 2 for a LOOPBACK client, whose key is whatever its
+///      launcher exported and may be one placeholder shared by every process on
+///      the box (the 2026-09-22 measurement is in the function body), else
 ///   2. the body's top-level `metadata.user_id` (the loopback/personal path,
 ///      where there's no distinguishing x-api-key). Claude Code sends this as a
 ///      STRINGIFIED JSON blob `{"device_id":"…","account_uuid":"…","session_id":"…"}`.
@@ -737,11 +740,26 @@ fn stable_session_key(
     path: &str,
     client_is_loopback: bool,
 ) -> Option<(u64, SessionKind)> {
-    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        // The shared proxy secret is not a client identity — skip it so remote
-        // clients don't all collapse onto one account.
-        if proxy_key != Some(key) {
-            return Some((stable_hash("key:", key), SessionKind::Stable));
+    // The shared proxy secret is not a client identity — skip it so remote
+    // clients don't all collapse onto one account.
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|key| proxy_key != Some(*key))
+        .map(|key| (stable_hash("key:", key), SessionKind::Stable));
+
+    // A REMOTE client's key is its identity (tier 1 first). On LOOPBACK the
+    // key is whatever the wrapper that launched `claude` exported, and the
+    // api-key gate never checked it, so it may be one placeholder shared by
+    // every process on the box: measured 2026-09-22, 34 `claude` processes
+    // under one `ANTHROPIC_API_KEY=via-tcr` collapsed onto ONE session key,
+    // 14,628 requests routed as one conversation, one account run to 100% of
+    // its window and the next one handed advisor results minted on the first.
+    // So on loopback the body's per-conversation `metadata.user_id` outranks
+    // the header, and the header keys only a client that sends no `user_id`.
+    if !client_is_loopback {
+        if let Some(key) = api_key {
+            return Some(key);
         }
     }
 
@@ -755,6 +773,9 @@ fn stable_session_key(
         .and_then(|m| m.user_id.as_deref())
     {
         return Some((stable_hash("uid:", user_id), SessionKind::Stable));
+    }
+    if let Some(key) = api_key {
+        return Some(key);
     }
 
     // Tier 3's scope guard — see the doc-comment above for why both halves are
@@ -5745,11 +5766,49 @@ mod tests {
     }
 
     #[test]
-    fn stable_session_key_prefers_api_key_over_user_id() {
+    fn stable_session_key_prefers_api_key_over_user_id_for_a_remote_client() {
         let body = br#"{"metadata":{"user_id":"user-123"}}"#;
-        let with_key = messages_key(&headers_with_api_key("the-key"), body, None);
-        let key_only = messages_key(&headers_with_api_key("the-key"), b"{}", None);
-        assert_eq!(with_key, key_only, "x-api-key must win over user_id");
+        let remote = |h: &HeaderMap, b: &[u8]| {
+            stable_session_key(h, b, None, &Method::POST, "/v1/messages", false)
+        };
+        let with_key = remote(&headers_with_api_key("the-key"), body);
+        let key_only = remote(&headers_with_api_key("the-key"), b"{}");
+        assert_eq!(
+            with_key, key_only,
+            "a remote client's x-api-key is its identity and wins over user_id"
+        );
+    }
+
+    /// The 2026-09-22 fleet collapse: every `tcr run` coder on the box exports
+    /// the same placeholder `ANTHROPIC_API_KEY`, so on loopback the header is
+    /// not an identity. The body's per-conversation `user_id` must key instead,
+    /// so two coders sharing one placeholder get two pins; a loopback client
+    /// that sends no `user_id` still keys on the header as before.
+    #[test]
+    fn stable_session_key_prefers_user_id_over_a_shared_key_on_loopback() {
+        let h = headers_with_api_key("via-tcr");
+        let coder_a = messages_key(&h, br#"{"metadata":{"user_id":"coder-a"}}"#, None);
+        let coder_b = messages_key(&h, br#"{"metadata":{"user_id":"coder-b"}}"#, None);
+        assert!(coder_a.is_some() && coder_b.is_some());
+        assert_ne!(
+            coder_a, coder_b,
+            "two loopback clients sharing one placeholder key must not share a pin"
+        );
+        let via_uid = messages_key(
+            &HeaderMap::new(),
+            br#"{"metadata":{"user_id":"coder-a"}}"#,
+            None,
+        );
+        assert_eq!(
+            coder_a, via_uid,
+            "on loopback the user_id is the discriminator, the header is ignored"
+        );
+        let key_only = messages_key(&h, b"{}", None);
+        assert!(
+            key_only.is_some(),
+            "a loopback client with a key and no user_id still keys on the header"
+        );
+        assert_ne!(key_only, coder_a);
     }
 
     #[test]

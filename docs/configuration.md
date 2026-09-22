@@ -355,7 +355,10 @@ Consequences worth knowing before you tune either number:
 ### `sessionAffinity` also pins identity-less loopback requests
 
 "Pin a session to the account it started on" normally means keying on an `x-api-key` or the
-body's `metadata.user_id` — a stable per-client identity. With `sessionAffinity` on, a
+body's `metadata.user_id` — a stable per-client identity. For a remote client the key comes
+first; for a **loopback** client the `user_id` comes first, because a loopback key is whatever
+the launcher exported and can be one placeholder shared by every `claude` on the box (measured
+2026-09-22: 34 coders under one `ANTHROPIC_API_KEY`, routed as one session). With `sessionAffinity` on, a
 **loopback** `POST /v1/messages` that carries **neither** — a plain SDK call or a bare
 `curl`, not `claude`, which always sends `metadata.user_id` — is still pinned, on a hash of
 its `system` + `tools` fields (its Anthropic prompt-cache prefix) instead of a client
