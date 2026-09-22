@@ -2727,9 +2727,10 @@ pub fn punch_plan_from_slot(secret: &[u8; 32], first: u64, slots: u32) -> Vec<Pu
 /// Macs again, or stop expecting a direct path from this network at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PunchFailure {
-    /// No peer has ever told this Mac where it sees that peer, so there is no
-    /// address to aim at. The ordinary answer for a pair that has only ever
-    /// met on one LAN.
+    /// No peer has ever told this Mac where it sees that peer, and the row
+    /// holds no dialable endpoint either, so there is no address to aim at.
+    /// The ordinary answer for a pair that has only ever met on one LAN with
+    /// no direct locator recorded.
     PeerAddressUnknown,
     /// No completed handshake with this peer since boot and no secret on its
     /// row, so the pair cannot compute a port. The pair still shares a key:
@@ -2774,8 +2775,8 @@ impl std::fmt::Display for PunchFailure {
         match self {
             Self::PeerAddressUnknown => write!(
                 f,
-                "punch: no peer has told this Mac an address for that one, so there is \
-                 nothing to punch at"
+                "punch: no peer has told this Mac an address for that one, and the row \
+                 holds no dialable endpoint either, so there is nothing to punch at"
             ),
             Self::NoRendezvousSecret => write!(
                 f,
@@ -2806,28 +2807,68 @@ impl std::fmt::Display for PunchFailure {
 
 impl std::error::Error for PunchFailure {}
 
+/// The address to aim a punch at from a row's own endpoints, when the
+/// observation register has nothing.
+///
+/// Three rules and nothing else: only a locator this node can dial itself
+/// ([`crate::peer::config::Endpoint::direct_addr`]), a preference for one
+/// whose IP is not LAN scope over one that is
+/// ([`crate::peer::listener::is_lan_scope`] reads a tailnet address as
+/// internet scope, which is correct here: a tailnet address is directly
+/// dialable), and otherwise the row's own order, which is newest observation
+/// first. Every direct locator on the row qualifies whatever its band: each
+/// got there under a rule that already proved it.
+pub fn aimable_address(endpoints: &[crate::peer::config::Endpoint]) -> Option<SocketAddr> {
+    let dialable: Vec<SocketAddr> = endpoints
+        .iter()
+        .filter_map(crate::peer::config::Endpoint::direct_addr)
+        .collect();
+    dialable
+        .iter()
+        .find(|addr| !crate::peer::listener::is_lan_scope(addr.ip()))
+        .or_else(|| dialable.first())
+        .copied()
+}
+
 /// What a punch at `peer` needs before it starts: an address to aim at and the
 /// pair's secret.
 ///
 /// One function rather than two lookups at the call site, because "can these
 /// two punch" is one question with two named answers, and a caller that asked
 /// it in two places would print two different sentences for the same state.
-pub fn punch_target(peer: &tcr_peer_wire::PeerId) -> Result<(IpAddr, [u8; 32]), PunchFailure> {
-    let Some(seen) = observed_peer_for(peer) else {
+///
+/// The address comes from either of two places. The per boot observation
+/// register first, because a source address a connection just arrived from is
+/// the freshest fact there is; the row's own endpoints when the register has
+/// nothing, because the register is never persisted and is empty for every
+/// peer after any restart, move or no move, while the row may already hold
+/// that peer's current public address from a moved link or a fetched dead
+/// drop.
+pub fn punch_target(
+    peer: &tcr_peer_wire::PeerId,
+    endpoints: &[crate::peer::config::Endpoint],
+) -> Result<(IpAddr, [u8; 32]), PunchFailure> {
+    let seen = observed_peer_for(peer)
+        .map(|addr| addr.ip())
+        .or_else(|| aimable_address(endpoints).map(|addr| addr.ip()));
+    let Some(ip) = seen else {
         return Err(PunchFailure::PeerAddressUnknown);
     };
     let Some(secret) = port_secret_for(peer) else {
         return Err(PunchFailure::NoRendezvousSecret);
     };
-    Ok((seen.ip(), secret))
+    Ok((ip, secret))
 }
 
 /// Whether a punch at `peer` could be attempted right now.
 ///
 /// The question `tcr peer reach` prints an answer to, stated as one call so
 /// the verb and the dial cannot disagree about what "possible" means.
-pub fn punch_is_possible(peer: &tcr_peer_wire::PeerId) -> bool {
-    punch_target(peer).is_ok()
+pub fn punch_is_possible(
+    peer: &tcr_peer_wire::PeerId,
+    endpoints: &[crate::peer::config::Endpoint],
+) -> bool {
+    punch_target(peer, endpoints).is_ok()
 }
 
 /// The two sockets a punch needs, as the one seam a test can stand behind.
@@ -3102,6 +3143,7 @@ pub fn punch_request(
     peer: tcr_peer_wire::PeerId,
     slot: u64,
     public_addr: &str,
+    endpoints: &[crate::peer::config::Endpoint],
 ) -> Result<(IpAddr, Vec<PunchSlot>), PunchFailure> {
     let Ok(addr) = public_addr.parse::<SocketAddr>() else {
         return Err(PunchFailure::AddressNotUnderstood {
@@ -3109,7 +3151,7 @@ pub fn punch_request(
         });
     };
     remember_observed_peer(peer, addr);
-    let (peer_ip, secret) = punch_target(&peer)?;
+    let (peer_ip, secret) = punch_target(&peer, endpoints)?;
     Ok((peer_ip, punch_plan_from_slot(&secret, slot, PUNCH_SLOTS)))
 }
 
@@ -3163,12 +3205,16 @@ pub fn punch_slots_within(
 /// id.
 ///
 /// Greppable, in the shape the rest of that verb already prints.
-pub fn reach_punch_line(label: &str, peer: &tcr_peer_wire::PeerId) -> String {
+pub fn reach_punch_line(
+    label: &str,
+    peer: &tcr_peer_wire::PeerId,
+    endpoints: &[crate::peer::config::Endpoint],
+) -> String {
     let seen = match observed_self_for(peer) {
         Some(addr) => addr.to_string(),
         None => "not told (that Mac has not greeted this one since boot)".to_string(),
     };
-    let punch = match punch_target(peer) {
+    let punch = match punch_target(peer, endpoints) {
         Ok(_) => "yes".to_string(),
         Err(failure) => format!("no: {failure}"),
     };

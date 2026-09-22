@@ -3029,7 +3029,7 @@ async fn punch_dial(
 ) -> Result<(SocketAddr, PeerStream), crate::peer::reach::PunchFailure> {
     use crate::peer::reach::{self, PunchFailure};
 
-    let (peer_ip, secret) = reach::punch_target(&row.node)?;
+    let (peer_ip, secret) = reach::punch_target(&row.node, &row.endpoints)?;
     let Some(mine) = reach::self_address_for(&row.node) else {
         return Err(PunchFailure::SelfAddressUnknown);
     };

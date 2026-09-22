@@ -447,7 +447,7 @@ fn a_punch_request_plans_from_the_slot_it_was_told() {
     // recorded, because an address a peer just told us is the freshest one
     // there is.
     assert_eq!(
-        reach::punch_request(peer, 7_000, "203.0.113.30:41000"),
+        reach::punch_request(peer, 7_000, "203.0.113.30:41000", &[]),
         Err(PunchFailure::NoRendezvousSecret)
     );
     assert_eq!(
@@ -458,7 +458,7 @@ fn a_punch_request_plans_from_the_slot_it_was_told() {
 
     let secret = [0x82_u8; 32];
     reach::remember_port_secret(peer, secret);
-    let (ip, plan) = reach::punch_request(peer, 7_000, "203.0.113.30:41000")
+    let (ip, plan) = reach::punch_request(peer, 7_000, "203.0.113.30:41000", &[])
         .expect("with a secret held, the request is answerable");
     assert_eq!(ip, told.ip(), "aimed at the address the peer gave");
     assert_eq!(
@@ -479,7 +479,7 @@ fn a_punch_request_plans_from_the_slot_it_was_told() {
 fn a_punch_request_with_an_unreadable_address_is_named() {
     let peer = tcr_peer_wire::PeerId([0x83; 32]);
     assert_eq!(
-        reach::punch_request(peer, 1, "over there"),
+        reach::punch_request(peer, 1, "over there", &[]),
         Err(PunchFailure::AddressNotUnderstood {
             told: "over there".to_string()
         }),
@@ -527,7 +527,7 @@ fn a_punch_takes_only_the_slots_that_fit_the_dials_budget() {
 #[test]
 fn the_reach_line_says_what_a_mac_sees_us_as_and_whether_a_punch_is_possible() {
     let peer = tcr_peer_wire::PeerId([0x85; 32]);
-    let unknown = reach::reach_punch_line("laptop-2", &peer);
+    let unknown = reach::reach_punch_line("laptop-2", &peer, &[]);
     assert!(
         unknown.contains("sees-us-at: not told") && unknown.contains("punch-possible: no:"),
         "a pair that has never met off the LAN says so, and says why it cannot punch: \
@@ -543,7 +543,7 @@ fn the_reach_line_says_what_a_mac_sees_us_as_and_whether_a_punch_is_possible() {
         "203.0.113.41:41001".parse().expect("a test address parses"),
     );
     reach::remember_port_secret(peer, [0x86; 32]);
-    let known = reach::reach_punch_line("laptop-2", &peer);
+    let known = reach::reach_punch_line("laptop-2", &peer, &[]);
     assert!(
         known.contains("sees-us-at: 203.0.113.40:41000") && known.contains("punch-possible: yes"),
         "and once both halves are held it prints the address and says yes: {known}"
