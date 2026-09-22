@@ -1308,6 +1308,85 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
     (tool_uses, tool_results)
 }
 
+/// Most `server_tool_use` ids one request's history is scanned for. A conversation accumulates
+/// one per server-side tool call, and they all name the same account (see
+/// `Manager::server_tool_pin_account`), so the first handful is already more than enough to
+/// resolve the minting account — the cap exists so a long conversation costs a fixed amount
+/// here, not a growing one.
+pub const SERVER_TOOL_ID_SCAN_CAP: usize = 16;
+
+/// Every `server_tool_use` id carried anywhere in a request's `messages`.
+///
+/// Deliberately NOT the bounded tail [`extract_tool_events`] walks: a server-side tool block
+/// (`--advisor` today) and the encrypted result beside it stay in the conversation history for
+/// its whole life, and it is the OLD ones that still pin the request — Claude Code echoes the
+/// pair back on every later turn, and the API rejects the whole request on any account but the
+/// one that minted the id. A tail scan would find them on turn two and miss them forever after,
+/// which is the same as not having this at all.
+///
+/// Cheap by construction: each block is read as `type` + `id` and nothing else, so the
+/// megabyte-scale `encrypted_content` string beside it is skipped rather than materialized.
+/// Ordinary `tool_use` blocks (client-side tools, `toolu_…`) are not server-side and are
+/// ignored. Capped at [`SERVER_TOOL_ID_SCAN_CAP`].
+///
+/// Role is not checked. The blocks are only ever emitted by the model, so they only ever appear
+/// in an `assistant` message; requiring the role would add a way for a body shaped slightly
+/// differently to lose its pin, and a client cannot gain anything by claiming an id — the worst
+/// a forged one does is bench the fleet down to the account that minted it.
+///
+/// `web_search` results carry the same `encrypted_content` shape and fail the same way on a
+/// foreign account; its block type is the next one to add here when it is worth the traffic.
+pub fn extract_server_tool_use_ids(messages: &RawValue) -> Vec<String> {
+    /// One content block, read for the two fields this scan needs.
+    #[derive(serde::Deserialize)]
+    struct ServerToolBlockPeek {
+        #[serde(rename = "type", default)]
+        kind: String,
+        #[serde(default)]
+        id: Option<String>,
+    }
+    /// One message, whose `content` is kept borrowed so a message with no blocks at all costs
+    /// nothing beyond finding its end.
+    #[derive(serde::Deserialize)]
+    struct ContentPeek<'a> {
+        #[serde(borrow, default)]
+        content: Option<&'a RawValue>,
+    }
+
+    let mut ids: Vec<String> = Vec::new();
+    let Ok(all) = serde_json::from_str::<Vec<&RawValue>>(messages.get()) else {
+        return ids;
+    };
+    for raw in all {
+        let Ok(msg) = serde_json::from_str::<ContentPeek>(raw.get()) else {
+            continue;
+        };
+        // A string `content` (the common plain-text message) is not an array of blocks and
+        // cannot carry one of these — parsing it as blocks fails, which is the skip.
+        let Some(Ok(blocks)) = msg
+            .content
+            .map(|c| serde_json::from_str::<Vec<ServerToolBlockPeek>>(c.get()))
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.kind != "server_tool_use" {
+                continue;
+            }
+            let Some(id) = block.id else {
+                continue;
+            };
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+            if ids.len() >= SERVER_TOOL_ID_SCAN_CAP {
+                return ids;
+            }
+        }
+    }
+    ids
+}
+
 /// Build one [`ToolUseEvent`] from a `tool_use` block's `id`, `name` and `input`.
 ///
 /// Factored out of [`extract_tool_events`] because a `tool_use` block now reaches this table
@@ -2179,6 +2258,92 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "tu_1");
         assert!(!results[0].is_error);
+    }
+
+    /// The block pair the API sends back for a server-side tool call, in the shape captured off
+    /// the wire on 2026-09-22: the `server_tool_use` and its encrypted result both sit in ONE
+    /// assistant message, beside the ordinary text and `tool_use` blocks of that turn. The
+    /// `encrypted_content` here is a placeholder — a real one decodes only on the org that
+    /// minted it and has no business in a public repo.
+    fn advisor_pair(id: &str) -> serde_json::Value {
+        serde_json::json!([
+            {"type": "text", "text": "thinking"},
+            {"type": "server_tool_use", "id": id, "name": "advisor", "input": {}},
+            {"type": "advisor_tool_result", "tool_use_id": id,
+             "content": {"type": "advisor_redacted_result", "encrypted_content": "AAAA"}},
+        ])
+    }
+
+    /// The whole point of scanning ALL messages: the block that pins the conversation was
+    /// minted on turn one and is still echoed on turn ten, far outside the tail window
+    /// `extract_tool_events` walks.
+    #[test]
+    fn server_tool_ids_are_found_anywhere_in_the_history() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": advisor_pair("srvtoolu_fake_1")},
+            {"role": "user", "content": [tool_result("tu_1", false, "ok")]},
+            {"role": "assistant", "content": "just text"},
+            {"role": "user", "content": "another turn"},
+            {"role": "assistant", "content": [tool_use("tu_2", "Bash", Some("ls"))]},
+            {"role": "user", "content": [tool_result("tu_2", false, "ok")]},
+        ]);
+        let raw = messages_raw(messages);
+        assert_eq!(
+            extract_server_tool_use_ids(&raw),
+            vec!["srvtoolu_fake_1".to_string()]
+        );
+    }
+
+    /// A client-side `tool_use` is not a server-side one: its result travels in the request
+    /// body in plain text and any account can read it. Benching the fleet for one would be a
+    /// pure loss.
+    #[test]
+    fn a_client_side_tool_use_is_not_a_server_tool() {
+        let messages = serde_json::json!([
+            {"role": "assistant", "content": [tool_use("toolu_fake_1", "Bash", Some("ls"))]},
+            {"role": "user", "content": [tool_result("toolu_fake_1", false, "ok")]},
+            {"role": "user", "content": "plain text carries nothing"},
+        ]);
+        let raw = messages_raw(messages);
+        assert!(extract_server_tool_use_ids(&raw).is_empty());
+    }
+
+    #[test]
+    fn repeated_and_multiple_server_tool_ids_are_collected_once_each_and_capped() {
+        let mut history = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        for n in 0..(SERVER_TOOL_ID_SCAN_CAP + 5) {
+            history.push(serde_json::json!({
+                "role": "assistant",
+                "content": advisor_pair(&format!("srvtoolu_fake_{n}")),
+            }));
+            // The same id echoed again, as a real conversation does on every later turn.
+            history.push(serde_json::json!({
+                "role": "assistant",
+                "content": advisor_pair("srvtoolu_fake_0"),
+            }));
+        }
+        let raw = messages_raw(serde_json::Value::Array(history));
+        let ids = extract_server_tool_use_ids(&raw);
+        assert_eq!(ids.len(), SERVER_TOOL_ID_SCAN_CAP);
+        assert_eq!(ids[0], "srvtoolu_fake_0");
+        assert_eq!(
+            ids.iter().filter(|id| *id == "srvtoolu_fake_0").count(),
+            1,
+            "an id echoed on every turn is still one id"
+        );
+    }
+
+    #[test]
+    fn a_body_with_no_server_tool_blocks_yields_nothing() {
+        let raw = messages_raw(serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        ]));
+        assert!(extract_server_tool_use_ids(&raw).is_empty());
+        let malformed = serde_json::value::RawValue::from_string("\"not an array\"".to_string())
+            .expect("raw value");
+        assert!(extract_server_tool_use_ids(&malformed).is_empty());
     }
 
     #[test]

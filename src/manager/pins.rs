@@ -56,6 +56,21 @@ impl Manager {
         }
     }
 
+    /// The account `key` is currently pinned to, if any — a READ of the live map, with no
+    /// touch, no eviction and no re-pin.
+    ///
+    /// Only one caller: the server-tool bench in `proxy.rs`, which logs a line when the account
+    /// that minted a conversation's `server_tool_use` id is NOT the one affinity would have
+    /// picked, and stays silent when they agree. Routing does not consult it — the bench
+    /// narrows `tried`, and `select()` reads the map itself, under its own lock.
+    pub fn affinity_pin(&self, key: u64) -> Option<usize> {
+        self.affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(index, _)| index)
+    }
+
     /// The pin map as persistable records — each live pin's index replaced by the
     /// identity of the account at that index.
     ///

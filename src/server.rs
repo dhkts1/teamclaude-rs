@@ -2028,6 +2028,74 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         })));
     }
 
+    // The `server_tool_use` id → minting account map (see `teamclaude_rs::server_tool_pins`)
+    // survives a restart the same way pins do, and for a sharper reason: a restart is exactly
+    // when live conversations get re-keyed onto other accounts, and a conversation carrying an
+    // advisor result that lands on another account 400s on every remaining turn. Restored
+    // before the listener binds so the first request after a bounce is already pinned.
+    //
+    // Keyed on the affinity path — a sibling file in the same directory — rather than on its
+    // own `ServeOptions` field: the two caches must never land in different places, and an
+    // embedder that points `affinity_path` at a disposable directory gets this one redirected
+    // with it instead of writing into the live proxy's cache dir. `affinity_path: None`
+    // therefore means in-memory-only here too.
+    //
+    // NOT gated on `session_affinity_enabled`: this map is not session affinity. It is a
+    // correctness constraint on which account CAN answer a request, and it applies whether or
+    // not sessions are pinned for cache warmth.
+    if let Some(affinity_path) = &affinity_path {
+        let server_tool_path = crate::server_tool_pins::path_beside(affinity_path);
+        let report = manager.restore_server_tool_pins(
+            &server_tool_path,
+            crate::server_tool_pins::SERVER_TOOL_PIN_TTL_MS,
+        );
+        if let Some(reason) = &report.degraded {
+            tracing::warn!(
+                path = %server_tool_path.display(),
+                reason = %reason,
+                "server-tool pins ignored; conversations minted before this boot may be re-keyed"
+            );
+        } else {
+            tracing::info!(
+                path = %server_tool_path.display(),
+                restored = report.pins.len(),
+                expired = report.expired,
+                unresolved = report.unresolved,
+                ambiguous = report.ambiguous,
+                "server-tool pins restored"
+            );
+        }
+
+        // Same debounced 5-second flush as the affinity pins above, same reason: `--replace`
+        // ends in a SIGKILL, and no shutdown path runs for one.
+        let flusher = manager.clone();
+        let flush_path = server_tool_path.clone();
+        let mut stop = shutdown_tx.subscribe();
+        background.push(tokio::spawn(supervise("server-tool-pin-flusher", async move {
+            let flush = async {
+                let mut ticker = tokio::time::interval(Duration::from_secs(5));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    if !flusher.take_server_tool_pins_dirty() {
+                        continue;
+                    }
+                    if let Err(err) = flusher.flush_server_tool_pins(&flush_path) {
+                        tracing::warn!(
+                            path = %flush_path.display(),
+                            error = %err,
+                            "could not write the server-tool pin file; conversations minted this boot may be re-keyed after a restart"
+                        );
+                    }
+                }
+            };
+            tokio::select! {
+                _ = flush => {}
+                _ = stop.changed() => {}
+            }
+        })));
+    }
+
     // The Sessions/Tools panel cache (F1, `docs/design/panel-tabs.md`) survives a
     // restart the same way pins do — see `session_wire_persist` — restored before
     // the listener binds so the panel is populated from the first `tcr status`
