@@ -44,7 +44,7 @@ section below.
 | `accountThrottle` | object | `{minSpacingMs: 350, burst: 8}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
 | `fleetThrottle` | object | `{minSpacingMs: 100, burst: 16}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
 | `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` |
-| `controlIdentity` | `"refuse"` \| `"warn"` \| `"off"` | **`"refuse"`** | no | what to do with a client whose own login is not `controlAccount`, see below |
+| `controlIdentity` | `"refuse"` \| `"warn"` \| `"off"` | **`"warn"`** | no | what to do with a client whose own login is not `controlAccount`, see below |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
 | `pricing` | object | `{}` → the built-in table only | no | per-model price overrides for the usage figures, see below |
 | `usageRetentionDays` | u32 | **`90`** | no | how many days of usage ledger files to keep |
@@ -542,16 +542,32 @@ request.
 
 | value | on a mismatch |
 |---|---|
-| `"refuse"` (default) | `403` naming both identities and the fix: `/logout`, then `/login` as the control account. Applies to bookkeeping calls AND inference, so a wrong-account session fails at its first request rather than running for hours on the wrong connectors |
-| `"warn"` | served; one `WARN` line per bearer |
+| `"warn"` (default) | served; one `WARN` line per bearer naming both identities |
+| `"refuse"` | `403` naming both identities and the fix: `/logout`, then `/login` as the control account. Applies to bookkeeping calls AND inference, so a wrong-account session fails at its first request rather than running for hours on the wrong connectors |
 | `"off"` | never resolved |
+
+`warn` is the default for this release so the fleet can measure how common the drift is
+before anything is refused: a headless `tcr run` worker sharing a drifted keychain would be
+403 on every request after an upgrade, with the cause visible only in a response body nobody
+reads. Set `"controlIdentity": "refuse"` on an install where a wrong-account session must
+fail loudly; the intent is to make that the default once a release of warnings has been
+read.
 
 Inert without a `controlAccount`, and for a request that carries no `Authorization:
 Bearer` (an API-key client). Fail-open on anything that is not a verified mismatch: a
 profile fetch that fails, or answers with neither email nor uuid, is served and is not
 cached, so a transient upstream failure neither blocks traffic nor pins a wrong answer. A
-control account whose name is not an email and whose row has no `accountUuid` cannot be
-verified against anything and is never refused.
+bearer the profile endpoint refuses outright (401/403 — an expired or revoked token) is
+served too, and remembered as unresolvable for 60 seconds so a stale session does not pay
+a profile round trip before every request. A control account whose name is not an email
+and whose row has no `accountUuid` cannot be verified against anything and is never
+refused.
+
+"Pooled" means exactly two paths: `/v1/messages` and `/v1/messages/count_tokens`. Any
+other path a client sends with its own bearer — including one that merely starts with
+`/v1/messages`, such as a batches endpoint — is the client's own call and is relayed
+under the client's own credential and quota, the same split `RequestClass` draws for
+bearer-less traffic.
 
 Measured before this existed (2026-09-22): a Claude Code keychain login that silently
 flipped to another account produced two hours of wrong-org 401/403/404 answers on every

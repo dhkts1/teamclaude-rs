@@ -911,11 +911,14 @@ impl ThrottleConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ControlIdentityMode {
     /// Answer a mismatched client with a 403 naming both identities and the
-    /// fix. The default: a session on the wrong account fails at its first
-    /// request instead of running for hours with the wrong connectors.
-    #[default]
+    /// fix, so a session on the wrong account fails at its first request
+    /// instead of running for hours with the wrong connectors. Intended to
+    /// become the default once a release of `warn` has shown how common the
+    /// drift is; a headless `tcr run` worker sharing a drifted keychain would
+    /// otherwise be refused with nothing on any screen saying why.
     Refuse,
-    /// Serve the request, log the mismatch once per bearer.
+    /// Serve the request, log the mismatch once per bearer. The default.
+    #[default]
     Warn,
     /// Do not resolve client identities at all.
     Off,
@@ -1093,7 +1096,7 @@ pub struct Config {
     #[serde(default)]
     pub control_pooled: bool,
     /// What the proxy does with a client whose own OAuth identity is not the
-    /// control account. Absent → [`ControlIdentityMode::Refuse`]. Inert without a
+    /// control account. Absent → [`ControlIdentityMode::Warn`]. Inert without a
     /// `controlAccount`, and for a request that carries no `Authorization: Bearer`.
     #[serde(default)]
     pub control_identity: ControlIdentityMode,
@@ -4793,11 +4796,11 @@ mod tests {
     }
 
     /// `controlIdentity` reads its three lowercase spellings, defaults to
-    /// `refuse` when absent, and rejects anything else rather than guessing.
+    /// `warn` when absent, and rejects anything else rather than guessing.
     #[test]
-    fn control_identity_parses_lowercase_and_defaults_to_refuse() {
+    fn control_identity_parses_lowercase_and_defaults_to_warn() {
         let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
-        assert_eq!(config.control_identity, ControlIdentityMode::Refuse);
+        assert_eq!(config.control_identity, ControlIdentityMode::Warn);
         for (spelling, expected) in [
             ("refuse", ControlIdentityMode::Refuse),
             ("warn", ControlIdentityMode::Warn),

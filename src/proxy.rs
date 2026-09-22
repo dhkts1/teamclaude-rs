@@ -9988,6 +9988,7 @@ mod tests {
             let (email, uuid) = match client_bearer_of(&headers) {
                 Some("tok-alice") => ("alice@example.com", ALICE_UUID),
                 Some("tok-bob") => ("bob@example.com", BOB_UUID),
+                Some("tok-dead") => return StatusCode::UNAUTHORIZED.into_response(),
                 _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             };
             Json(serde_json::json!({
@@ -10067,9 +10068,9 @@ mod tests {
             String::from_utf8_lossy(&bytes).into_owned()
         }
 
-        // refuse (the default): bob is refused on a bookkeeping call and on
-        // inference, and neither reaches upstream.
-        let manager = manager_with(crate::config::ControlIdentityMode::default());
+        // refuse: bob is refused on a bookkeeping call and on inference, and
+        // neither reaches upstream.
+        let manager = manager_with(crate::config::ControlIdentityMode::Refuse);
         let response = app(manager.clone())
             .oneshot(request(
                 Method::GET,
@@ -10156,13 +10157,36 @@ mod tests {
         }
         assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 4);
 
+        // A bearer upstream REFUSES (expired or revoked) is served too, but is
+        // remembered: two requests on it cost one profile fetch, not two.
+        for _ in 0..2 {
+            let response = app(manager.clone())
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/messages?beta=true",
+                    Some("tok-dead"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a refused bearer is fail-open"
+            );
+        }
+        assert_eq!(
+            seen.profile_hits.load(Ordering::SeqCst),
+            5,
+            "a 401 on the profile endpoint is cached, a 500 is not"
+        );
+
         // No bearer: nothing to check, nothing asked.
         let response = app(manager.clone())
             .oneshot(request(Method::POST, "/v1/messages?beta=true", None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 4);
+        assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 5);
 
         // warn: bob is served.
         let manager = manager_with(crate::config::ControlIdentityMode::Warn);
@@ -10179,7 +10203,7 @@ mod tests {
             StatusCode::OK,
             "warn serves a foreign client"
         );
-        assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 5);
+        assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 6);
 
         // off: bob is served and the profile endpoint is never asked.
         let manager = manager_with(crate::config::ControlIdentityMode::Off);
@@ -10194,7 +10218,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             seen.profile_hits.load(Ordering::SeqCst),
-            5,
+            6,
             "off never resolves"
         );
     }

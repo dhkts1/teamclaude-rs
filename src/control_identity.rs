@@ -23,7 +23,10 @@
 //! Fail-open by design on anything that is not a verified mismatch: a profile
 //! fetch that fails, or one that comes back with no email and no uuid, is
 //! [`Verdict::Unknown`] and is NOT cached, so a transient upstream failure
-//! neither blocks traffic nor pins a wrong answer.
+//! neither blocks traffic nor pins a wrong answer. The one miss that IS
+//! remembered, briefly, is a bearer upstream refused outright (401/403): that
+//! answer does not change until the client refreshes, and a refreshed token is
+//! a new bearer — see [`UNRESOLVABLE_TTL_MS`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,13 +113,42 @@ pub fn verdict(control: &ControlIdentity, client: &ClientIdentity) -> Verdict {
     }
 }
 
+/// How long a bearer upstream REFUSED (401/403 on the profile endpoint) is
+/// remembered as unresolvable before it is asked about again. Without this, a
+/// session holding an expired or revoked token paid a fresh profile round trip —
+/// new TLS handshake included — before every request, inference too, for as long
+/// as it lived; a fleet of stale sessions is one upstream call per request.
+/// Short, because the answer is only ever "still dead": a client that recovers
+/// does so by refreshing, and a refreshed token is a new bearer.
+const UNRESOLVABLE_TTL_MS: i64 = 60_000;
+
+/// What one bearer resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resolved {
+    Identity(ClientIdentity),
+    /// Upstream refused the bearer outright. Held until `until_ms`, then the
+    /// entry is dropped and the next request asks again.
+    Unresolvable {
+        until_ms: i64,
+    },
+}
+
 #[derive(Default)]
 struct Entry {
-    identity: OnceCell<ClientIdentity>,
+    resolved: OnceCell<Resolved>,
     /// Set by the first request that logged this bearer's mismatch, so a
     /// client that fires ten bookkeeping calls at startup produces one line,
     /// not ten.
     warned: AtomicBool,
+}
+
+impl Entry {
+    fn expired_at(&self, now_ms: i64) -> bool {
+        matches!(
+            self.resolved.get(),
+            Some(Resolved::Unresolvable { until_ms }) if *until_ms <= now_ms
+        )
+    }
 }
 
 /// Resolved client identities, keyed by a SHA-256 of the bearer. The bearer
@@ -135,9 +167,12 @@ impl ClientIdentityCache {
         Self::default()
     }
 
-    async fn entry(&self, bearer: &str) -> Arc<Entry> {
+    async fn entry(&self, bearer: &str, now_ms: i64) -> Arc<Entry> {
         let key = key_of(bearer);
         let mut entries = self.entries.lock().await;
+        if entries.get(&key).is_some_and(|e| e.expired_at(now_ms)) {
+            entries.remove(&key);
+        }
         if entries.len() >= CACHE_CAP && !entries.contains_key(&key) {
             entries.clear();
         }
@@ -146,34 +181,56 @@ impl ClientIdentityCache {
 
     /// The identity behind `bearer`, fetched from `profile_url` on first sight
     /// and cached afterwards. Concurrent first sights of one bearer share a
-    /// single fetch (`OnceCell::get_or_try_init`). `None` — a fetch that failed
-    /// or answered with no identity — is not cached, so the next request tries
-    /// again.
+    /// single fetch (`OnceCell::get_or_try_init`). `None` is either a bearer
+    /// upstream refused — remembered for [`UNRESOLVABLE_TTL_MS`] — or a fetch
+    /// that failed or answered with no identity, which is not cached at all, so
+    /// the next request tries again.
     pub async fn resolve(&self, profile_url: &str, bearer: &str) -> Option<ClientIdentity> {
-        let entry = self.entry(bearer).await;
-        entry
-            .identity
+        self.resolve_at(profile_url, bearer, crate::now_ms()).await
+    }
+
+    /// [`Self::resolve`] at an explicit clock, so the TTL is testable.
+    pub async fn resolve_at(
+        &self,
+        profile_url: &str,
+        bearer: &str,
+        now_ms: i64,
+    ) -> Option<ClientIdentity> {
+        use crate::oauth::ProfileFetchError;
+
+        let entry = self.entry(bearer, now_ms).await;
+        let resolved = entry
+            .resolved
             .get_or_try_init(|| async {
-                let profile = crate::oauth::fetch_profile_at(profile_url, bearer).await;
-                let identity = ClientIdentity {
-                    email: profile.email().map(str::to_string),
-                    account_uuid: profile.account_uuid().map(str::to_string),
-                };
-                if identity.email.is_none() && identity.account_uuid.is_none() {
-                    Err(())
-                } else {
-                    Ok(identity)
+                match crate::oauth::try_fetch_profile_at(profile_url, bearer).await {
+                    Ok(profile) => {
+                        let identity = ClientIdentity {
+                            email: profile.email().map(str::to_string),
+                            account_uuid: profile.account_uuid().map(str::to_string),
+                        };
+                        if identity.email.is_none() && identity.account_uuid.is_none() {
+                            Err(())
+                        } else {
+                            Ok(Resolved::Identity(identity))
+                        }
+                    }
+                    Err(ProfileFetchError::Status(401 | 403)) => Ok(Resolved::Unresolvable {
+                        until_ms: now_ms + UNRESOLVABLE_TTL_MS,
+                    }),
+                    Err(_) => Err(()),
                 }
             })
-            .await
-            .ok()
-            .cloned()
+            .await;
+        match resolved {
+            Ok(Resolved::Identity(identity)) => Some(identity.clone()),
+            _ => None,
+        }
     }
 
     /// `true` exactly once per bearer: the caller that gets it writes the log
     /// line, every later caller stays quiet.
     pub async fn first_warning(&self, bearer: &str) -> bool {
-        let entry = self.entry(bearer).await;
+        let entry = self.entry(bearer, crate::now_ms()).await;
         !entry.warned.swap(true, Ordering::Relaxed)
     }
 
@@ -379,5 +436,75 @@ mod tests {
             "one fetch for ten concurrent first sightings of one bearer"
         );
         assert_eq!(cache.len().await, 2);
+    }
+
+    /// A bearer upstream refuses is remembered for the TTL and asked about again
+    /// after it; a transport-class failure (here a 500) is never remembered.
+    #[tokio::test]
+    async fn a_refused_bearer_is_remembered_for_the_ttl_then_asked_again() {
+        use axum::{extract::State, routing::get, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Clone)]
+        struct Fake {
+            hits: Arc<AtomicUsize>,
+        }
+        async fn profile(
+            State(f): State<Fake>,
+            headers: axum::http::HeaderMap,
+        ) -> axum::http::StatusCode {
+            f.hits.fetch_add(1, Ordering::SeqCst);
+            match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                Some("Bearer tok-dead") => axum::http::StatusCode::UNAUTHORIZED,
+                _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        }
+
+        let fake = Fake {
+            hits: Arc::new(AtomicUsize::new(0)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/api/oauth/profile", get(profile))
+            .with_state(fake.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}/api/oauth/profile");
+        let cache = ClientIdentityCache::new();
+        let t0 = 1_000_000;
+
+        assert_eq!(cache.resolve_at(&url, "tok-dead", t0).await, None);
+        assert_eq!(
+            cache
+                .resolve_at(&url, "tok-dead", t0 + UNRESOLVABLE_TTL_MS - 1)
+                .await,
+            None
+        );
+        assert_eq!(
+            fake.hits.load(Ordering::SeqCst),
+            1,
+            "inside the TTL the refusal is remembered, not re-fetched"
+        );
+        assert_eq!(
+            cache
+                .resolve_at(&url, "tok-dead", t0 + UNRESOLVABLE_TTL_MS)
+                .await,
+            None
+        );
+        assert_eq!(
+            fake.hits.load(Ordering::SeqCst),
+            2,
+            "at the TTL the entry is dropped and upstream is asked again"
+        );
+
+        assert_eq!(cache.resolve_at(&url, "tok-500", t0).await, None);
+        assert_eq!(cache.resolve_at(&url, "tok-500", t0).await, None);
+        assert_eq!(
+            fake.hits.load(Ordering::SeqCst),
+            4,
+            "a 500 is not a verdict on the bearer and is never remembered"
+        );
     }
 }
