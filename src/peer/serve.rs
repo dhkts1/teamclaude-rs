@@ -3029,7 +3029,30 @@ async fn punch_dial(
 ) -> Result<(SocketAddr, PeerStream), crate::peer::reach::PunchFailure> {
     use crate::peer::reach::{self, PunchFailure};
 
-    let (peer_ip, secret) = reach::punch_target(&row.node, &row.endpoints)?;
+    // **The one refusal worth a second question.** `PeerAddressUnknown` is the
+    // only one an exchange can answer: it means nothing on this Mac knows where
+    // that peer is, which is precisely the state a hint fixes. Every other
+    // refusal is about the pair, the slot or this Mac, so asking the peer
+    // anything would spend a carried round trip to learn what is already
+    // known, and each returns exactly as it did before this step existed.
+    //
+    // ONE exchange, never a loop. A second ask against a peer that did not
+    // answer the first spends a slot's worth of the caller's budget for
+    // nothing, and there is no third thing to learn from asking twice.
+    let (peer_ip, secret) = match reach::punch_target(&row.node, &row.endpoints) {
+        Ok(found) => found,
+        Err(PunchFailure::PeerAddressUnknown) => {
+            let learned = exchange_addresses(row, store, borrow_timeout_ms).await;
+            tracing::debug!(
+                peer = %row.node.display(),
+                learned,
+                "peer punch: nothing here knew where that peer is, so this node asked it \
+                 through a friend before aiming"
+            );
+            reach::punch_target(&row.node, &row.endpoints)?
+        }
+        Err(refused) => return Err(refused),
+    };
     let Some(mine) = reach::self_address_for(&row.node) else {
         return Err(PunchFailure::SelfAddressUnknown);
     };
@@ -3213,6 +3236,140 @@ async fn ask_through_a_friend(
         }
     }
     None
+}
+
+/// How long the address exchange waits for the other Mac's hint back.
+///
+/// Bounded twice over, and both bounds matter. Never more than the caller's
+/// own borrow timeout, because a dial that overran it would report a peer
+/// unreachable after the operator's patience had already run out. And never
+/// more than this, because the answer is one frame on a stream that is already
+/// open and a peer that heard the hint but says nothing back would otherwise
+/// eat the punch that follows: the exchange exists to make the punch possible,
+/// so spending the punch's own waiting time on it is the one way it can make
+/// things worse. Five seconds is a whole `Probe` round trip across a relay
+/// with room to spare.
+const HINT_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Swap current addresses with `row`'s Mac through a friend they can both
+/// still reach. Answers whether an address was learned.
+///
+/// # The moment this is for
+///
+/// Both Macs changed networks, so each one's recorded address for the other is
+/// somewhere neither of them is any more. Neither can be told anything
+/// directly and neither has anything to aim at. What they do still share is a
+/// friend, so the hint goes out over the friend and the answer comes back on
+/// the same stream: one round trip, and then a direct path between the two of
+/// them that the friend carries nothing more of.
+///
+/// # One exchange, one answer read
+///
+/// Exactly one bounded [`recv_control`], on [`HINT_ANSWER_TIMEOUT`]. A peer
+/// running a build with no arm for this frame closes the session instead of
+/// answering, which reads here as "this peer does not exchange addresses" and
+/// is the same thing the prober already does with an unanswered `Probe`: the
+/// caller falls through to the carry, which still works.
+///
+/// An answer naming a Mac other than the one asked is refused rather than
+/// believed. A hint is about its own sender, and a third party's address
+/// travels as a `NeighborBrief` under a grant
+/// ([`crate::peer::discovery::neighbor_brief_endpoints`]); believing one here
+/// would be transitive trust with nothing behind it, and the refusal is the
+/// same rule the listener's own arm applies in the other direction.
+async fn exchange_addresses(row: &PeerRow, store: &PeerStore, borrow_timeout_ms: u64) -> bool {
+    let key = match NodeKey::load_or_mint(&node_key_dir(store)) {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "peer aim: this node has no keypair to exchange addresses with"
+            );
+            return false;
+        }
+    };
+
+    let ask = Control::CollapseHint(crate::peer::reach::own_collapse_hint(key.id(), &row.node));
+    let Some((carrier, mut stream, mut session)) =
+        ask_through_a_friend(row, store, borrow_timeout_ms, &key, &ask).await
+    else {
+        tracing::debug!(
+            peer = %row.node.display(),
+            "peer aim: no pinned Mac could carry this node's address to that peer, so there \
+             is nothing to exchange"
+        );
+        return false;
+    };
+
+    let within = HINT_ANSWER_TIMEOUT.min(Duration::from_millis(borrow_timeout_ms));
+    let answered = match tokio::time::timeout(
+        within,
+        recv_control::<_, Control>(&mut stream, &mut session),
+    )
+    .await
+    {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(err)) => {
+            tracing::debug!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                error = %err,
+                "peer aim: that peer closed the carried session instead of answering with its \
+                 own address, so this build reads it as a peer that does not exchange \
+                 addresses"
+            );
+            return false;
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                timeout_ms = within.as_millis(),
+                "peer aim: that peer sent no address back inside the deadline"
+            );
+            return false;
+        }
+    };
+
+    let Control::CollapseHint(theirs) = answered else {
+        tracing::debug!(
+            peer = %row.node.display(),
+            via = %carrier.display(),
+            "peer aim: that peer answered an address exchange with another frame"
+        );
+        return false;
+    };
+    if theirs.node != row.node {
+        tracing::warn!(
+            peer = %row.node.display(),
+            via = %carrier.display(),
+            named = %theirs.node.display(),
+            "peer aim: that peer answered with a hint about a third Mac, which is a \
+             NeighborBrief's job and needs a grant, so nothing was recorded"
+        );
+        return false;
+    }
+    match crate::peer::reach::learn_from_hint(&row.node, &theirs) {
+        Some(addr) => {
+            tracing::info!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                addr = %addr,
+                "peer aim: that peer named where it is now, over a friend they both still \
+                 reach"
+            );
+            true
+        }
+        None => {
+            tracing::debug!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                "peer aim: nothing that peer named is an address anything can dial, so this \
+                 node still has nowhere to aim"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
