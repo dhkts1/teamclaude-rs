@@ -3091,6 +3091,58 @@ async fn announce_punch(
         }
     };
 
+    let ask = Control::PunchAt {
+        slot,
+        public_addr: public_addr.to_string(),
+    };
+    match ask_through_a_friend(row, store, borrow_timeout_ms, &key, &ask).await {
+        Some((carrier, _stream, _session)) => {
+            tracing::info!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                slot,
+                "peer punch: asked this peer to meet on the pair's derived port"
+            );
+            true
+        }
+        None => false,
+    }
+}
+
+/// Ask `row`'s Mac one thing through any Mac that will carry the frame, and
+/// hand the LIVE stream back so a caller may read an answer on it.
+///
+/// # Why this is one function and not two copies
+///
+/// Which carrier is tried, in which order, and what the inner header says are
+/// each one decision. A second spelling of the loop would be a second place
+/// that decides them, and the pair would disagree the first time either was
+/// edited: the punch's ask and the address exchange's ask travel the identical
+/// way and differ only in the frame.
+///
+/// # The signature, and why it hands three things back
+///
+/// The CARRIER's id, because every line either caller logs names the Mac that
+/// carried. The stream and the session, because the address exchange reads one
+/// bounded answer on this stream and a helper that closed it would make that
+/// impossible; a caller with nothing to read simply drops both, which is what
+/// [`announce_punch`] does and what it did before this was extracted.
+///
+/// The key comes IN rather than being loaded here, so each caller keeps its
+/// own sentence for "this node has no keypair": a shared helper would have to
+/// pick one of the two, and an operator reading the line needs to know which
+/// ask it was that could not be made.
+///
+/// A refusal on the way is a `None`, never an error: every one of them is a
+/// forwarder that said no, which is the ordinary answer and is already logged
+/// with its own reason by [`forward_through`].
+async fn ask_through_a_friend(
+    row: &PeerRow,
+    store: &PeerStore,
+    borrow_timeout_ms: u64,
+    key: &NodeKey,
+    ask: &Control,
+) -> Option<(PeerId, PeerStream, noise::PeerSession)> {
     for forwarder in forwarders_for(&row.node, store) {
         let Some(mut stream) =
             forward_through(&forwarder, &row.node, store, borrow_timeout_ms).await
@@ -3115,7 +3167,7 @@ async fn announce_punch(
                     peer = %row.node.display(),
                     via = %forwarder.display(),
                     error = %err,
-                    "peer punch: the carried handshake failed; trying another carrier"
+                    "peer carry: the carried handshake failed; trying another carrier"
                 );
                 continue;
             }
@@ -3125,50 +3177,42 @@ async fn announce_punch(
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "peer punch: this node could not mint a request id"
+                    "peer carry: this node could not mint a request id"
                 );
-                return false;
+                return None;
             }
         };
+        // **The carrier goes in the inner `via`, and only this end can put it
+        // there.** A blind forward writes no header of its own
+        // (`crate::peer::tunnel`'s doc on that point), so the origin is the
+        // only party that knows which Mac carried, and a receiver whose inner
+        // `via` is empty reads the socket in front of it as the peer's own.
+        // That socket is the carrier's connection and teaches nothing about
+        // the peer, which is what `listener::StreamOrigin` exists to say.
+        // Stamping it here is what lets the far end say it.
         let header = StreamHeader {
             kind: StreamKind::Control,
             target: None,
-            via: Vec::new(),
+            via: vec![forwarder],
             hops_remaining: 1,
             request_id,
         };
         let asked = async {
             send_control(&mut stream, &mut session, &header).await?;
-            send_control(
-                &mut stream,
-                &mut session,
-                &Control::PunchAt {
-                    slot,
-                    public_addr: public_addr.to_string(),
-                },
-            )
-            .await
+            send_control(&mut stream, &mut session, ask).await
         }
         .await;
         match asked {
-            Ok(()) => {
-                tracing::info!(
-                    peer = %row.node.display(),
-                    via = %forwarder.display(),
-                    slot,
-                    "peer punch: asked this peer to meet on the pair's derived port"
-                );
-                return true;
-            }
+            Ok(()) => return Some((forwarder, stream, session)),
             Err(err) => tracing::debug!(
                 peer = %row.node.display(),
                 via = %forwarder.display(),
                 error = %err,
-                "peer punch: the ask did not reach this peer through that carrier"
+                "peer carry: the ask did not reach this peer through that carrier"
             ),
         }
     }
-    false
+    None
 }
 
 #[cfg(test)]
