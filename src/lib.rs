@@ -16,6 +16,7 @@
 
 pub mod account_uuid;
 pub mod affinity;
+pub mod bound_tokens;
 pub mod build_info;
 pub mod cache_ttl;
 pub mod claude_code_login;
@@ -39,7 +40,6 @@ pub mod proxy;
 pub mod quota;
 pub mod schedule;
 pub mod server;
-pub mod server_tool_pins;
 pub mod session_wire;
 pub mod session_wire_persist;
 pub mod singleton;
