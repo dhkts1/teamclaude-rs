@@ -2028,11 +2028,12 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         })));
     }
 
-    // The `server_tool_use` id → minting account map (see `teamclaude_rs::server_tool_pins`)
-    // survives a restart the same way pins do, and for a sharper reason: a restart is exactly
-    // when live conversations get re-keyed onto other accounts, and a conversation carrying an
-    // advisor result that lands on another account 400s on every remaining turn. Restored
-    // before the listener binds so the first request after a bounce is already pinned.
+    // The account-bound-token map (see `teamclaude_rs::bound_tokens`) survives a restart the
+    // same way pins do, and for a sharper reason: a restart is exactly when live conversations
+    // get re-keyed onto other accounts, and a conversation carrying an advisor result, a
+    // thinking signature or server-side thread state is rejected outright on every remaining
+    // turn once that happens. Restored before the listener binds so the first request after a
+    // bounce is already pinned.
     //
     // Keyed on the affinity path — a sibling file in the same directory — rather than on its
     // own `ServeOptions` field: the two caches must never land in different places, and an
@@ -2044,47 +2045,49 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // correctness constraint on which account CAN answer a request, and it applies whether or
     // not sessions are pinned for cache warmth.
     if let Some(affinity_path) = &affinity_path {
-        let server_tool_path = crate::server_tool_pins::path_beside(affinity_path);
-        let report = manager.restore_server_tool_pins(
-            &server_tool_path,
-            crate::server_tool_pins::SERVER_TOOL_PIN_TTL_MS,
-        );
+        let bound_token_path = crate::bound_tokens::path_beside(affinity_path);
+        let report = manager
+            .restore_bound_tokens(&bound_token_path, crate::bound_tokens::BOUND_TOKEN_TTL_MS);
         if let Some(reason) = &report.degraded {
             tracing::warn!(
-                path = %server_tool_path.display(),
+                path = %bound_token_path.display(),
                 reason = %reason,
-                "server-tool pins ignored; conversations minted before this boot may be re-keyed"
+                "bound-token pins ignored; conversations bound before this boot may be re-keyed"
             );
         } else {
             tracing::info!(
-                path = %server_tool_path.display(),
-                restored = report.pins.len(),
+                path = %bound_token_path.display(),
+                restored = report.tokens.len(),
                 expired = report.expired,
                 unresolved = report.unresolved,
                 ambiguous = report.ambiguous,
-                "server-tool pins restored"
+                "bound-token pins restored"
             );
         }
 
-        // Same debounced 5-second flush as the affinity pins above, same reason: `--replace`
-        // ends in a SIGKILL, and no shutdown path runs for one.
+        // Debounced like the affinity pins above, but on a MINUTE rather than five seconds.
+        // The affinity map settles early in a session and then stops changing; this one gains
+        // an entry on nearly every assistant turn, and at `BOUND_TOKEN_CAP` the file is
+        // megabytes — a 5-second timer would rewrite all of it twelve times a minute, forever.
+        // The cost of the wider window is what a SIGKILL inside it loses: up to a minute of
+        // newly minted tokens, whose conversations then route as they did before this feature.
         let flusher = manager.clone();
-        let flush_path = server_tool_path.clone();
+        let flush_path = bound_token_path.clone();
         let mut stop = shutdown_tx.subscribe();
-        background.push(tokio::spawn(supervise("server-tool-pin-flusher", async move {
+        background.push(tokio::spawn(supervise("bound-token-flusher", async move {
             let flush = async {
-                let mut ticker = tokio::time::interval(Duration::from_secs(5));
+                let mut ticker = tokio::time::interval(Duration::from_secs(60));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
-                    if !flusher.take_server_tool_pins_dirty() {
+                    if !flusher.take_bound_tokens_dirty() {
                         continue;
                     }
-                    if let Err(err) = flusher.flush_server_tool_pins(&flush_path) {
+                    if let Err(err) = flusher.flush_bound_tokens(&flush_path) {
                         tracing::warn!(
                             path = %flush_path.display(),
                             error = %err,
-                            "could not write the server-tool pin file; conversations minted this boot may be re-keyed after a restart"
+                            "could not write the bound-token file; conversations bound this boot may be re-keyed after a restart"
                         );
                     }
                 }

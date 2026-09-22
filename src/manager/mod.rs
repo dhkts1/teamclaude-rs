@@ -45,6 +45,10 @@ use crate::stats::{
 };
 use crate::warmer::{AccountWarmer, LiveWarmer};
 
+mod bound_tokens;
+// The one TYPE that module owns and `proxy.rs` names: one minted token as the response path
+// hands it over, so a kind can never be paired with another token's string.
+pub use bound_tokens::MintedToken;
 // The ONE line `src/manager/select.rs`'s zero-change tripwire explicitly
 // permits: `Manager::lendable_fraction` has to live on a SIBLING of `select.rs`
 // to reach its `pub(super) fn effective_threshold`, and a sibling module that
@@ -60,7 +64,6 @@ mod pins;
 mod probing;
 mod refresh;
 mod select;
-mod server_tools;
 mod snapshot;
 mod state;
 mod throttle;
@@ -1125,19 +1128,26 @@ pub struct Manager {
     /// only ordering that matters is "a change eventually causes a write", and a
     /// tick that observes the flag late simply writes on the next one.
     affinity_dirty: AtomicBool,
-    /// `server_tool_use` id → (account index, mint ms): who minted each server-side tool call
-    /// the fleet has served. See [`crate::server_tool_pins`] for the rule — a conversation
-    /// carrying one of these ids is served by its minting account or by nobody, because the
-    /// result block travelling with it decrypts only on the org that produced it.
+    /// Hashed account-bound token → (account index, kind, mint ms): who minted each advisor id,
+    /// thinking signature, redacted-thinking payload and message id the fleet has served. See
+    /// [`crate::bound_tokens`] for the rule — a conversation carrying one of these is served by
+    /// its minting account or by nobody, because no other account can read it back.
+    ///
+    /// Keyed by HASH, never the token itself: a thinking signature is several hundred bytes and
+    /// arrives on nearly every assistant turn, so hashing at the door bounds this map at 64
+    /// bytes a key and keeps Anthropic's attestations out of this process's memory.
     ///
     /// Positional like [`Self::affinity`], and for the same reason: the response path learns an
     /// index, and the request path needs an index to bench the rest of the fleet. The file half
     /// stores identities. Written from the response path, read from the request path; a plain
     /// `std::sync::Mutex`, **never** held while the accounts lock is taken.
-    server_tool_pins: Mutex<HashMap<String, (usize, i64)>>,
-    /// Set whenever [`Self::server_tool_pins`] is mutated, cleared by the flusher task that
-    /// writes it to disk — same debounce contract as [`Self::affinity_dirty`].
-    server_tool_pins_dirty: AtomicBool,
+    bound_tokens: Mutex<HashMap<String, (usize, crate::bound_tokens::BoundTokenKind, i64)>>,
+    /// Set whenever [`Self::bound_tokens`] is mutated, cleared by the flusher task that writes
+    /// it to disk — same debounce contract as [`Self::affinity_dirty`].
+    bound_tokens_dirty: AtomicBool,
+    /// Session keys already logged as held to their pin by bound history, so a long
+    /// conversation costs one line and not one per turn. Diagnostic only: nothing routes on it.
+    bound_history_logged: Mutex<HashSet<u64>>,
     /// Per-session serving stats (session key → account/count/last-seen), for
     /// live per-session visibility in the TUI. Separate from `affinity` so the
     /// routing pin stays byte-for-byte unchanged; bounded in `record_served`.
@@ -1472,8 +1482,9 @@ impl Manager {
             affinity: Mutex::new(HashMap::new()),
             affinity_extended: Mutex::new(HashSet::new()),
             affinity_dirty: AtomicBool::new(false),
-            server_tool_pins: Mutex::new(HashMap::new()),
-            server_tool_pins_dirty: AtomicBool::new(false),
+            bound_tokens: Mutex::new(HashMap::new()),
+            bound_tokens_dirty: AtomicBool::new(false),
+            bound_history_logged: Mutex::new(HashSet::new()),
             sessions: Mutex::new(HashMap::new()),
             wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
             wire_sessions_dirty: AtomicBool::new(false),
@@ -1639,15 +1650,48 @@ impl Manager {
         is_fable: bool,
         group: Option<&str>,
     ) -> ExhaustionHint {
+        self.exhaustion_hint_over(now, is_fable, group, None)
+    }
+
+    /// [`Self::exhaustion_hint`] for a request that ONE account alone may serve.
+    ///
+    /// Exists for a request whose history is account-bound (see [`crate::bound_tokens`]): the
+    /// proxy benches every other account, so the fleet-wide hint times the wait against
+    /// accounts this request will never be allowed to use. Any of them freeing sooner wins the
+    /// fleet's `min`, spends the request's one-shot soft-wait waking early, and answers a 429
+    /// whose `retry-after` has nothing to do with when the bound account frees.
+    ///
+    /// Same sentinel as the fleet form: `60` with `free_at: None` when that account advertises
+    /// no recovery instant.
+    pub fn exhaustion_hint_for_account(
+        &self,
+        now: OffsetDateTime,
+        is_fable: bool,
+        idx: usize,
+    ) -> ExhaustionHint {
+        self.exhaustion_hint_over(now, is_fable, None, Some(idx))
+    }
+
+    /// The one derivation behind both hint forms: `group` narrows to a group's members, `only`
+    /// to a single account index.
+    fn exhaustion_hint_over(
+        &self,
+        now: OffsetDateTime,
+        is_fable: bool,
+        group: Option<&str>,
+        only: Option<usize>,
+    ) -> ExhaustionHint {
         let now_ms = odt_to_ms(now);
         let reserved_groups = self.reserved_groups();
         let parked_groups = self.parked_groups();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let mut gated: BTreeMap<GateReason, usize> = BTreeMap::new();
         let mut soonest: Option<(i64, GateReason)> = None;
-        for account in accounts
+        for (_, account) in accounts
             .iter()
-            .filter(|account| group.is_none_or(|g| account.groups.iter().any(|m| m == g)))
+            .enumerate()
+            .filter(|&(idx, _)| only.is_none_or(|only| only == idx))
+            .filter(|(_, account)| group.is_none_or(|g| account.groups.iter().any(|m| m == g)))
         {
             let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
             let (reason, free_at) = Self::account_gate(
@@ -10211,6 +10255,38 @@ mod tests {
         assert_eq!(hint.free_at, None);
         assert_eq!(hint.binding, None);
         assert_eq!(hint.gated.get(&GateReason::SevenDay), Some(&1));
+    }
+
+    /// A request that only account 1 may serve (bound history, see `crate::bound_tokens`) is
+    /// told when account 1 frees — 7 seconds — not when the SOONER account 0 does. The
+    /// fleet-wide hint over the same fleet is the control: it answers 2.
+    #[test]
+    fn a_single_account_hint_times_the_wait_on_that_account_alone() {
+        let manager = Manager::from_runtimes(vec![
+            AccountRuntime::from_config(&account("a", 0), false),
+            AccountRuntime::from_config(&account("b", 0), false),
+        ]);
+        manager.mark_rate_limited(0, 2);
+        manager.mark_rate_limited(1, 7);
+        // Read AFTER the marks, so each hold has at most its own length left and rounds up to
+        // exactly that many whole seconds.
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.exhaustion_hint(now, false, None).retry_after,
+            2,
+            "the control: fleet-wide, the sooner account wins"
+        );
+        let hint = manager.exhaustion_hint_for_account(now, false, 1);
+        assert_eq!(
+            hint.retry_after, 7,
+            "bound to account 1, the wait is ITS hold: {hint:?}"
+        );
+        assert_eq!(hint.binding, Some(GateReason::Hold));
+        assert_eq!(
+            hint.gated.get(&GateReason::Hold),
+            Some(&1),
+            "only the one account is counted: {hint:?}"
+        );
     }
 
     /// `next_session_key` hands out strictly-increasing, unique u64s starting at 1.

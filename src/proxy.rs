@@ -49,11 +49,12 @@ use futures::StreamExt;
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::bound_tokens::BoundTokenKind;
 use crate::config;
 use crate::fallback;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
-    InFlightGuard, Manager, SetControlOutcome, SetDisabledOutcome,
+    InFlightGuard, Manager, MintedToken, SetControlOutcome, SetDisabledOutcome,
 };
 use crate::quota::{quota_rejections, UnifiedRejectionKind};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
@@ -131,8 +132,16 @@ const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
 /// The content-block type Anthropic uses for a tool IT runs — `--advisor` today, `web_search`
 /// next. Its result block travels with an `encrypted_content` that only the minting
 /// organization can decrypt, which is why the id has to be remembered at all: see
-/// [`crate::server_tool_pins`].
+/// [`crate::bound_tokens`].
 const SERVER_TOOL_USE_BLOCK_TYPE: &str = "server_tool_use";
+/// A reasoning block. Its `signature` is Anthropic's attestation over the block, arriving in
+/// the stream as `signature_delta` fragments; another account answers a history carrying it
+/// with `400 thinking or redacted_thinking blocks in the latest assistant message cannot be
+/// modified`.
+const THINKING_BLOCK_TYPE: &str = "thinking";
+/// A reasoning block the API returns already encrypted; its `data` binds exactly as a
+/// `signature` does.
+const REDACTED_THINKING_BLOCK_TYPE: &str = "redacted_thinking";
 /// A transient `429` whose `retry-after` is within this bound is waited out
 /// inline on the same account; anything longer throttles + rotates instead of
 /// tying up the client connection.
@@ -2262,21 +2271,33 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // `RawValue` rather than materializing the whole conversation — see `session_wire.rs`'s
     // module doc. A body that fails to parse here yields "no session, no tool events" rather
     // than rejecting the request: this is an observability peek, never a validation gate.
-    // The fourth value is NOT observability: `server_tool_ids` is every `server_tool_use` id
-    // this conversation carries, and it decides which account may serve this request at all —
-    // see `crate::server_tool_pins` and the bench below. Scanned from the same borrowed
-    // `messages` in the same pass, over ALL messages rather than the tail window the tool
-    // events use, because the block that pins the conversation was minted on its FIRST turn.
-    let (wire_session_id, wire_tool_uses, wire_tool_results, server_tool_ids) = {
+    // The fourth value is NOT observability: `bound` is every account-bound token this
+    // conversation carries — advisor ids, thinking signatures, redacted-thinking payloads and
+    // any `previous_message_id` — and it decides which account may serve this request at all,
+    // see `crate::bound_tokens` and the bench below. Scanned from the same borrowed `messages`
+    // in the same pass, over ALL messages rather than the tail window the tool events use,
+    // because the block that binds the conversation was minted on its FIRST turn.
+    let (wire_session_id, wire_tool_uses, wire_tool_results, bound) = {
         #[derive(serde::Deserialize)]
         struct RequestSessionPeek<'a> {
             metadata: Option<RequestSessionMeta>,
             #[serde(borrow)]
             messages: Option<&'a serde_json::value::RawValue>,
+            /// Server-side thread state, named at the top level…
+            previous_message_id: Option<String>,
+            /// …or under `thread`, or under `diagnostics`. Which of the three a client sends
+            /// has not been captured, so all three are read and the first sighting of each is
+            /// logged (see `note_previous_message_id_path`) rather than guessed at.
+            thread: Option<PreviousMessagePeek>,
+            diagnostics: Option<PreviousMessagePeek>,
         }
         #[derive(serde::Deserialize)]
         struct RequestSessionMeta {
             user_id: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct PreviousMessagePeek {
+            previous_message_id: Option<String>,
         }
         match serde_json::from_slice::<RequestSessionPeek>(&body_bytes) {
             Ok(peek) => {
@@ -2288,13 +2309,40 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     .messages
                     .map(crate::session_wire::extract_tool_events)
                     .unwrap_or_default();
-                let server_tool_ids = peek
+                let mut bound = peek
                     .messages
-                    .map(crate::session_wire::extract_server_tool_use_ids)
+                    .map(crate::session_wire::extract_bound_tokens)
                     .unwrap_or_default();
-                (session_id, uses, results, server_tool_ids)
+                for (path, id) in [
+                    ("previous_message_id", peek.previous_message_id),
+                    (
+                        "thread.previous_message_id",
+                        peek.thread.and_then(|t| t.previous_message_id),
+                    ),
+                    (
+                        "diagnostics.previous_message_id",
+                        peek.diagnostics.and_then(|d| d.previous_message_id),
+                    ),
+                ] {
+                    let Some(id) = id else {
+                        continue;
+                    };
+                    note_previous_message_id_path(path);
+                    // Thread state is bound exactly as a signature is, and it binds even when
+                    // this process never saw the response that created it.
+                    bound.carries_bound_history = true;
+                    if !bound.tokens.contains(&id) {
+                        bound.tokens.push(id);
+                    }
+                }
+                (session_id, uses, results, bound)
             }
-            Err(_) => (None, Vec::new(), Vec::new(), Vec::new()),
+            Err(_) => (
+                None,
+                Vec::new(),
+                Vec::new(),
+                crate::session_wire::BoundHistory::default(),
+            ),
         }
     };
     // Whether THIS request targets a Fable model — the same classification
@@ -2440,45 +2488,77 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             "account-set scope: this request may be served only by the accounts it names"
         );
     }
-    // A conversation that carries a `server_tool_use` id is served by the account that MINTED
-    // that id, or by nobody.
+    // A conversation whose history carries ACCOUNT-BOUND state is served by the account that
+    // minted that state, or by nobody.
     //
-    // The result block travelling with the id (`advisor_tool_result`'s `encrypted_content`)
-    // decrypts only on the organization that produced it, so every other account answers the
-    // whole request `400 invalid_request_error: "Advisor tool result content could not be
-    // processed."` — 1,246 of them on 2026-09-22 alone, one per turn for the rest of each
-    // re-keyed conversation. An eligible sibling is therefore never the right answer, and a 429
-    // ("no eligible account") is the honest one when the minting account is hard-ineligible:
-    // the client retries, and a 429 costs a retry where a 400 costs the turn.
+    // An advisor result decrypts only on the org that produced it, a `thinking` signature is an
+    // attestation that org signed, and the thread state behind a `previous_message_id` lives on
+    // that account alone. Every other account answers the WHOLE request with a 400 or a 404:
+    // measured 2026-09-20..22 over 173k calls, 8,322 advisor 400s, 170 thinking 400s and 66
+    // thread-state 404s, each cluster starting where a pinned conversation was diverted (4,420
+    // diverts in the same window). So an eligible sibling is never the right answer, and a 429
+    // ("no eligible account") is the honest one when the bound account cannot serve: the client
+    // retries, and a 429 costs a retry where a divert costs the turn.
     //
     // Enforced by BENCHING every other account into `tried`, exactly as the account-set scope
     // above does and for the same three reasons — it can only narrow, the affinity fast-path
-    // honours it (a pinned session whose pin is not the minting account DIVERTS for this one
-    // request, and the pin itself is left alone: the map, not the pin, is the authority here),
-    // and if the minting account is gone from this fleet every account ends up benched and the
-    // client gets the same honest 429 an exhausted fleet produces.
+    // honours it (so a request whose pin is not the bound account is held here rather than
+    // diverting, and the pin itself is left alone), and if the bound account is gone from this
+    // fleet every account ends up benched and the client gets the same honest 429 an exhausted
+    // fleet produces.
     //
-    // An id this process has never seen — minted before this shipped, or expired out of the map
-    // — benches nothing: the rule must never block a conversation it knows nothing about.
-    if let Some((minting_idx, minting_id)) = manager.server_tool_pin_account(&server_tool_ids) {
-        if manager.server_tool_pins_disagree(&server_tool_ids) {
+    // Two rungs, because a token is not always knowable:
+    //
+    //  1. A token this process minted names its account outright.
+    //  2. No token resolves, but the history IS bound and the session has a pin: hold it to the
+    //     pin. This is every conversation older than this build, and the pin is where that
+    //     history was made as long as it never diverted — a guess, but the only one that can be
+    //     better than diverting, which is a guaranteed rejection.
+    //
+    // Neither: today's behaviour, so the rule never blocks a conversation it knows nothing
+    // about.
+    //
+    // `bound_to` carries the one account this request may use down to the terminals, which
+    // must answer for THAT account: the wait they size and the `retry-after` they advertise
+    // are its own, and a fallback provider (a peer's credential) is refused outright, since
+    // it is one more account that cannot read this history.
+    let mut bound_to: Option<usize> = None;
+    if let Some((bound_idx, bound_kind)) = manager.bound_token_account(&bound.tokens) {
+        bound_to = Some(bound_idx);
+        if manager.bound_tokens_disagree(&bound.tokens) {
             tracing::warn!(
-                ids = server_tool_ids.len(),
-                chose = %minting_id,
-                "server-tool ids in one conversation name different accounts; taking the newest mint"
+                tokens = bound.tokens.len(),
+                kind = bound_kind.as_str(),
+                "bound tokens in one conversation name different accounts; taking the newest mint"
             );
         }
         let affinity_would_have_picked = session_key.and_then(|key| manager.affinity_pin(key));
         for idx in 0..account_count {
-            if idx != minting_idx {
+            if idx != bound_idx {
                 tried.insert(idx);
             }
         }
-        if affinity_would_have_picked.is_some_and(|pinned| pinned != minting_idx) {
+        if affinity_would_have_picked.is_some_and(|pinned| pinned != bound_idx) {
             tracing::info!(
-                account = manager.account_name(minting_idx).as_deref().unwrap_or("?"),
-                minted = %minting_id,
-                "server-tool result pins request to account"
+                account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
+                kind = bound_kind.as_str(),
+                "bound token pins request to the account that minted it"
+            );
+        }
+    } else if let (true, Some(pinned_idx)) = (
+        bound.carries_bound_history,
+        session_key.and_then(|key| manager.affinity_pin(key)),
+    ) {
+        bound_to = Some(pinned_idx);
+        for idx in 0..account_count {
+            if idx != pinned_idx {
+                tried.insert(idx);
+            }
+        }
+        if session_key.is_some_and(|key| manager.first_bound_history_hold(key)) {
+            tracing::info!(
+                account = manager.account_name(pinned_idx).as_deref().unwrap_or("?"),
+                "bound history, no minted token known: holding session to its pin"
             );
         }
     }
@@ -2743,16 +2823,23 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // windows / long holds) has soonest_free >> the ceiling →
                     // soft_wait_secs returns None → fall through to the honest 429.
                     match soft_wait_secs(
-                        match strict_group {
+                        match (bound_to, strict_group) {
+                            // Bound history: the one account it may use is the only
+                            // clock that matters, for the same reason as the group arm.
+                            (Some(idx), _) => {
+                                manager
+                                    .exhaustion_hint_for_account(now, request_is_fable, idx)
+                                    .retry_after
+                            }
                             // Size the wait by when a MEMBER frees. The fleet-wide
                             // hint would be won by any unrelated account un-gating
                             // sooner, spending this request's one-shot soft-wait on
                             // a recovery it cannot use and 429-ing while its own
                             // member was still seconds away.
-                            Some(group) => {
+                            (None, Some(group)) => {
                                 manager.retry_after_hint_for_group(now, request_is_fable, group)
                             }
-                            None => manager.retry_after_hint(now, request_is_fable),
+                            (None, None) => manager.retry_after_hint(now, request_is_fable),
                         },
                         soft_waited_exhaustion,
                     ) {
@@ -2832,6 +2919,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     account_count,
                                     request_is_fable,
                                     strict_group,
+                                    bound_to,
                                     fallback_ask.as_ref(),
                                 )
                                 .await;
@@ -2870,6 +2958,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                         account_count,
                                         request_is_fable,
                                         strict_group,
+                                        bound_to,
                                         fallback_ask.as_ref(),
                                     )
                                     .await;
@@ -2881,6 +2970,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     account_count,
                                     request_is_fable,
                                     strict_group,
+                                    bound_to,
                                     fallback_ask.as_ref(),
                                 )
                                 .await;
@@ -3669,13 +3759,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     usage: parsed,
                     stream_error,
                     tool_uses: response_tool_uses,
-                    server_tool_ids,
+                    bound_tokens,
                 } = parse_sse_usage(byte_stream).await;
-                // Who minted the server-side tool calls in this turn. Recorded before anything
+                // Who minted the account-bound tokens in this turn. Recorded before anything
                 // else the parse learned, because it is the only one of them that changes how a
                 // LATER request is routed: every following turn of this conversation echoes
-                // these ids back, and any account but `idx` answers them with a 400.
-                manager_side.record_minted_server_tools(&server_tool_ids, idx, crate::now_ms());
+                // these back, and any account but `idx` rejects the whole request.
+                manager_side.record_bound_tokens(&bound_tokens, idx, crate::now_ms());
                 // RUNNING NOW: every tool this turn asked for starts HERE — the stream has
                 // just ended, so the client is beginning them as this line runs. Outside the
                 // usage guard below on purpose: a turn that emitted tool calls but reported
@@ -3904,8 +3994,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 &response_tool_uses_from_json(&bytes),
             );
             // Non-streamed twin of the mint record on the SSE arm above.
-            manager.record_minted_server_tools(
-                &response_server_tool_ids_from_json(&bytes),
+            manager.record_bound_tokens(
+                &response_bound_tokens_from_json(&bytes),
                 idx,
                 crate::now_ms(),
             );
@@ -3973,6 +4063,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             request_group
                 .as_deref()
                 .filter(|g| manager.is_group_strict(g)),
+            bound_to,
         )
     }
 }
@@ -4756,44 +4847,64 @@ fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUs
         .collect()
 }
 
-/// Parse the `server_tool_use` ids out of a non-streamed messages body — the JSON-path twin of
-/// [`parse_sse_usage`]'s fourth return value, feeding
-/// [`crate::manager::Manager::record_minted_server_tools`].
+/// Parse the account-bound tokens out of a non-streamed messages body — the JSON-path twin of
+/// [`parse_sse_usage`]'s `bound_tokens`, feeding
+/// [`crate::manager::Manager::record_bound_tokens`].
 ///
 /// A separate pass over the same bytes for the same reason
 /// [`response_tool_uses_from_json`] is one: these bodies are already buffered and capped, and
 /// Claude Code itself always streams, so the cost lands only on the rare non-streamed 2xx.
-fn response_server_tool_ids_from_json(bytes: &[u8]) -> Vec<String> {
+///
+/// The body's own `id` is one of them: a later request may name it as `previous_message_id`,
+/// and the thread state behind that id lives on the account that answered — `404 No thread
+/// state was found for the requested previous_message_id` on any other.
+fn response_bound_tokens_from_json(bytes: &[u8]) -> Vec<MintedToken> {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
         return Vec::new();
     };
+    let mut tokens: Vec<MintedToken> = Vec::new();
+    if let Some(id) = value.get("id").and_then(Value::as_str) {
+        tokens.push((BoundTokenKind::MessageId, id.to_string()));
+    }
     let Some(blocks) = value.get("content").and_then(Value::as_array) else {
-        return Vec::new();
+        return tokens;
     };
-    blocks
-        .iter()
-        .filter(|b| {
-            b.get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|t| t == SERVER_TOOL_USE_BLOCK_TYPE)
-        })
-        .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
-        .take(crate::session_wire::SERVER_TOOL_ID_SCAN_CAP)
-        .collect()
+    for block in blocks {
+        let field = |name: &str| block.get(name).and_then(Value::as_str).map(str::to_string);
+        let minted = match block.get("type").and_then(Value::as_str) {
+            Some(SERVER_TOOL_USE_BLOCK_TYPE) => {
+                field("id").map(|t| (BoundTokenKind::ServerToolUse, t))
+            }
+            Some(THINKING_BLOCK_TYPE) => {
+                field("signature").map(|t| (BoundTokenKind::ThinkingSignature, t))
+            }
+            Some(REDACTED_THINKING_BLOCK_TYPE) => {
+                field("data").map(|t| (BoundTokenKind::RedactedThinking, t))
+            }
+            _ => None,
+        };
+        if let Some(minted) = minted {
+            tokens.push(minted);
+        }
+        if tokens.len() >= crate::session_wire::BOUND_TOKEN_SCAN_CAP {
+            break;
+        }
+    }
+    tokens
 }
 
 /// Parse the total usage breakdown from an SSE messages stream, plus — out of
 /// band, so [`ParsedUsage`] can stay `Copy` — the FIRST in-band `error` event's
 /// `error.type`, if any arrived, every COMPLETED `tool_use` block the turn
-/// emitted, and the id of every `server_tool_use` block it opened.
+/// emitted, and every account-bound token it minted.
 ///
-/// The server-tool ids are the fourth value and not part of the third: a `server_tool_use` is
-/// Anthropic's own tool, run inside the API, so it is not a client-side call the Tools tab has
-/// anything to show. What it IS, is the thing that decides which account may serve the REST of
-/// this conversation — see [`crate::server_tool_pins`]. It is taken at
-/// `content_block_start`, not at `content_block_stop`, because the id is the whole payload and
-/// it is complete the moment the block opens; a stream severed mid-turn has still told us who
-/// minted it, and that account is still the only one that can serve the retry.
+/// The bound tokens are their own value and not part of the tool blocks: none of them is a
+/// client-side call the Tools tab has anything to show. What they ARE is the thing that decides
+/// which account may serve the REST of this conversation — see [`crate::bound_tokens`]. The
+/// message id and a `server_tool_use` id are taken the moment their event arrives, because
+/// each is whole there; a stream severed mid-turn has still told us who minted them. A
+/// thinking signature arrives as `signature_delta` fragments and is taken at
+/// `content_block_stop`, whole or not at all.
 ///
 /// The tool blocks are what the Tools tab's RUNNING NOW section is built from,
 /// and the response is the only place they can come from: a Claude Code request
@@ -4865,10 +4976,15 @@ where
     let mut open_tool_blocks: std::collections::HashMap<u64, OpenToolBlock> =
         std::collections::HashMap::new();
     let mut tool_uses: Vec<crate::session_wire::ToolUseEvent> = Vec::new();
-    // Ids of the SERVER-side tool blocks this turn opened — complete at `content_block_start`,
-    // so unlike `open_tool_blocks` above there is nothing to assemble and nothing to lose when
-    // a stream is cut short.
-    let mut server_tool_ids: Vec<String> = Vec::new();
+    // Account-bound tokens this turn minted — the message id, every server-tool id, every
+    // thinking signature, every redacted-thinking payload. See `crate::bound_tokens`.
+    let mut bound_tokens: Vec<MintedToken> = Vec::new();
+    // Thinking signatures under construction, keyed by block index: a signature arrives as
+    // `signature_delta` fragments that concatenate, so it is complete only at
+    // `content_block_stop` — unlike a server-tool id, which is whole the moment its block
+    // opens.
+    let mut open_signatures: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
     while let Some(item) = events.next().await {
         let Ok(event) = item else {
             break; // malformed/utf8/transport error — stop parsing, keep totals
@@ -4883,6 +4999,16 @@ where
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 saw_message_start = true;
+                // The response's own message id. A later request may name it as
+                // `previous_message_id`, and the server-side thread state behind it lives on
+                // the account that answered — `404 No thread state was found` anywhere else.
+                if let Some(id) = value
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    push_bound_token(&mut bound_tokens, BoundTokenKind::MessageId, id.to_string());
+                }
                 if let Some(usage) = value.get("message").and_then(|m| m.get("usage")) {
                     parsed.input_total = sum_input_tokens(usage);
                     (
@@ -4915,16 +5041,46 @@ where
                     .and_then(|b| b.get("id"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                // A SERVER-side tool call (`--advisor` today; `web_search` is the next block
-                // type to add here). Recorded by id alone: it is Anthropic's own call, nothing
-                // the client runs, and the only thing that matters about it later is which
-                // account minted it.
-                if let (Some(SERVER_TOOL_USE_BLOCK_TYPE), Some(id)) = (block_type, id.as_deref()) {
-                    if server_tool_ids.len() < crate::session_wire::SERVER_TOOL_ID_SCAN_CAP
-                        && !server_tool_ids.iter().any(|seen| seen == id)
-                    {
-                        server_tool_ids.push(id.to_string());
+                match block_type {
+                    // A SERVER-side tool call (`--advisor` today; `web_search` is next).
+                    // Recorded by id alone: it is Anthropic's own call, nothing the client
+                    // runs, and the only thing that matters later is which account minted it.
+                    Some(SERVER_TOOL_USE_BLOCK_TYPE) => {
+                        if let Some(id) = id.as_deref() {
+                            push_bound_token(
+                                &mut bound_tokens,
+                                BoundTokenKind::ServerToolUse,
+                                id.to_string(),
+                            );
+                        }
                     }
+                    // A reasoning block: open the buffer its `signature_delta`s append to.
+                    Some(THINKING_BLOCK_TYPE) => {
+                        if let Some(index) = block_index(&value) {
+                            // A block start may already carry the whole signature (the
+                            // non-streamed shape arriving over SSE); the deltas then append to
+                            // it rather than to an empty string.
+                            let head = block
+                                .and_then(|b| b.get("signature"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            open_signatures.insert(index, head);
+                        }
+                    }
+                    // Already encrypted, and whole at the start — nothing to assemble.
+                    Some(REDACTED_THINKING_BLOCK_TYPE) => {
+                        if let Some(data) =
+                            block.and_then(|b| b.get("data")).and_then(Value::as_str)
+                        {
+                            push_bound_token(
+                                &mut bound_tokens,
+                                BoundTokenKind::RedactedThinking,
+                                data.to_string(),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
                 if let (true, Some(index), Some(id)) = (is_tool_use, block_index(&value), id) {
                     // A stream can only carry so many tool blocks before the cap that bounds
@@ -4947,6 +5103,30 @@ where
                 }
             }
             Some("content_block_delta") => {
+                // A `signature_delta` carries the next fragment of a reasoning block's
+                // signature. They concatenate; the whole value is the token.
+                let signature_fragment = value
+                    .get("delta")
+                    .filter(|d| {
+                        d.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t == "signature_delta")
+                    })
+                    .and_then(|d| d.get("signature"))
+                    .and_then(Value::as_str);
+                if let (Some(index), Some(fragment)) = (block_index(&value), signature_fragment) {
+                    if let Some(open) = open_signatures.get_mut(&index) {
+                        // Bounded like the tool-input buffer beside it: a signature is a few
+                        // hundred bytes, so anything past this cap is a malformed or hostile
+                        // stream, and a half-signature is worth nothing anyway — drop the
+                        // buffer rather than grow with the response.
+                        if open.len() + fragment.len() <= SIGNATURE_CAP {
+                            open.push_str(fragment);
+                        } else {
+                            open.clear();
+                        }
+                    }
+                }
                 let partial = value
                     .get("delta")
                     .filter(|d| {
@@ -4971,6 +5151,18 @@ where
                 }
             }
             Some("content_block_stop") => {
+                // A reasoning block's signature is complete here and nowhere earlier.
+                if let Some(signature) =
+                    block_index(&value).and_then(|i| open_signatures.remove(&i))
+                {
+                    if !signature.is_empty() {
+                        push_bound_token(
+                            &mut bound_tokens,
+                            BoundTokenKind::ThinkingSignature,
+                            signature,
+                        );
+                    }
+                }
                 if let Some(open) = block_index(&value).and_then(|i| open_tool_blocks.remove(&i)) {
                     let input = if open.over_cap {
                         None
@@ -5018,16 +5210,56 @@ where
         usage: parsed,
         stream_error,
         tool_uses,
-        server_tool_ids,
+        bound_tokens,
     }
 }
 
+/// Add one account-bound token to a turn's list, deduplicated and capped.
+///
+/// One place, three callers (the two SSE arms and the message id), because a token added
+/// without the cap is an unbounded allocation driven by the upstream's response.
+fn push_bound_token(tokens: &mut Vec<MintedToken>, kind: BoundTokenKind, token: String) {
+    if tokens.len() >= crate::session_wire::BOUND_TOKEN_SCAN_CAP
+        || tokens.iter().any(|(_, seen)| *seen == token)
+    {
+        return;
+    }
+    tokens.push((kind, token));
+}
+
+/// Say, once per process per field path, that a client sent `previous_message_id` there.
+///
+/// Three shapes are read on the request path because no capture tells us which one Claude Code
+/// actually sends — and a field nobody ever sends is indistinguishable, from the code, from one
+/// that is read wrongly. One line the first time each path is seen turns that guess into a
+/// measurement; a line per request would be a flood on a busy proxy.
+fn note_previous_message_id_path(path: &'static str) {
+    static SEEN: std::sync::Mutex<Option<HashSet<&'static str>>> = std::sync::Mutex::new(None);
+    let mut seen = match SEEN.lock() {
+        Ok(seen) => seen,
+        // A poisoned diagnostic latch must never take down a request.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if seen.get_or_insert_with(HashSet::new).insert(path) {
+        tracing::info!(
+            field = path,
+            "a client names server-side thread state here; requests carrying it are pinned to \
+             the account that holds it"
+        );
+    }
+}
+
+/// Most bytes one reasoning-block signature may occupy while being assembled. A real signature
+/// is a few hundred bytes; this is slack, not a protocol limit, and it bounds what a malformed
+/// stream of `signature_delta`s can make the parser hold.
+const SIGNATURE_CAP: usize = 16 * 1024;
+
 /// What one pass of [`parse_sse_usage`] learned about a streamed turn.
 ///
-/// A struct rather than a tuple because the fourth value (`server_tool_ids`) is the one that
-/// decides ROUTING, and a caller that silently binds it to the wrong position would pin
-/// conversations to the wrong account — the exact failure this whole feature exists to prevent.
-/// Named fields make that misbinding impossible to write.
+/// A struct rather than a tuple because `bound_tokens` is the value that decides ROUTING, and a
+/// caller that silently bound it to the wrong position would pin conversations to the wrong
+/// account — the exact failure this whole feature exists to prevent. Named fields make that
+/// misbinding impossible to write.
 struct SseParse {
     usage: ParsedUsage,
     /// The FIRST in-band `error` event's `error.type`, or the fixed
@@ -5036,8 +5268,8 @@ struct SseParse {
     /// Every COMPLETED client-side `tool_use` block — what the Tools tab's RUNNING NOW is built
     /// from.
     tool_uses: Vec<crate::session_wire::ToolUseEvent>,
-    /// Every `server_tool_use` id the turn opened — see [`crate::server_tool_pins`].
-    server_tool_ids: Vec<String>,
+    /// Every account-bound token the turn minted — see [`crate::bound_tokens`].
+    bound_tokens: Vec<MintedToken>,
 }
 
 /// One `tool_use` content block being assembled across SSE events — see [`parse_sse_usage`].
@@ -5132,6 +5364,12 @@ fn error_response(
 /// a different subject: `lock_account` means this one account or nothing, and a
 /// peer's account is not it. See the check at the top of the body.
 ///
+/// A request with **account-bound history** (`bound_to`, see
+/// [`crate::bound_tokens`]) never reaches one, and for a sharper reason: a
+/// peer's account cannot read that history, so the provider would answer the
+/// same 400 or 404 the bench exists to prevent. Its 429 is timed on the bound
+/// account alone.
+///
 /// The other terminal in this handler, the attempt budget running out while
 /// still rotating, at the tail of the loop, is deliberately NOT routed through
 /// this function yet. It is a different question ("we walked the fleet and ran
@@ -5143,6 +5381,7 @@ async fn exhausted_or_fallback(
     account_count: usize,
     is_fable: bool,
     strict_group: Option<&str>,
+    bound_to: Option<usize>,
     ask: Option<&fallback::Ask<'_>>,
 ) -> Response {
     // **A HARD ACCOUNT LOCK NEVER REACHES A PROVIDER.** `lock_account` is the
@@ -5160,7 +5399,7 @@ async fn exhausted_or_fallback(
     // `None` is a path this seam refused to build an `Ask` for at all, a
     // client-credential path, which no provider may be offered. See the arm at
     // `:2352`.
-    if let (Some(ask), None, false) = (ask, strict_group, locked) {
+    if let (Some(ask), None, false, None) = (ask, strict_group, locked, bound_to) {
         if let Some(provider) = fallback::configured_provider() {
             if let Some(response) = provider.try_serve(ask).await {
                 tracing::info!(
@@ -5171,7 +5410,14 @@ async fn exhausted_or_fallback(
             }
         }
     }
-    exhausted_response(manager, now, account_count, is_fable, strict_group)
+    exhausted_response(
+        manager,
+        now,
+        account_count,
+        is_fable,
+        strict_group,
+        bound_to,
+    )
 }
 
 /// 429 with a fleet-wide `retry-after` hint when no account is currently usable.
@@ -5211,8 +5457,13 @@ fn exhausted_response(
     account_count: usize,
     is_fable: bool,
     strict_group: Option<&str>,
+    bound_to: Option<usize>,
 ) -> Response {
-    let hint = manager.exhaustion_hint(now, is_fable, strict_group);
+    // Bound history is the narrowest scope there is — one account — so it wins over a group.
+    let hint = match bound_to {
+        Some(idx) => manager.exhaustion_hint_for_account(now, is_fable, idx),
+        None => manager.exhaustion_hint(now, is_fable, strict_group),
+    };
     let retry_after = hint.retry_after;
     let advertised_retry_after = advertised_retry_after(&hint);
     let causes = describe_gates(&hint.gated);
@@ -5223,12 +5474,19 @@ fn exhausted_response(
         ),
         None => format!("No account reports a reset time; retry in {retry_after}s."),
     };
-    let detail = match strict_group {
-        Some(group) => format!(
+    // Named in the LOG only: the body can travel to a borrowing peer, and an account's name
+    // is this operator's, not the client's.
+    let bound_name = bound_to.and_then(|idx| manager.account_name(idx));
+    let detail = match (bound_to, strict_group) {
+        (Some(_), _) => format!(
+            "This conversation's history can only be read by the account that produced it, \
+             which is not available{causes}; any other account would reject it. {when}"
+        ),
+        (None, Some(group)) => format!(
             "No account in reserved group '{group}' is available, and a reserved \
              group never serves from outside itself{causes}. {when}"
         ),
-        None => format!("All {account_count} accounts exhausted{causes}. {when}"),
+        (None, None) => format!("All {account_count} accounts exhausted{causes}. {when}"),
     };
     tracing::warn!(
         account_count,
@@ -5236,6 +5494,7 @@ fn exhausted_response(
         advertised_retry_after,
         binding = ?hint.binding,
         group = strict_group.unwrap_or("-"),
+        bound_to = bound_name.as_deref().unwrap_or("-"),
         "returning exhausted 429 to client"
     );
     let mut response = error_response(
@@ -6623,10 +6882,13 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
         let SseParse {
             tool_uses,
-            server_tool_ids,
+            bound_tokens,
             ..
         } = parse_sse_usage(stream).await;
-        assert_eq!(server_tool_ids, vec!["srvtoolu_fake_1".to_string()]);
+        assert_eq!(
+            bound_tokens,
+            vec![(BoundTokenKind::ServerToolUse, "srvtoolu_fake_1".to_string())]
+        );
         assert_eq!(
             tool_uses.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             vec!["toolu_fake_1"],
@@ -6634,35 +6896,91 @@ mod tests {
         );
     }
 
-    /// A stream cut off before `content_block_stop` has still named its minting account — the
-    /// id is complete the moment the block opens, and the retry of that very turn has to land
-    /// on the same account.
+    /// A signed reasoning block, streamed the way the API sends one: the signature arrives as
+    /// `signature_delta` fragments that concatenate, and is only whole at `content_block_stop`.
+    /// A half-assembled signature would hash to something no later turn ever presents.
     #[tokio::test]
-    async fn a_truncated_stream_still_reports_the_server_tool_id() {
+    async fn a_thinking_signature_is_assembled_from_its_deltas() {
         let full = concat!(
             "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_fake_\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"1\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"data_fake_1\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
+        let SseParse {
+            tool_uses,
+            bound_tokens,
+            ..
+        } = parse_sse_usage(stream).await;
+        assert_eq!(
+            bound_tokens,
+            vec![
+                (BoundTokenKind::MessageId, "msg_fake_1".to_string()),
+                (BoundTokenKind::ThinkingSignature, "sig_fake_1".to_string()),
+                (BoundTokenKind::RedactedThinking, "data_fake_1".to_string()),
+            ],
+            "the signature is the CONCATENATION of its deltas, not the first fragment"
+        );
+        assert!(
+            tool_uses.is_empty(),
+            "reasoning is not a tool call the client runs"
+        );
+    }
+
+    /// A stream cut off before `content_block_stop` has still named its minting account: the
+    /// message id and the server-tool id are whole the moment their block opens, so the retry
+    /// of that very turn can be sent back to the same account. The half-signature is NOT
+    /// reported — it would never match anything a later turn echoes.
+    #[tokio::test]
+    async fn a_truncated_stream_reports_the_whole_tokens_and_not_a_half_signature() {
+        let full = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_fake_1\",\"name\":\"advisor\",\"input\":{}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_fak\"}}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
         let SseParse {
             stream_error,
-            server_tool_ids,
+            bound_tokens,
             ..
         } = parse_sse_usage(stream).await;
         assert_eq!(stream_error.as_deref(), Some(TRUNCATED_STREAM_ERROR_KIND));
-        assert_eq!(server_tool_ids, vec!["srvtoolu_fake_1".to_string()]);
+        assert_eq!(
+            bound_tokens,
+            vec![
+                (BoundTokenKind::MessageId, "msg_fake_1".to_string()),
+                (BoundTokenKind::ServerToolUse, "srvtoolu_fake_1".to_string()),
+            ]
+        );
     }
 
-    /// The non-streamed twin of the id scan.
+    /// The non-streamed twin of the token scan, including the body's own message id.
     #[test]
-    fn non_streamed_server_tool_ids_come_off_the_content_array() {
+    fn non_streamed_bound_tokens_come_off_the_body() {
         let body = br#"{
-            "id": "msg_1",
+            "id": "msg_fake_1",
             "type": "message",
             "content": [
                 {"type": "text", "text": "on it"},
+                {"type": "thinking", "thinking": "step one", "signature": "sig_fake_1"},
+                {"type": "redacted_thinking", "data": "data_fake_1"},
                 {"type": "server_tool_use", "id": "srvtoolu_fake_1", "name": "advisor", "input": {}},
                 {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_fake_1",
                  "content": {"type": "advisor_redacted_result", "encrypted_content": "AAAA"}},
@@ -6671,10 +6989,16 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 2}
         }"#;
         assert_eq!(
-            response_server_tool_ids_from_json(body),
-            vec!["srvtoolu_fake_1".to_string()]
+            response_bound_tokens_from_json(body),
+            vec![
+                (BoundTokenKind::MessageId, "msg_fake_1".to_string()),
+                (BoundTokenKind::ThinkingSignature, "sig_fake_1".to_string()),
+                (BoundTokenKind::RedactedThinking, "data_fake_1".to_string()),
+                (BoundTokenKind::ServerToolUse, "srvtoolu_fake_1".to_string()),
+            ],
+            "the client-side tool_use is not bound state and must not appear"
         );
-        assert!(response_server_tool_ids_from_json(b"not json at all").is_empty());
+        assert!(response_bound_tokens_from_json(b"not json at all").is_empty());
     }
 
     /// The non-streamed twin: `tool_use` blocks come off the response body's
@@ -10001,19 +10325,19 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
-    // --- a server-tool result pins the conversation to its minting account ---
+    // --- account-bound history pins the conversation, and never diverts ---
 
-    /// An upstream that answers every request with a Messages body carrying ONE
-    /// `server_tool_use` block — the shape Anthropic returns for `--advisor` — and records the
-    /// `authorization` header of each request it saw, which is how these tests read WHICH
-    /// account served a turn. The encrypted content is a placeholder: a real one decodes only
-    /// on the org that minted it and has no business in a public repo.
+    /// An upstream that answers every request with a Messages body carrying the bound state the
+    /// real API returns — a `server_tool_use` block, a signed `thinking` block, and the
+    /// message's own id — and records the `authorization` header of each request it saw, which
+    /// is how these tests read WHICH account served a turn. Every token is a placeholder: a real
+    /// signature is Anthropic's attestation and has no business in a public repo.
     ///
-    /// Each response mints its OWN id (`srvtoolu_fake_<nth hit>`), as the real API does. One
-    /// fixed id across every response would let a LATER turn re-mint the same id onto whichever
-    /// account served it, which is exactly the routing this is meant to prevent and would make
-    /// the test agree with a broken implementation.
-    async fn spawn_advisor_upstream() -> (
+    /// Each response mints its OWN tokens (`…_fake_<nth hit>`), as the real API does. One fixed
+    /// token across every response would let a LATER turn re-mint it onto whichever account
+    /// served it, which is exactly the routing this is meant to prevent and would make the test
+    /// agree with a broken implementation.
+    async fn spawn_bound_upstream() -> (
         String,
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::Mutex<Vec<String>>>,
@@ -10034,6 +10358,8 @@ mod tests {
                     "type": "message",
                     "role": "assistant",
                     "content": [
+                        {"type": "thinking", "thinking": "step one",
+                         "signature": format!("sig_fake_{nth}")},
                         {"type": "server_tool_use", "id": mint_id, "name": "advisor", "input": {}},
                         {"type": "advisor_tool_result", "tool_use_id": mint_id,
                          "content": {"type": "advisor_redacted_result", "encrypted_content": "AAAA"}},
@@ -10077,17 +10403,15 @@ mod tests {
     }
 
     /// One turn of a conversation: `user_id` is the session's stable identity (tier 2 of
-    /// `stable_session_key`), and `server_tool_ids` are echoed back inside an assistant message
-    /// exactly as Claude Code echoes them.
-    fn advisor_turn_body(user_id: &str, server_tool_ids: &[&str]) -> String {
+    /// `stable_session_key`), and each signature is echoed back inside an assistant `thinking`
+    /// block exactly as Claude Code echoes them.
+    fn thinking_turn_body(user_id: &str, signatures: &[&str]) -> String {
         let mut messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        for id in server_tool_ids {
+        for signature in signatures {
             messages.push(serde_json::json!({
                 "role": "assistant",
                 "content": [
-                    {"type": "server_tool_use", "id": id, "name": "advisor", "input": {}},
-                    {"type": "advisor_tool_result", "tool_use_id": id,
-                     "content": {"type": "advisor_redacted_result", "encrypted_content": "AAAA"}},
+                    {"type": "thinking", "thinking": "step one", "signature": signature},
                 ],
             }));
         }
@@ -10102,7 +10426,7 @@ mod tests {
     /// Drive `/v1/messages` as a real client session would: a loopback peer and the
     /// `SessionKey` extension `mitm::serve_http` attaches, without which `stable_session_key`
     /// is never consulted and nothing is ever pinned.
-    async fn drive_conversation(manager: Arc<Manager>, body: &str) -> (StatusCode, Bytes) {
+    async fn drive_conversation_full(manager: Arc<Manager>, body: &str) -> Response {
         use tower::ServiceExt as _;
         let mut req = Request::builder()
             .method(Method::POST)
@@ -10112,7 +10436,13 @@ mod tests {
             .expect("build request");
         req.extensions_mut().insert(ClientAddr(loopback_peer()));
         req.extensions_mut().insert(SessionKey(1));
-        let response = app(manager).oneshot(req).await.expect("router response");
+        app(manager).oneshot(req).await.expect("router response")
+    }
+
+    /// [`drive_conversation_full`] reduced to the status and body most of these tests assert
+    /// on; the full form exists for the one that reads a `retry-after` header.
+    async fn drive_conversation(manager: Arc<Manager>, body: &str) -> (StatusCode, Bytes) {
+        let response = drive_conversation_full(manager, body).await;
         let status = response.status();
         let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
             .await
@@ -10121,18 +10451,18 @@ mod tests {
     }
 
     /// The whole feature, end to end on a two-account fleet: a turn whose history carries a
-    /// `server_tool_use` id is served by the account that minted it — even when this session's
-    /// own affinity pin names the other one — and the pin itself is left alone, because the
-    /// divert is for THIS request and the session is still warm where it was.
+    /// signed `thinking` block is served by the account that minted the signature — even when
+    /// this session's own affinity pin names the other one — and the pin itself is left alone,
+    /// because the divert is for THIS request and the session is still warm where it was.
     #[tokio::test]
-    async fn a_server_tool_result_pins_later_turns_to_the_minting_account() {
-        let (upstream, hits, seen) = spawn_advisor_upstream().await;
+    async fn a_bound_token_pins_later_turns_to_the_minting_account() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
         let manager =
             Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
 
-        // Turn 1 mints the id on whichever account rotation picked.
+        // Turn 1 mints the signature on whichever account rotation picked.
         let (status, _) =
-            drive_conversation(Arc::clone(&manager), &advisor_turn_body("sess-mint", &[])).await;
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-mint", &[])).await;
         assert_eq!(status, StatusCode::OK);
         let minting_auth = seen
             .lock()
@@ -10140,11 +10470,12 @@ mod tests {
             .first()
             .cloned()
             .expect("a hit");
-        assert!(
+        assert_eq!(
             manager
-                .server_tool_pin_account(&["srvtoolu_fake_1".to_string()])
-                .is_some(),
-            "the response's server_tool_use block must have been recorded"
+                .bound_token_account(&["sig_fake_1".to_string()])
+                .map(|(_, kind)| kind),
+            Some(BoundTokenKind::ThinkingSignature),
+            "the response's thinking signature must have been recorded"
         );
 
         // A DIFFERENT session, pinned to the OTHER account. Rotation on its own would hand it
@@ -10153,30 +10484,30 @@ mod tests {
         // this test needs is a session whose pin disagrees with the mint, by whatever route.
         manager.mark_rate_limited(0, 60);
         let (status, _) =
-            drive_conversation(Arc::clone(&manager), &advisor_turn_body("sess-other", &[])).await;
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-other", &[])).await;
         assert_eq!(status, StatusCode::OK);
         manager.clear_rate_limited(0);
         let other_auth = seen.lock().expect("recorder")[1].clone();
         assert_ne!(
             other_auth, minting_auth,
-            "the control this test rests on: with no pin, rotation moves to the other account"
+            "the control this test rests on: that turn landed on the other account"
         );
         let pin_key = stable_hash("uid:", "sess-other");
         let pinned_before = manager.affinity_pin(pin_key);
         assert!(pinned_before.is_some(), "that turn must have left a pin");
 
-        // The same session, now carrying the id minted on the OTHER account. Its pin says one
-        // thing, the minting account says another, and the minting account wins.
+        // The same session, now carrying the signature minted on the OTHER account. Its pin
+        // says one thing, the minting account says another, and the minting account wins.
         let (status, _) = drive_conversation(
             Arc::clone(&manager),
-            &advisor_turn_body("sess-other", &["srvtoolu_fake_1"]),
+            &thinking_turn_body("sess-other", &["sig_fake_1"]),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             seen.lock().expect("recorder")[2],
             minting_auth,
-            "a request carrying the id must reach the account that minted it"
+            "a request carrying the signature must reach the account that signed it"
         );
         assert_eq!(
             manager.affinity_pin(pin_key),
@@ -10184,32 +10515,36 @@ mod tests {
             "a divert serves one request; it must not rewrite the session's pin"
         );
 
-        // And the pin is still doing its job for turns that carry no server-tool history.
+        // And the pin is still doing its job for turns that carry no bound history.
         let (status, _) =
-            drive_conversation(Arc::clone(&manager), &advisor_turn_body("sess-other", &[])).await;
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-other", &[])).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             seen.lock().expect("recorder")[3],
             other_auth,
-            "with no id to honour, the session goes back to its own pinned account"
+            "with no token to honour, the session goes back to its own pinned account"
         );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
-    /// When the minting account cannot serve, the honest answer is a 429 — never an eligible
-    /// sibling, which would answer `400 invalid_request_error` and burn the turn. The hit
-    /// counter is the assertion that matters: no upstream may be touched at all.
+    /// When the bound account cannot serve, the honest answer is a 429 — never an eligible
+    /// sibling, which would reject the whole request and burn the turn. The hit counter is the
+    /// assertion that matters: no upstream may be touched at all.
     #[tokio::test]
-    async fn a_hard_ineligible_minting_account_answers_429_instead_of_a_sibling() {
-        let (upstream, hits, _seen) = spawn_advisor_upstream().await;
-        // Account 0 is out of rotation; the id was minted on it before it went out.
+    async fn a_hard_ineligible_bound_account_answers_429_instead_of_a_sibling() {
+        let (upstream, hits, _seen) = spawn_bound_upstream().await;
+        // Account 0 is out of rotation; the signature was minted on it before it went out.
         let manager =
             Manager::with_live_refresher(two_accounts_over(&upstream, &[true, false]), None);
-        manager.record_minted_server_tools(&["srvtoolu_fake_1".to_string()], 0, crate::now_ms());
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_fake_1".to_string())],
+            0,
+            crate::now_ms(),
+        );
 
         let (status, body) = drive_conversation(
             Arc::clone(&manager),
-            &advisor_turn_body("sess-pinned", &["srvtoolu_fake_1"]),
+            &thinking_turn_body("sess-pinned", &["sig_fake_1"]),
         )
         .await;
         assert_eq!(
@@ -10221,29 +10556,33 @@ mod tests {
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "the eligible sibling must never be handed a foreign advisor result"
+            "the eligible sibling must never be handed a foreign signature"
         );
 
-        // The control, on the same manager: the same session with no server-tool history is
-        // served normally by the account that IS eligible.
-        let (status, _) =
-            drive_conversation(Arc::clone(&manager), &advisor_turn_body("sess-pinned", &[])).await;
+        // The control, on the same manager: the same session with no bound history is served
+        // normally by the account that IS eligible.
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-pinned", &[]),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// An id this process never minted — from before this shipped, or aged out of the map —
-    /// benches nothing. The rule must never block a conversation it knows nothing about.
+    /// A token this process never minted — from before this shipped, or aged out of the map —
+    /// on a session with no pin benches nothing. The rule must never block a conversation it
+    /// knows nothing about and has no better guess for.
     #[tokio::test]
-    async fn an_unknown_server_tool_id_changes_nothing() {
-        let (upstream, hits, seen) = spawn_advisor_upstream().await;
+    async fn an_unknown_bound_token_on_an_unpinned_session_changes_nothing() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
         let manager =
             Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
 
         for _ in 0..2 {
             let (status, _) = drive_conversation(
                 Arc::clone(&manager),
-                &advisor_turn_body("sess-unknown", &["srvtoolu_fake_never_minted"]),
+                &thinking_turn_body("sess-unknown", &["sig_fake_never_minted"]),
             )
             .await;
             assert_eq!(status, StatusCode::OK);
@@ -10254,6 +10593,143 @@ mod tests {
             seen[0], seen[1],
             "unchanged routing here means the session's own pin decided, not a bench"
         );
+    }
+
+    /// The case that covers every conversation older than this build: the history IS bound —
+    /// it carries a `thinking` signature — but this process never minted it, so nothing
+    /// resolves. It must be held to the session's PIN rather than diverted, because the pin is
+    /// where that history was made, and a divert is a guaranteed rejection.
+    ///
+    /// The control is the same request on a short hold: without the bench it diverts to the
+    /// sibling and is served (`short-hold`, 2,773 of 4,420 diverts measured 2026-09-20..22).
+    #[tokio::test]
+    async fn bound_history_with_no_known_token_holds_the_session_to_its_pin() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+
+        // Pin the session to account 1 by making it the only choice for one turn.
+        manager.mark_rate_limited(0, 60);
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-old", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        manager.clear_rate_limited(0);
+        let pinned_auth = seen.lock().expect("recorder")[0].clone();
+        let pin_key = stable_hash("uid:", "sess-old");
+        assert_eq!(manager.affinity_pin(pin_key), Some(1));
+
+        // The control FIRST, so this test cannot pass on a fleet that never diverts: an
+        // ORDINARY turn on the pinned account's short hold goes to the sibling.
+        manager.mark_rate_limited(1, 7);
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-old", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(
+            seen.lock().expect("recorder")[1],
+            pinned_auth,
+            "with no bound history, a short hold on the pin DIVERTS — that is the behaviour \
+             this rule has to override"
+        );
+        manager.clear_rate_limited(1);
+
+        // Same session, same hold, but now the history is bound by a signature this process
+        // never saw. There is nothing to resolve, so the pin decides — and the request WAITS
+        // that hold out on the pinned account rather than diverting. A hold inside
+        // `INLINE_WAIT_MAX_SECS` is waited inline, so the turn is served, on the one account
+        // that can serve it: strictly better than the 429 the same bench produces for a longer
+        // hold (the test below), and never the sibling.
+        manager.mark_rate_limited(1, 1);
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-old", &["sig_fake_minted_before_this_build"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.lock().expect("recorder")[2],
+            pinned_auth,
+            "a bound conversation is held to its pin and waits, never diverted"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// The other half of the hold: a bound conversation whose only account is parked for LONGER
+    /// than the soft-wait gets a 429 advertising that account's own `retry-after`, so the
+    /// client comes back when the account is actually free — not a divert onto a sibling that
+    /// would reject the history, and not an instant 429 with an invented number.
+    #[tokio::test]
+    async fn a_bound_request_on_a_long_hold_answers_429_with_that_holds_retry_after() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+
+        // Pin the session to account 1, as above.
+        manager.mark_rate_limited(0, 600);
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-held", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        manager.clear_rate_limited(0);
+        assert_eq!(
+            manager.affinity_pin(stable_hash("uid:", "sess-held")),
+            Some(1)
+        );
+        let pinned_auth = seen.lock().expect("recorder")[0].clone();
+
+        // A hold past the soft-wait ceiling (`EXHAUSTION_SOFT_WAIT_MAX_SECS`), so waiting it out
+        // inside the request is not an option, and under the client's `retry-after` ceiling
+        // (`CLIENT_RETRY_AFTER_MAX_SECS`), so the header carries the figure itself. The SIBLING
+        // frees sooner: timed fleet-wide, the answer would be the sibling's 3s — a soft-wait
+        // spent on an account this request may not use, then a 429 whose number means nothing.
+        const BOUND_HOLD: i64 = 45;
+        const _: () = assert!(
+            BOUND_HOLD > EXHAUSTION_SOFT_WAIT_MAX_SECS && BOUND_HOLD <= CLIENT_RETRY_AFTER_MAX_SECS
+        );
+        manager.mark_rate_limited(0, 3);
+        manager.mark_rate_limited(1, BOUND_HOLD);
+        let asked_at = std::time::Instant::now();
+        let response = drive_conversation_full(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-held", &["sig_fake_minted_before_this_build"]),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "held to a parked pin, the honest answer is a 429"
+        );
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())
+            .expect("a 429 from this path must carry a retry-after");
+        assert!(
+            (BOUND_HOLD - 1..=BOUND_HOLD).contains(&retry_after),
+            "the hint must be the pinned account's OWN hold ({BOUND_HOLD}s, less the moment \
+             spent getting here), not the sibling's and not an invented number: got \
+             {retry_after}"
+        );
+        assert!(
+            asked_at.elapsed() < Duration::from_secs(2),
+            "answered at once, not after a soft-wait timed on the sibling: {:?}",
+            asked_at.elapsed()
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the held request reached no upstream at all"
+        );
+        manager.clear_rate_limited(0);
+        manager.clear_rate_limited(1);
+
+        // Released, the same bound request is served by the pinned account.
+        let (status, _) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-held", &["sig_fake_minted_before_this_build"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.lock().expect("recorder")[1], pinned_auth);
     }
 
     /// The segment-boundary fix on the wire, in both directions. The bare `/v1/code`

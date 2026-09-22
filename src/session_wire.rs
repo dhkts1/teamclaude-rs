@@ -1308,42 +1308,62 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
     (tool_uses, tool_results)
 }
 
-/// Most `server_tool_use` ids one request's history is scanned for. A conversation accumulates
-/// one per server-side tool call, and they all name the same account (see
-/// `Manager::server_tool_pin_account`), so the first handful is already more than enough to
-/// resolve the minting account — the cap exists so a long conversation costs a fixed amount
-/// here, not a growing one.
-pub const SERVER_TOOL_ID_SCAN_CAP: usize = 16;
+/// Most account-bound tokens one request's history is scanned for. Every token in a
+/// conversation names the same account, so the first handful already resolves it — the cap
+/// makes a long conversation cost a fixed amount here rather than a growing one.
+pub const BOUND_TOKEN_SCAN_CAP: usize = 16;
 
-/// Every `server_tool_use` id carried anywhere in a request's `messages`.
+/// What a request's history says about which account may serve it — see
+/// [`extract_bound_tokens`].
 ///
-/// Deliberately NOT the bounded tail [`extract_tool_events`] walks: a server-side tool block
-/// (`--advisor` today) and the encrypted result beside it stay in the conversation history for
-/// its whole life, and it is the OLD ones that still pin the request — Claude Code echoes the
-/// pair back on every later turn, and the API rejects the whole request on any account but the
-/// one that minted the id. A tail scan would find them on turn two and miss them forever after,
-/// which is the same as not having this at all.
+/// A struct, not a tuple: the two values answer different questions and the second one drives a
+/// bench all by itself, so a caller must not be able to bind them the wrong way round.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BoundHistory {
+    /// The tokens themselves, deduplicated, at most [`BOUND_TOKEN_SCAN_CAP`] of them.
+    pub tokens: Vec<String>,
+    /// Whether the history carries ANY account-bound state at all — true even when the tokens
+    /// were capped away, and true for a bound block whose token field is missing. This is what
+    /// holds a conversation to its pin when no token happens to be known to this process.
+    pub carries_bound_history: bool,
+}
+
+/// Every account-bound token carried anywhere in a request's `messages`.
 ///
-/// Cheap by construction: each block is read as `type` + `id` and nothing else, so the
-/// megabyte-scale `encrypted_content` string beside it is skipped rather than materialized.
-/// Ordinary `tool_use` blocks (client-side tools, `toolu_…`) are not server-side and are
-/// ignored. Capped at [`SERVER_TOOL_ID_SCAN_CAP`].
+/// Three block shapes bind a conversation to the account that produced them, and all three ride
+/// in the history for its whole life:
 ///
-/// Role is not checked. The blocks are only ever emitted by the model, so they only ever appear
-/// in an `assistant` message; requiring the role would add a way for a body shaped slightly
-/// differently to lose its pin, and a client cannot gain anything by claiming an id — the worst
-/// a forged one does is bench the fleet down to the account that minted it.
+/// - `server_tool_use.id` — the advisor call, whose encrypted result decrypts on one org only;
+/// - `thinking.signature` — Anthropic's attestation over a reasoning block;
+/// - `redacted_thinking.data` — the same thing, already encrypted.
 ///
-/// `web_search` results carry the same `encrypted_content` shape and fail the same way on a
-/// foreign account; its block type is the next one to add here when it is worth the traffic.
-pub fn extract_server_tool_use_ids(messages: &RawValue) -> Vec<String> {
-    /// One content block, read for the two fields this scan needs.
+/// (`previous_message_id` binds a conversation too, but it is a top-level body field rather
+/// than a content block, so `src/proxy.rs` reads it in the same peek and folds it in here.)
+///
+/// Deliberately NOT the bounded tail [`extract_tool_events`] walks: it is the OLD blocks that
+/// still bind the request, so a tail scan would find them on turn two and miss them forever
+/// after — the same as not having this at all.
+///
+/// Cheap by construction: each block is read as `type` plus one string field, so the
+/// megabyte-scale `encrypted_content`, `thinking` text and tool inputs beside them are skipped
+/// rather than materialized.
+///
+/// Role is not checked. These blocks are only ever emitted by the model, so they only appear in
+/// an `assistant` message; requiring the role would add a way for a body shaped slightly
+/// differently to lose its pin, and a client gains nothing by claiming one — the worst a forged
+/// token does is bench the fleet down to the account that minted it.
+pub fn extract_bound_tokens(messages: &RawValue) -> BoundHistory {
+    /// One content block, read for the type and the four fields any bound shape uses.
     #[derive(serde::Deserialize)]
-    struct ServerToolBlockPeek {
+    struct BoundBlockPeek {
         #[serde(rename = "type", default)]
         kind: String,
         #[serde(default)]
         id: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
+        #[serde(default)]
+        data: Option<String>,
     }
     /// One message, whose `content` is kept borrowed so a message with no blocks at all costs
     /// nothing beyond finding its end.
@@ -1353,9 +1373,9 @@ pub fn extract_server_tool_use_ids(messages: &RawValue) -> Vec<String> {
         content: Option<&'a RawValue>,
     }
 
-    let mut ids: Vec<String> = Vec::new();
+    let mut found = BoundHistory::default();
     let Ok(all) = serde_json::from_str::<Vec<&RawValue>>(messages.get()) else {
-        return ids;
+        return found;
     };
     for raw in all {
         let Ok(msg) = serde_json::from_str::<ContentPeek>(raw.get()) else {
@@ -1365,26 +1385,35 @@ pub fn extract_server_tool_use_ids(messages: &RawValue) -> Vec<String> {
         // cannot carry one of these — parsing it as blocks fails, which is the skip.
         let Some(Ok(blocks)) = msg
             .content
-            .map(|c| serde_json::from_str::<Vec<ServerToolBlockPeek>>(c.get()))
+            .map(|c| serde_json::from_str::<Vec<BoundBlockPeek>>(c.get()))
         else {
             continue;
         };
         for block in blocks {
-            if block.kind != "server_tool_use" {
-                continue;
-            }
-            let Some(id) = block.id else {
+            // The token field differs per shape; an ordinary `tool_use` (client-side, `toolu_…`)
+            // is not bound state at all and must not appear here — its result travels in the
+            // request body in plain text and any account can read it.
+            let token = match block.kind.as_str() {
+                "server_tool_use" => block.id,
+                "thinking" => block.signature,
+                "redacted_thinking" => block.data,
+                _ => continue,
+            };
+            // Reached only for a bound shape, so the history is bound even when the token field
+            // itself is absent and even once the cap has been hit.
+            found.carries_bound_history = true;
+            let Some(token) = token else {
                 continue;
             };
-            if !ids.contains(&id) {
-                ids.push(id);
+            if found.tokens.len() >= BOUND_TOKEN_SCAN_CAP {
+                continue;
             }
-            if ids.len() >= SERVER_TOOL_ID_SCAN_CAP {
-                return ids;
+            if !found.tokens.contains(&token) {
+                found.tokens.push(token);
             }
         }
     }
-    ids
+    found
 }
 
 /// Build one [`ToolUseEvent`] from a `tool_use` block's `id`, `name` and `input`.
@@ -2274,76 +2303,107 @@ mod tests {
         ])
     }
 
-    /// The whole point of scanning ALL messages: the block that pins the conversation was
+    /// A signed reasoning block, in the shape the API returns it and Claude Code echoes it.
+    fn thinking_block(signature: &str) -> serde_json::Value {
+        serde_json::json!({"type": "thinking", "thinking": "step one", "signature": signature})
+    }
+
+    /// The whole point of scanning ALL messages: the block that binds the conversation was
     /// minted on turn one and is still echoed on turn ten, far outside the tail window
-    /// `extract_tool_events` walks.
+    /// `extract_tool_events` walks. Every bound shape is found there.
     #[test]
-    fn server_tool_ids_are_found_anywhere_in_the_history() {
+    fn bound_tokens_are_found_anywhere_in_the_history() {
         let messages = serde_json::json!([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": advisor_pair("srvtoolu_fake_1")},
             {"role": "user", "content": [tool_result("tu_1", false, "ok")]},
-            {"role": "assistant", "content": "just text"},
+            {"role": "assistant", "content": [thinking_block("sig_fake_1")]},
             {"role": "user", "content": "another turn"},
-            {"role": "assistant", "content": [tool_use("tu_2", "Bash", Some("ls"))]},
+            {"role": "assistant", "content": [
+                {"type": "redacted_thinking", "data": "data_fake_1"},
+                tool_use("tu_2", "Bash", Some("ls")),
+            ]},
             {"role": "user", "content": [tool_result("tu_2", false, "ok")]},
         ]);
-        let raw = messages_raw(messages);
+        let found = extract_bound_tokens(&messages_raw(messages));
         assert_eq!(
-            extract_server_tool_use_ids(&raw),
-            vec!["srvtoolu_fake_1".to_string()]
+            found.tokens,
+            vec![
+                "srvtoolu_fake_1".to_string(),
+                "sig_fake_1".to_string(),
+                "data_fake_1".to_string(),
+            ]
         );
+        assert!(found.carries_bound_history);
     }
 
-    /// A client-side `tool_use` is not a server-side one: its result travels in the request
-    /// body in plain text and any account can read it. Benching the fleet for one would be a
-    /// pure loss.
+    /// A client-side `tool_use` is not bound state: its result travels in the request body in
+    /// plain text and any account can read it. Benching the fleet for one would be a pure loss,
+    /// and — more to the point — claiming it as bound history would hold every ordinary
+    /// tool-using conversation to its pin.
     #[test]
-    fn a_client_side_tool_use_is_not_a_server_tool() {
+    fn a_client_side_tool_use_is_not_bound_state() {
         let messages = serde_json::json!([
             {"role": "assistant", "content": [tool_use("toolu_fake_1", "Bash", Some("ls"))]},
             {"role": "user", "content": [tool_result("toolu_fake_1", false, "ok")]},
             {"role": "user", "content": "plain text carries nothing"},
         ]);
-        let raw = messages_raw(messages);
-        assert!(extract_server_tool_use_ids(&raw).is_empty());
+        let found = extract_bound_tokens(&messages_raw(messages));
+        assert!(found.tokens.is_empty());
+        assert!(!found.carries_bound_history);
+    }
+
+    /// A bound block whose token field is missing still means the history is bound — the
+    /// request must be held to its pin even though there is nothing to look up.
+    #[test]
+    fn a_bound_block_with_no_token_still_reports_bound_history() {
+        let messages = serde_json::json!([
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "step one"}]},
+        ]);
+        let found = extract_bound_tokens(&messages_raw(messages));
+        assert!(found.tokens.is_empty());
+        assert!(found.carries_bound_history);
     }
 
     #[test]
-    fn repeated_and_multiple_server_tool_ids_are_collected_once_each_and_capped() {
+    fn repeated_and_multiple_bound_tokens_are_collected_once_each_and_capped() {
         let mut history = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        for n in 0..(SERVER_TOOL_ID_SCAN_CAP + 5) {
+        for n in 0..(BOUND_TOKEN_SCAN_CAP + 5) {
             history.push(serde_json::json!({
                 "role": "assistant",
-                "content": advisor_pair(&format!("srvtoolu_fake_{n}")),
+                "content": [thinking_block(&format!("sig_fake_{n}"))],
             }));
-            // The same id echoed again, as a real conversation does on every later turn.
+            // The same signature echoed again, as a real conversation does on every later turn.
             history.push(serde_json::json!({
                 "role": "assistant",
-                "content": advisor_pair("srvtoolu_fake_0"),
+                "content": [thinking_block("sig_fake_0")],
             }));
         }
-        let raw = messages_raw(serde_json::Value::Array(history));
-        let ids = extract_server_tool_use_ids(&raw);
-        assert_eq!(ids.len(), SERVER_TOOL_ID_SCAN_CAP);
-        assert_eq!(ids[0], "srvtoolu_fake_0");
+        let found = extract_bound_tokens(&messages_raw(serde_json::Value::Array(history)));
+        assert_eq!(found.tokens.len(), BOUND_TOKEN_SCAN_CAP);
+        assert_eq!(found.tokens[0], "sig_fake_0");
         assert_eq!(
-            ids.iter().filter(|id| *id == "srvtoolu_fake_0").count(),
+            found.tokens.iter().filter(|t| *t == "sig_fake_0").count(),
             1,
-            "an id echoed on every turn is still one id"
+            "a signature echoed on every turn is still one token"
         );
+        assert!(found.carries_bound_history);
     }
 
     #[test]
-    fn a_body_with_no_server_tool_blocks_yields_nothing() {
+    fn a_body_with_no_bound_blocks_yields_nothing() {
         let raw = messages_raw(serde_json::json!([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
         ]));
-        assert!(extract_server_tool_use_ids(&raw).is_empty());
+        assert_eq!(extract_bound_tokens(&raw), BoundHistory::default());
         let malformed = serde_json::value::RawValue::from_string("\"not an array\"".to_string())
             .expect("raw value");
-        assert!(extract_server_tool_use_ids(&malformed).is_empty());
+        assert_eq!(
+            extract_bound_tokens(&malformed),
+            BoundHistory::default(),
+            "a body that does not parse binds nothing, and never panics"
+        );
     }
 
     #[test]

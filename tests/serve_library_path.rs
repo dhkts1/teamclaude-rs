@@ -162,15 +162,16 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     );
     assert!(addr.ip().is_loopback(), "the proxy binds loopback only");
 
-    // The four loops this config enables: affinity flush + server-tool-pin flush +
-    // wire-sessions flush + quota probe. The server-tool-pin flusher joined them when a
-    // `server_tool_use` id became routing state that has to survive a restart
-    // (`teamclaude_rs::server_tool_pins`); it is keyed on the same `affinity_path` this
-    // config sets. The keep-warm loop is off, so it must NOT have been spawned.
+    // The four loops this config enables: affinity flush + bound-token flush +
+    // wire-sessions flush + quota probe. The bound-token flusher joined them when
+    // account-bound history (advisor ids, thinking signatures, message ids) became routing
+    // state that has to survive a restart (`teamclaude_rs::bound_tokens`); it is keyed on the
+    // same `affinity_path` this config sets. The keep-warm loop is off, so it must NOT have
+    // been spawned.
     assert_eq!(
         handle.background_task_count(),
         4,
-        "expected the affinity flusher, the server-tool-pin flusher, the wire-sessions \
+        "expected the affinity flusher, the bound-token flusher, the wire-sessions \
          flusher and the quota prober, and no keep-warm loop"
     );
 
