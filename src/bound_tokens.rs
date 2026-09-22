@@ -3,17 +3,20 @@
 //!
 //! Anthropic's API hands back several kinds of state that only the account that produced them
 //! can read again. Claude Code echoes every one of them in the conversation history on every
-//! later turn, so serving one of those turns from another account fails the WHOLE request:
+//! later turn, so serving one of those turns from another account fails that request:
 //!
-//! | what the history carries | what another account answers |
-//! |---|---|
-//! | a `server_tool_use` id (`--advisor`) | `400 Advisor tool result content could not be processed` |
-//! | a signed `thinking` block, or a `redacted_thinking` block's `data` | `400 thinking or redacted_thinking blocks in the latest assistant message cannot be modified` |
-//! | a `previous_message_id` naming server-side thread state | `404 No thread state was found for the requested previous_message_id` |
+//! | what the history carries | what another account answers | what Claude Code does next |
+//! |---|---|---|
+//! | a `server_tool_use` id (`--advisor`) | `400 Advisor tool result content could not be processed` | strips the advisor blocks and retries (`retry:advisor-strip`) |
+//! | a signed `thinking` block, or a `redacted_thinking` block's `data` | `400 thinking or redacted_thinking blocks in the latest assistant message cannot be modified` | strips every thinking block and retries (`retry:thinking-signature-strip`) |
+//! | a `thread.previous_message_id` naming server-side thread state | `404 No thread state was found for the requested previous_message_id` (`thread_not_found`) | replays the full history as a new thread (`retry:tether-replay`) |
 //!
 //! Measured over 2026-09-20..22 on one fleet, 173k upstream calls: 8,322 of the first, 170 of
 //! the second, 66 of the third — every cluster starting where a pinned conversation was
-//! diverted onto another account (4,420 diverts in the same window).
+//! diverted onto another account (4,420 diverts in the same window). The third column was read
+//! in the Claude Code 2.1.277..2.1.280 binaries on 2026-09-22: every rejection costs one extra
+//! round trip and some context, never the turn. That is why the map holds a conversation to
+//! its account only while that account can serve soon (`Manager::bound_account_holds`).
 //!
 //! This module is the file that carries the token → account map across a restart, which is
 //! when a live conversation is most likely to be re-keyed. [`crate::manager::Manager`] owns the
