@@ -431,52 +431,81 @@ fn forwarder_on(
     listener: TcpListener,
     forwarder: Forwarder,
 ) -> tokio::task::JoinHandle<anyhow::Result<(u64, u64)>> {
+    forwarder_rounds_on(listener, forwarder, 1)
+}
+
+/// [`forwarder_on`] for a caller that is dialled more than once, answering the
+/// LAST forward's byte counts.
+///
+/// **A real forwarder serves many streams, and this fixture used to serve
+/// exactly one.** That arity was invisible at the call site and it was the
+/// whole of a later failure: a caller that now opens one carried stream before
+/// the one it is measuring found nothing accepting the second, and read that
+/// as the carry itself refusing. Making the count an argument puts the fact
+/// where a reader of the test can see it.
+fn forwarder_rounds_on(
+    listener: TcpListener,
+    forwarder: Forwarder,
+    rounds: usize,
+) -> tokio::task::JoinHandle<anyhow::Result<(u64, u64)>> {
     tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await?;
-        let pin_rows = forwarder.store.peers();
-        let mut session = noise::accept_handshake(
-            &mut stream,
-            &forwarder.secret,
-            Handshake::Return,
-            &[],
-            move |remote| noise::pin_check_rows(remote, &pin_rows),
-        )
-        .await?;
-        let frame = noise::recv_encrypted(&mut stream, &mut session.transport).await?;
-        let wire: StreamHeader = serde_json::from_slice(&frame)?;
-        let target = wire.target.clone().unwrap_or(TunnelTarget::Peer {
-            node: forwarder.target,
-        });
-        let header = StreamHeader {
-            target: Some(target.clone()),
-            ..wire
-        };
-        let row = forwarder.store.row(&session.peer);
-        listener::peer_stream_gate_rows(&header, row.as_ref()).map_err(anyhow::Error::new)?;
-        // The peer charged is the one the HANDSHAKE proved, read off the
-        // session, never anything the header said about itself.
-        let peer = session.peer;
-        tunnel::handle_forward_on(
-            stream,
-            session,
-            Carry {
-                route: OriginRoute::Peer(forwarder.target),
-                peer,
-                target: &target,
-                hosts: teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
-                cap_bytes: forwarder.cap_bytes,
-                budget: &forwarder.budget,
-                now_ms: NOW_MS,
-            },
-            Forward {
-                store: &forwarder.store,
-                node: forwarder.node,
-                hops_remaining: header.hops_remaining,
-                via: &header.via,
-            },
-        )
-        .await
+        let mut last = (0, 0);
+        for _ in 0..rounds {
+            let (stream, _) = listener.accept().await?;
+            last = forward_one(stream, &forwarder).await?;
+        }
+        Ok(last)
     })
+}
+
+/// One accepted connection, forwarded. The body of [`forwarder_on`], lifted
+/// out so that how MANY connections are served is the spawner's business and
+/// not something baked into the accept.
+async fn forward_one(stream: TcpStream, forwarder: &Forwarder) -> anyhow::Result<(u64, u64)> {
+    let mut stream = stream;
+    let pin_rows = forwarder.store.peers();
+    let mut session = noise::accept_handshake(
+        &mut stream,
+        &forwarder.secret,
+        Handshake::Return,
+        &[],
+        move |remote| noise::pin_check_rows(remote, &pin_rows),
+    )
+    .await?;
+    let frame = noise::recv_encrypted(&mut stream, &mut session.transport).await?;
+    let wire: StreamHeader = serde_json::from_slice(&frame)?;
+    let target = wire.target.clone().unwrap_or(TunnelTarget::Peer {
+        node: forwarder.target,
+    });
+    let header = StreamHeader {
+        target: Some(target.clone()),
+        ..wire
+    };
+    let row = forwarder.store.row(&session.peer);
+    listener::peer_stream_gate_rows(&header, row.as_ref()).map_err(anyhow::Error::new)?;
+    // The peer charged is the one the HANDSHAKE proved, read off the
+    // session, never anything the header said about itself.
+    let peer = session.peer;
+    tunnel::handle_forward_on(
+        stream,
+        session,
+        Carry {
+            route: OriginRoute::Peer(forwarder.target),
+            peer,
+            target: &target,
+            hosts: teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
+            cap_bytes: forwarder.cap_bytes,
+            budget: &forwarder.budget,
+            now_ms: NOW_MS,
+        },
+        Forward {
+            store: &forwarder.store,
+            node: forwarder.node,
+            hops_remaining: header.hops_remaining,
+            via: &header.via,
+        },
+    )
+    .await
 }
 
 /// A target that counts what reached it, so "refused" can be measured as *the
@@ -783,34 +812,62 @@ fn responder_on(
     secret: [u8; 32],
     pins: Vec<PeerRow>,
 ) -> tokio::task::JoinHandle<anyhow::Result<Arrived>> {
+    responder_rounds_on(listener, secret, pins, 1)
+}
+
+/// [`responder_on`] for a target that is dialled more than once, answering
+/// what arrived on the LAST session.
+///
+/// The last and not the first, because the earlier rounds are whatever the
+/// dialler did on its way to the exchange this test is about, and the session
+/// under assertion is the one it ended on. Same reasoning as
+/// [`forwarder_rounds_on`]: the count belongs at the call site.
+fn responder_rounds_on(
+    listener: TcpListener,
+    secret: [u8; 32],
+    pins: Vec<PeerRow>,
+    rounds: usize,
+) -> tokio::task::JoinHandle<anyhow::Result<Arrived>> {
     tokio::spawn(async move {
-        let (socket, _) = listener.accept().await?;
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut tapped = Tap {
-            inner: socket,
-            seen: Arc::clone(&seen),
-        };
-        let mut session = noise::accept_handshake(
-            &mut tapped,
-            &secret,
-            Handshake::Return,
-            &[],
-            move |remote| noise::pin_check_rows(remote, &pins),
-        )
-        .await?;
-        let plaintext = noise::recv_encrypted(&mut tapped, &mut session.transport).await?;
-        // Drain to EOF, so `on_the_wire` is EVERYTHING the forwarder wrote and
-        // not merely as far as the first frame: an assertion about ciphertext
-        // has to be about the whole stream, and a tap that stopped early would
-        // pass by looking away.
-        let mut rest = vec![0_u8; 4096];
-        while tapped.read(&mut rest).await.unwrap_or(0) > 0 {}
-        let on_the_wire = seen.lock().expect("the tap lock").clone();
-        Ok(Arrived {
-            authenticated_as: session.peer,
-            plaintext,
-            on_the_wire,
+        let mut last = None;
+        for _ in 0..rounds {
+            let (socket, _) = listener.accept().await?;
+            last = Some(respond_once(socket, &secret, &pins).await?);
+        }
+        last.ok_or_else(|| anyhow::anyhow!("a responder asked for zero rounds accepted nothing"))
+    })
+}
+
+/// One accepted session, answered. The body of [`responder_on`], lifted out so
+/// that how many sessions are served is the spawner's business.
+async fn respond_once(
+    socket: TcpStream,
+    secret: &[u8; 32],
+    pins: &[PeerRow],
+) -> anyhow::Result<Arrived> {
+    let pins = pins.to_vec();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut tapped = Tap {
+        inner: socket,
+        seen: Arc::clone(&seen),
+    };
+    let mut session =
+        noise::accept_handshake(&mut tapped, secret, Handshake::Return, &[], move |remote| {
+            noise::pin_check_rows(remote, &pins)
         })
+        .await?;
+    let plaintext = noise::recv_encrypted(&mut tapped, &mut session.transport).await?;
+    // Drain to EOF, so `on_the_wire` is EVERYTHING the forwarder wrote and
+    // not merely as far as the first frame: an assertion about ciphertext
+    // has to be about the whole stream, and a tap that stopped early would
+    // pass by looking away.
+    let mut rest = vec![0_u8; 4096];
+    while tapped.read(&mut rest).await.unwrap_or(0) > 0 {}
+    let on_the_wire = seen.lock().expect("the tap lock").clone();
+    Ok(Arrived {
+        authenticated_as: session.peer,
+        plaintext,
+        on_the_wire,
     })
 }
 
@@ -1234,11 +1291,19 @@ fn via_row(peer: &PeerId, label: &str, via: PeerId) -> PeerRow {
 ///
 /// One function because all three cases below want the same two listeners and
 /// differ only in what A's own peers file says about how to get to B.
+///
+/// `carried` is how many carried streams A will open before it is done, and
+/// every caller says its own number rather than inheriting one. A dial whose
+/// row holds no dialable endpoint now opens two, because the punch step asks
+/// that peer for its current address through this same friend first
+/// (`serve::exchange_addresses`), and a fixture that accepted one read the
+/// missing second accept as the carry refusing.
 async fn forwarder_and_target(
     tag: &str,
     a: &PeerId,
     b: &Node,
     c: &Node,
+    carried: usize,
 ) -> (
     std::net::SocketAddr,
     tokio::task::JoinHandle<anyhow::Result<(u64, u64)>>,
@@ -1247,17 +1312,18 @@ async fn forwarder_and_target(
     // B pins A and NOT C, so the nested handshake has to prove A or die.
     let target_listener = loopback().await;
     let target_addr = target_listener.local_addr().expect("the target address");
-    let target = responder_on(
+    let target = responder_rounds_on(
         target_listener,
         b.secret,
         vec![row(a, "requester", Vec::new(), false)],
+        carried,
     );
 
     let forwarder_listener = loopback().await;
     let forwarder_addr = forwarder_listener
         .local_addr()
         .expect("the forwarder address");
-    let forwarding = forwarder_on(
+    let forwarding = forwarder_rounds_on(
         forwarder_listener,
         Forwarder {
             secret: c.secret,
@@ -1274,6 +1340,7 @@ async fn forwarder_and_target(
             cap_bytes: 1024 * 1024,
             budget: Arc::new(Mutex::new(TunnelBudget::new())),
         },
+        carried,
     );
     (forwarder_addr, forwarding, target)
 }
@@ -1321,7 +1388,10 @@ async fn a_via_endpoint_is_dialled_through_the_forwarder_it_names() {
     let dir = scratch("client-via");
     let key = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
     let (forwarder_addr, forwarding, target) =
-        forwarder_and_target("client-via-forwarder", &key.id(), &b, &c).await;
+        // One carried stream: no Mac here holds `allow.carry`, so the address
+        // exchange inside the punch step has no carrier to ask and spends
+        // nothing before the `Via` endpoint is followed.
+        forwarder_and_target("client-via-forwarder", &key.id(), &b, &c, 1).await;
 
     // A's whole peers file: C, reachable and holding NO `allow.carry`; B,
     // reachable only through C.
@@ -1416,7 +1486,11 @@ async fn a_row_with_no_endpoints_is_reached_through_a_carry_grantee() {
     let dir = scratch("client-carry");
     let key = teamclaude_rs::peer::id::NodeKey::load_or_mint(&dir).expect("A mints its keypair");
     let (forwarder_addr, forwarding, target) =
-        forwarder_and_target("client-carry-forwarder", &key.id(), &b, &c).await;
+        // Two carried streams, and the second is the one under assertion. This
+        // row holds nothing dialable, which is the state the punch step names
+        // `PeerAddressUnknown`, so the dial asks B for its current address
+        // through C first and only then carries to it.
+        forwarder_and_target("client-carry-forwarder", &key.id(), &b, &c, 2).await;
 
     let a_store = store_in(
         &dir,
