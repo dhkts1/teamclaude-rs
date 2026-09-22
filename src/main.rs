@@ -4235,7 +4235,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
                     // disagree about what "possible" means.
                     "seesUsAt": reach::observed_self_for(&row.node)
                         .map(|addr| addr.to_string()),
-                    "punchPossible": reach::punch_target(&row.node).is_ok(),
+                    "punchPossible": reach::punch_target(&row.node, &row.endpoints).is_ok(),
                 })
             })
             .collect();
@@ -4323,7 +4323,7 @@ fn run_peer_reach(args: peer_cli::PeerReachArgs) -> anyhow::Result<()> {
         // reader of this verb and a dial that punches cannot disagree.
         println!(
             "{}",
-            reach::reach_punch_line(&masked_label(&row.label), &row.node)
+            reach::reach_punch_line(&masked_label(&row.label), &row.node, &row.endpoints)
         );
     }
     if file.dead_drop.is_live() {

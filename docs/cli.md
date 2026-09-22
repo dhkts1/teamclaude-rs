@@ -1358,7 +1358,11 @@ It prints, in order: this Mac's global IPv6 addresses (none, if it has none); th
 answer, meaning the gateway found, the external address, and the mapping outcome when
 `--map` was passed (a refusal is an ordinary outcome, not an error); the local listen port;
 the current time-derived port slot; and, per pinned peer, that peer's derived port for this
-slot. A refusal from the router, or a peer row with no derived port yet, still exits 0.
+slot and a punch line: the address that peer last said it sees this Mac at, and whether a
+punch between the two is possible right now. The answer is `yes` when either that peer's
+last direct arrival or the row's own recorded endpoints give an address to aim at, and `no`
+when neither does. A refusal from the router, or a peer row with no derived port yet, still
+exits 0.
 
 The external address is asked over NAT-PMP first and UPnP IGD when NAT-PMP refuses, the same
 order the mapping itself falls back through, and the line names which protocol answered:

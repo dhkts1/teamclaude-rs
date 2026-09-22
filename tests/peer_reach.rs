@@ -2410,39 +2410,55 @@ fn the_told_side_plans_from_the_slot_it_was_given() {
 
 /// A punch that cannot start says which of the two things is missing.
 ///
-/// Both arms, and in order: a pair with no observed address is the ordinary
-/// state of two Macs that have only met on one LAN, and a pair with an address
-/// but no secret is what a restart leaves. They need different answers from
-/// an operator, so they are different names.
+/// Both arms, and in order: a pair with no observed address AND no dialable
+/// row endpoint is the ordinary state of two Macs that have only met on one
+/// LAN, and a pair with an address but no secret is what a restart leaves.
+/// They need different answers from an operator, so they are different
+/// names.
 #[test]
 fn a_punch_that_cannot_start_names_what_is_missing() {
     let node = tcr_peer_wire::PeerId([0x75; 32]);
     assert_eq!(
-        reach::punch_target(&node),
+        reach::punch_target(&node, &[]),
         Err(reach::PunchFailure::PeerAddressUnknown),
-        "nothing has ever seen this peer, so there is no address to aim at"
+        "nothing has ever seen this peer and the row is empty, so there is no address to aim at"
     );
-    assert!(!reach::punch_is_possible(&node));
+    assert!(!reach::punch_is_possible(&node, &[]));
+
+    // A row that holds only an undialable endpoint (a hop this node would
+    // have to reach through another Mac) still refuses with the same
+    // variant: the new source is the row's own DIRECT locators, not the row
+    // itself.
+    let via_only = [teamclaude_rs::peer::config::Endpoint::via(
+        tcr_peer_wire::PeerId([0x76; 32]),
+        1_000,
+        teamclaude_rs::peer::config::EndpointSource::Brief,
+    )];
+    assert_eq!(
+        reach::punch_target(&node, &via_only),
+        Err(reach::PunchFailure::PeerAddressUnknown),
+        "an endpoint that needs another Mac to carry it is not something this node can aim at"
+    );
 
     reach::remember_observed_peer(
         node,
         "203.0.113.20:41000".parse().expect("a test address parses"),
     );
     assert_eq!(
-        reach::punch_target(&node),
+        reach::punch_target(&node, &[]),
         Err(reach::PunchFailure::NoRendezvousSecret),
         "an address without a secret is a port the two cannot compute"
     );
 
     reach::remember_port_secret(node, [0x5c; 32]);
-    let (addr, secret) = reach::punch_target(&node).expect("both halves are held now");
+    let (addr, secret) = reach::punch_target(&node, &[]).expect("both halves are held now");
     assert_eq!(
         addr,
         "203.0.113.20".parse::<std::net::IpAddr>().expect("parses"),
         "the punch aims at the address, and the port comes from the derivation"
     );
     assert_eq!(secret, [0x5c; 32]);
-    assert!(reach::punch_is_possible(&node));
+    assert!(reach::punch_is_possible(&node, &[]));
 
     let named = reach::PunchFailure::NoSlotConnected {
         slots_tried: 3,
@@ -2452,6 +2468,51 @@ fn a_punch_that_cannot_start_names_what_is_missing() {
     assert!(
         named.contains("3 slots") && named.contains("20001"),
         "and the failure a symmetric NAT produces prints the count and the ports: {named}"
+    );
+}
+
+/// A punch may aim at an address the row already holds, when the per boot
+/// observation register has nothing.
+///
+/// The register is never persisted, so it is empty for every peer after any
+/// restart, move or no move ([`teamclaude_rs::peer::reach::observed_peer_for`]'s
+/// own doc). The row may already hold that peer's current public address from
+/// a moved link, and only the IP matters here because the port comes from the
+/// pair's own slot derivation.
+#[test]
+fn aim_off_the_row() {
+    let node = tcr_peer_wire::PeerId([0x77; 32]);
+    let moved: std::net::SocketAddr = "198.51.100.7:7755".parse().expect("a test address parses");
+    let endpoints = [teamclaude_rs::peer::config::Endpoint::direct(
+        moved,
+        2_000,
+        teamclaude_rs::peer::config::EndpointSource::Moved,
+    )];
+
+    reach::remember_port_secret(node, [0x5d; 32]);
+    let (addr, secret) = reach::punch_target(&node, &endpoints).expect(
+        "punch_target refused with PeerAddressUnknown while the row held \
+         198.51.100.7:7755 from a moved link",
+    );
+    assert_eq!(
+        addr,
+        moved.ip(),
+        "the row's own address is what a punch aims at when the register holds nothing"
+    );
+    assert_eq!(secret, [0x5d; 32]);
+    assert!(reach::punch_is_possible(&node, &endpoints));
+
+    // The register still wins over the row when both hold something: a
+    // source address a connection just arrived from is the freshest fact.
+    reach::remember_observed_peer(
+        node,
+        "203.0.113.9:9000".parse().expect("a test address parses"),
+    );
+    let (fresher, _) = reach::punch_target(&node, &endpoints).expect("both halves are held");
+    assert_eq!(
+        fresher,
+        "203.0.113.9".parse::<std::net::IpAddr>().expect("parses"),
+        "the freshest observation still wins over a row endpoint"
     );
 }
 

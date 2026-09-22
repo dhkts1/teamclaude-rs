@@ -3210,7 +3210,12 @@ where
             // whichever of the two sockets completed, and a stranger who
             // guessed the port meets the same pin check as anybody else.
             Control::PunchAt { slot, public_addr } => {
-                match crate::peer::reach::punch_request(session.peer, slot, &public_addr) {
+                match crate::peer::reach::punch_request(
+                    session.peer,
+                    slot,
+                    &public_addr,
+                    &row.endpoints,
+                ) {
                     Ok((peer_ip, plan)) => {
                         let Some(in_flight) =
                             PunchInFlight::acquire(context.admission(), session.peer)
