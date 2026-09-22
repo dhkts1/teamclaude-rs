@@ -1263,6 +1263,16 @@ pub struct LeaseReceipt {
 /// re-proven by the handshake against the pinned static key, so a lying hint
 /// fails, and a hint naming an unpinned node is refused before a socket opens.
 /// That one sentence is what makes chain collapse free.
+///
+/// It is sent by the Mac the hint is ABOUT, so [`Self::node`] is always the
+/// sender and a receiver refuses any other value: a third party's address is
+/// [`NeighborBrief`]'s job and travels under a grant. It travels on a carried
+/// CONTROL stream just before a punch, which is the moment the address is
+/// needed and the moment neither Mac can reach the other to ask any other way.
+/// And a build older than this one has no arm for it at all, so it closes the
+/// session: an asker reads one such close as "this peer does not exchange
+/// addresses" and falls through to the carry, exactly as the prober already
+/// treats an unanswered [`Control::Probe`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollapseHint {

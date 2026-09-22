@@ -3462,6 +3462,67 @@ where
                     "peer control: applied a borrower's usage hint"
                 );
             }
+            // **The other half of "both Macs moved".** A peer that changed
+            // networks names its current addresses here, and this Mac answers
+            // with its own, so one carried round trip leaves both of them with
+            // somewhere to aim. After that the friend carries nothing.
+            //
+            // # Why this frame's address is believed and the socket under it is
+            // not
+            //
+            // The session already proved this peer's pinned static key: a
+            // carried CONTROL stream is a fresh end to end Noise session
+            // nested inside a TUNNEL, which is what makes the carrier blind to
+            // it and is stated on the wire type itself
+            // (`tcr_peer_wire::Control`'s own doc). So the address in the
+            // frame is routing advice from a proved sender, and a wrong one
+            // costs a connect timeout while the handshake re-proves identity
+            // at the far end regardless. The transport socket is the opposite
+            // case: it is the CARRIER's connection to this node and proves
+            // only the carrier's key, so it is read here for a LOG FIELD and
+            // never for an address, which is what [`StreamOrigin`] exists to
+            // keep true.
+            Control::CollapseHint(hint) => {
+                // A hint is about its sender, so a hint about somebody else is
+                // refused before anything is recorded. A third party's address
+                // is `NeighborBrief`'s job and travels under a grant
+                // (`discovery::neighbor_brief_endpoints`); believing one on
+                // this stream would be transitive trust with nothing behind
+                // it, which is the recorded rule here and not a judgement this
+                // arm gets to make.
+                if hint.node != session.peer {
+                    bail!(
+                        "peer control: a CollapseHint is about its own sender and this one \
+                         names {}, so the session is closed; a third party's address travels \
+                         as a NeighborBrief under a grant",
+                        hint.node.display()
+                    );
+                }
+                match crate::peer::reach::learn_from_hint(&session.peer, &hint) {
+                    Some(addr) => tracing::info!(
+                        peer = %session.peer.display(),
+                        addr = %addr,
+                        carried_on = %origin.socket(),
+                        carrier = ?origin.carrier().map(|carrier| carrier.display()),
+                        "peer control: this peer named where it is now, so a punch has \
+                         somewhere to aim"
+                    ),
+                    None => tracing::debug!(
+                        peer = %session.peer.display(),
+                        carried_on = %origin.socket(),
+                        carrier = ?origin.carrier().map(|carrier| carrier.display()),
+                        "peer control: nothing this peer named is an address anything can \
+                         dial, so it stays reachable at whatever was already recorded"
+                    ),
+                }
+                // Answered whether anything was learned or not: the asker
+                // needs this Mac's addresses to aim at, and a peer whose own
+                // claims were merely undialable has said nothing wrong.
+                let answer = crate::peer::reach::own_collapse_hint(context.node, &session.peer);
+                let bytes = serde_json::to_vec(&Control::CollapseHint(answer))
+                    .context("peer control: the CollapseHint did not serialize")?;
+                noise::send_encrypted(stream, &mut session.transport, &bytes).await?;
+            }
             other => bail!(
                 "peer control: {other:?} is not answered by this build (the lease lifecycle \
                  is phase 4)"
