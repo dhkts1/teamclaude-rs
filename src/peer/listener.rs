@@ -2379,6 +2379,67 @@ pub async fn park_one_carrier(friend: &PeerRow, context: &SessionContext) -> Res
         .map_err(|failure| failure.error)
 }
 
+/// Where a stream's transport socket actually came from, once a peer's own
+/// `via` stamp has been read: the accepting socket itself, or a carrier that
+/// relayed for a peer that stamped its own id into the inner header.
+///
+/// No address is ever learned from a carrier's socket: a carrier's connection
+/// to this node proves the carrier's static key, nothing about who is behind
+/// it, so [`Self::observed_socket`] answers `None` for the carried case and
+/// every caller that would otherwise write the socket onto a row, into the
+/// observation register, or back to the peer as `observed_you_at` has to ask
+/// it first. [`Self::socket`] still answers the raw socket for a caller that
+/// only wants it for a log line, where naming the carrier's own connection is
+/// honest and writing it as the peer's address is not.
+#[derive(Debug, Clone, Copy)]
+enum StreamOrigin {
+    /// This socket is the peer's own connection to this node.
+    Direct(SocketAddr),
+    /// This socket is a carrier's connection; the peer arrived through it.
+    Carried { socket: SocketAddr, carrier: PeerId },
+}
+
+impl StreamOrigin {
+    /// Built once per stream, from the accepted socket and the header's
+    /// `via`: non-empty means the frame's own origin stamped a carrier in, so
+    /// nothing after this point may treat `from` as the peer's address.
+    fn from_header(from: SocketAddr, via: &[PeerId]) -> Self {
+        match via.first() {
+            Some(&carrier) => StreamOrigin::Carried {
+                socket: from,
+                carrier,
+            },
+            None => StreamOrigin::Direct(from),
+        }
+    }
+
+    /// The socket to treat as evidence about the peer: `Some` only when this
+    /// stream's own transport connection is the peer's, never a carrier's.
+    fn observed_socket(&self) -> Option<SocketAddr> {
+        match self {
+            StreamOrigin::Direct(addr) => Some(*addr),
+            StreamOrigin::Carried { .. } => None,
+        }
+    }
+
+    /// The raw transport socket, for a log line that wants to say which
+    /// connection the bytes arrived on, whichever kind it is.
+    fn socket(&self) -> SocketAddr {
+        match self {
+            StreamOrigin::Direct(addr) => *addr,
+            StreamOrigin::Carried { socket, .. } => *socket,
+        }
+    }
+
+    /// The carrier's id, for a log line; `None` for a direct arrival.
+    fn carrier(&self) -> Option<PeerId> {
+        match self {
+            StreamOrigin::Direct(_) => None,
+            StreamOrigin::Carried { carrier, .. } => Some(*carrier),
+        }
+    }
+}
+
 /// Serve one authenticated stream: the header, the gate, then the handler.
 ///
 /// The row set is re-read and the gate re-run **before every frame**, so
@@ -2468,7 +2529,13 @@ where
                 header.kind
             );
         }
-        return serve_enrolment(&mut stream, &mut session, context, &secret, store, from).await;
+        // The origin is built here, after the two checks just above (CONTROL
+        // kind, an outstanding invite proved in message 1): those are the
+        // enrolment path's own gate, the fields a peer controls that must
+        // answer first, and there is no row yet for `peer_stream_gate_rows`
+        // to check.
+        let origin = StreamOrigin::from_header(from, &header.via);
+        return serve_enrolment(&mut stream, &mut session, context, &secret, store, origin).await;
     }
 
     // Read BEFORE the session can be moved into a carry: the TUNNEL arm hands
@@ -2486,8 +2553,15 @@ where
     peer_stream_gate_hop(&context.node, &header, &mut dedup, now_ms())
         .map_err(anyhow::Error::new)?;
 
+    // Built only after the two gates above: they read fields a peer controls
+    // and have to answer first (`peer_stream_gate`'s own doc,
+    // `:3374-3377`), and `header.via` is one of those fields.
+    let origin = StreamOrigin::from_header(from, &header.via);
+
     match header.kind {
-        StreamKind::Control => serve_control(&mut stream, &mut session, context, store, from).await,
+        StreamKind::Control => {
+            serve_control(&mut stream, &mut session, context, store, origin).await
+        }
         // The lender's half. The gate above has already agreed this peer holds
         // `inspect`; `handle_serve_on` asks the same question again through
         // this store, which is the belt-and-braces the SERVE module documents
@@ -2667,7 +2741,7 @@ async fn serve_enrolment<S>(
     context: &SessionContext,
     secret: &[u8; KEY_BYTES],
     store: &PeerStore,
-    from: SocketAddr,
+    origin: StreamOrigin,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2682,6 +2756,15 @@ where
         );
     };
 
+    if let Some(carrier) = origin.carrier() {
+        tracing::debug!(
+            peer = %session.peer.display(),
+            carrier = %carrier.display(),
+            "peer enrol: this enrolment arrived through a carrier; no address is learned \
+             about the joiner from this socket"
+        );
+    }
+
     // **On a blocking thread**, the rule [`on_blocking_thread`] states: this is
     // a locked read-modify-write of the peers file, the lock waits with
     // `std::thread::sleep`, and an enrolment is served on a connection whose
@@ -2692,8 +2775,16 @@ where
         let peers_path = context.peers_path.clone();
         let peer = session.peer;
         let secret = *secret;
+        let observed_socket = origin.observed_socket();
         move || {
-            crate::peer::pair::accept_enrolment(&peers_path, peer, &enroll, &secret, now_ms(), from)
+            crate::peer::pair::accept_enrolment(
+                &peers_path,
+                peer,
+                &enroll,
+                &secret,
+                now_ms(),
+                observed_socket,
+            )
         }
     })
     .await?;
@@ -2710,7 +2801,7 @@ where
     // with `store.reload_if_changed()`, and `accept_enrolment` has just
     // written the file, so the row it wrote is the row the next frame is
     // gated against.
-    serve_control(stream, session, context, store, from).await
+    serve_control(stream, session, context, store, origin).await
 }
 
 /// The CONTROL handler: answer `Hello` with a `Hello` assembled from this
@@ -2880,7 +2971,7 @@ async fn serve_control<S>(
     session: &mut PeerSession,
     context: &SessionContext,
     store: &PeerStore,
-    from: SocketAddr,
+    origin: StreamOrigin,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2952,20 +3043,50 @@ where
             // address is a side effect of a correctly authenticated packet
             // arriving, never a configured fact.
             Control::Hello(incoming) => {
-                // `from` goes through the same combine the dialing side uses,
-                // and not onto the row whole: its HOST is the one fact this
-                // frame proves about where that peer is, and its PORT is the
-                // ephemeral one the far side's kernel picked for this
-                // connection, which answers nothing once it closes. The rule
-                // for pairing the two is
+                // The accepted socket goes through the same combine the
+                // dialing side uses, and not onto the row whole, but only when
+                // this stream's own transport connection is the peer's: its
+                // HOST is the one fact this frame proves about where that peer
+                // is, and its PORT is the ephemeral one the far side's kernel
+                // picked for this connection, which answers nothing once it
+                // closes. The rule for pairing the two is
                 // [`crate::peer::config::endpoints_and_connection_from_hello`].
-                let learned =
-                    config::endpoints_and_connection_from_hello(&incoming.addrs, from, now_ms());
+                // A carried Hello has no connection worth pairing: the socket
+                // is the carrier's, so only what the Hello itself claims is
+                // used, through [`config::endpoints_from_hello`].
+                let learned = match origin.observed_socket() {
+                    Some(socket) => config::endpoints_and_connection_from_hello(
+                        &incoming.addrs,
+                        socket,
+                        now_ms(),
+                    ),
+                    None => {
+                        tracing::debug!(
+                            peer = %session.peer.display(),
+                            carrier = ?origin.carrier().map(|carrier| carrier.display()),
+                            "peer control: this Hello arrived through a carrier; only the \
+                             addresses it claims are used, never the carrier's own socket"
+                        );
+                        config::endpoints_from_hello(&incoming.addrs, now_ms())
+                    }
+                };
                 // The two reflexive halves of this frame, recorded in memory
-                // and never onto the row: `from` whole is the address a NAT in
-                // front of that peer rewrote its packets to, so it is advice
-                // for a punch and never an endpoint to dial.
-                crate::peer::reach::remember_observed_peer(session.peer, from);
+                // and never onto the row: the socket whole is the address a
+                // NAT in front of that peer rewrote its packets to, so it is
+                // advice for a punch and never an endpoint to dial. A carried
+                // Hello teaches nothing here either: the socket belongs to the
+                // carrier, not the peer.
+                match origin.observed_socket() {
+                    Some(socket) => {
+                        crate::peer::reach::remember_observed_peer(session.peer, socket)
+                    }
+                    None => tracing::debug!(
+                        peer = %session.peer.display(),
+                        carrier = ?origin.carrier().map(|carrier| carrier.display()),
+                        "peer control: not recording an observed address for a peer reached \
+                         through a carrier"
+                    ),
+                }
                 let sees_us_at = match incoming.observed_you_at.as_deref() {
                     None => None,
                     Some(told) => match told.parse::<SocketAddr>() {
@@ -3051,7 +3172,7 @@ where
                 })
                 .await;
                 match written {
-                    Ok(written) => written.report(session.peer, from),
+                    Ok(written) => written.report(session.peer, origin.socket()),
                     Err(err) => tracing::warn!(
                         peer = %session.peer.display(),
                         error = %err,
@@ -3062,7 +3183,15 @@ where
                 let mut facts = NodeFacts::listening(context.node, store.file().listen);
                 facts.briefs =
                     crate::peer::discovery::neighbor_briefs(&store.file().peers, session.peer);
-                facts.observed_peer_at = Some(from);
+                facts.observed_peer_at = origin.observed_socket();
+                if facts.observed_peer_at.is_none() {
+                    tracing::debug!(
+                        peer = %session.peer.display(),
+                        carrier = ?origin.carrier().map(|carrier| carrier.display()),
+                        "peer control: telling this peer nothing about where it appeared to \
+                         answer; the socket seen here is a carrier's"
+                    );
+                }
                 let hello = hello_for_peer(&facts, &row.allow.control);
                 let bytes = serde_json::to_vec(&Control::Hello(hello))
                     .context("peer control: the Hello did not serialize")?;
@@ -3088,7 +3217,7 @@ where
                         else {
                             tracing::info!(
                                 peer = %session.peer.display(),
-                                peer_addr = %from,
+                                peer_addr = %origin.socket(),
                                 "peer punch: this peer already has a punch in flight, so this \
                                  frame is dropped; one punch at a time is all a peer can be \
                                  waiting on"
@@ -3137,7 +3266,7 @@ where
                     }
                     Err(failure) => tracing::info!(
                         peer = %session.peer.display(),
-                        peer_addr = %from,
+                        peer_addr = %origin.socket(),
                         failure = %failure,
                         "peer punch: this peer asked for a punch this node cannot join"
                     ),
@@ -3174,7 +3303,7 @@ where
             Control::ProbeAck { .. } => {
                 tracing::debug!(
                     peer = %session.peer.display(),
-                    peer_addr = %from,
+                    peer_addr = %origin.socket(),
                     "peer control: a probe ack arrived on a stream this node never probed on; \
                      ignoring it"
                 );
@@ -3273,7 +3402,7 @@ where
                         // can spend it the serve way.
                         tracing::warn!(
                             peer = %session.peer.display(),
-                            peer_addr = %from,
+                            peer_addr = %origin.socket(),
                             handshake = ?session.handshake,
                             "peer control: a hand grant was answered on a session that is not \
                              a return visit to a pinned key, so the owner's bearer stays on \
