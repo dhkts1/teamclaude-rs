@@ -376,7 +376,12 @@ Sometimes there is nothing left to try. Both Macs changed networks, neither has 
 address, and the addresses on each other's rows are where the other one used to be. Nothing on
 this list can fix that by itself: every mechanism above needs one end to be findable.
 
-What fixes it is you, over the chat you already use. On the Mac that moved:
+If you both still reach one friend, though, the two Macs fix it between themselves: they swap
+their current addresses through that friend and then open a direct path to each other. The
+friend carries nothing after that, and nobody has to paste anything.
+
+When there is no such friend, what fixes it is you, over the chat you already use. On the Mac
+that moved:
 
 ```
 tcr peer moved mint <the other Mac's peer id>

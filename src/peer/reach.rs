@@ -3155,6 +3155,97 @@ pub fn punch_request(
     Ok((peer_ip, punch_plan_from_slot(&secret, slot, PUNCH_SLOTS)))
 }
 
+/// Believe the address a peer's own `CollapseHint` carried, and answer what
+/// was recorded.
+///
+/// # Why a frame is believed here when a socket is not
+///
+/// The session this frame arrived on has already proved the sender's pinned
+/// static key: a carried CONTROL stream is a fresh end to end Noise session
+/// nested inside a TUNNEL, which is what makes the carrier blind to it. So the
+/// address is routing advice from a proved sender, exactly as
+/// [`punch_request`] below treats the address in a `PunchAt`, and the socket
+/// the bytes arrived on is a carrier's connection that proves nothing about
+/// who is behind it.
+///
+/// Every filter is [`crate::peer::config::endpoints_from_hello`]'s, reused
+/// rather than restated: an entry that is not a socket address is skipped and
+/// so is one that parses but cannot be dialed, which is the case that function
+/// measured against a peer honestly naming its own `0.0.0.0` listen socket.
+/// [`aimable_address`] then picks among what survived, the same picker a punch
+/// uses on a row's own endpoints, so a hint and a row cannot disagree about
+/// which of two addresses is worth aiming at.
+///
+/// Answers the address rather than a bool, so a caller logs the VALUE it
+/// learned. "A hint was accepted" and "the punch will now aim at
+/// 192.0.2.77:7755" are different lines to read at three in the morning.
+pub fn learn_from_hint(
+    peer: &tcr_peer_wire::PeerId,
+    hint: &tcr_peer_wire::CollapseHint,
+) -> Option<SocketAddr> {
+    let endpoints = crate::peer::config::endpoints_from_hello(&hint.addrs, crate::now_ms());
+    let addr = aimable_address(&endpoints)?;
+    remember_observed_peer(*peer, addr);
+    Some(addr)
+}
+
+/// This Mac's own hint for `peer`: where to reach it directly, in the frame
+/// that says so.
+///
+/// **One builder, because two would drift.** The asker sends this before a
+/// punch and the answering Mac sends it straight back, and the two are the
+/// same fact in opposite directions; a second assembly of the same list is a
+/// second answer to "which of my addresses do I name, and how many".
+///
+/// The order is [`self_address_for`]'s first, because the address that is
+/// right for THIS peer is the one that peer itself measured, then every other
+/// peer's observation behind it: a Mac behind one router looks the same from
+/// everywhere outside it, so the rest are a real fallback rather than noise.
+/// Duplicates are dropped, and the list is capped at
+/// [`crate::peer::discovery::MAX_BRIEF_ADDRS`], the cap the sibling weak bands
+/// already use for exactly this reason.
+///
+/// [`crate::peer::probe::collapse_hint`] fills the round trip, and a poisoned
+/// path table costs the figure and nothing else: `0` is what that field's own
+/// doc defines as "no measurement", which is also what every build before the
+/// probe module would have sent.
+pub fn own_collapse_hint(
+    own_id: tcr_peer_wire::PeerId,
+    peer: &tcr_peer_wire::PeerId,
+) -> tcr_peer_wire::CollapseHint {
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    for addr in self_address_for(peer)
+        .into_iter()
+        .chain(observed_self_addresses().into_iter().map(|(_, addr)| addr))
+    {
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+        if addrs.len() == crate::peer::discovery::MAX_BRIEF_ADDRS {
+            break;
+        }
+    }
+    let addrs: Vec<String> = addrs.iter().map(SocketAddr::to_string).collect();
+    match crate::peer::probe::with_table(|table| {
+        crate::peer::probe::collapse_hint(own_id, addrs.clone(), table)
+    }) {
+        Ok(hint) => hint,
+        Err(err) => {
+            tracing::warn!(
+                peer = %peer.display(),
+                error = %err,
+                "peer aim: the path table could not be read, so this hint carries no measured \
+                 round trip"
+            );
+            crate::peer::probe::collapse_hint(
+                own_id,
+                addrs,
+                &crate::peer::probe::PathTable::default(),
+            )
+        }
+    }
+}
+
 /// How long one side spends inside a slot: the slot's own width.
 ///
 /// Stated as a [`Duration`] once, because three callers need it and a second

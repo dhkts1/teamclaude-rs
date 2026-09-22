@@ -3029,7 +3029,48 @@ async fn punch_dial(
 ) -> Result<(SocketAddr, PeerStream), crate::peer::reach::PunchFailure> {
     use crate::peer::reach::{self, PunchFailure};
 
-    let (peer_ip, secret) = reach::punch_target(&row.node, &row.endpoints)?;
+    // **The one refusal worth a second question, and only from a row that
+    // names some way to that peer.** `PeerAddressUnknown` is the only refusal
+    // an exchange can answer: it means nothing on this Mac knows where that
+    // peer is, which is precisely the state a hint fixes. Every other refusal
+    // is about the pair, the slot or this Mac, so asking the peer anything
+    // would spend a carried round trip to learn what is already known, and
+    // each returns exactly as it did before this step existed.
+    //
+    // **A row with NO endpoint at all is the carry case and not a punch, so it
+    // is not asked.** An empty row is what a lender that parked a socket at a
+    // friend looks like from here, and the step below this one already answers
+    // it by asking that friend to carry ([`dial_peer_reaching_within`]'s last
+    // loop). Asking first spends the same friend twice: one more connection
+    // from this address against its pre-authentication allowance
+    // ([`crate::peer::listener::unauthenticated_allowance`]), and on the
+    // reverse path one of the carriers parked on its desk, both of them the
+    // borrow's own and both spent on a punch that a Mac nobody can dial cannot
+    // answer. Measured, not reasoned: with the question asked on an empty row,
+    // `an_undialable_lender_ends_the_borrow_through_a_carrier_and_never_hangs`
+    // (`tests/peer_e2e.rs`) fails on both platforms of one run with the carrier
+    // refusing a connection at an allowance of two, and
+    // `a_row_with_no_endpoints_is_reached_through_a_carry_grantee`
+    // (`tests/peer_forward.rs`) only passes if its fixture accepts a carried
+    // stream the borrow never gets to use.
+    //
+    // ONE exchange, never a loop. A second ask against a peer that did not
+    // answer the first spends a slot's worth of the caller's budget for
+    // nothing, and there is no third thing to learn from asking twice.
+    let (peer_ip, secret) = match reach::punch_target(&row.node, &row.endpoints) {
+        Ok(found) => found,
+        Err(PunchFailure::PeerAddressUnknown) if row.has_endpoint() => {
+            let learned = exchange_addresses(row, store, borrow_timeout_ms).await;
+            tracing::debug!(
+                peer = %row.node.display(),
+                learned,
+                "peer punch: nothing here knew where that peer is, so this node asked it \
+                 through a friend before aiming"
+            );
+            reach::punch_target(&row.node, &row.endpoints)?
+        }
+        Err(refused) => return Err(refused),
+    };
     let Some(mine) = reach::self_address_for(&row.node) else {
         return Err(PunchFailure::SelfAddressUnknown);
     };
@@ -3091,6 +3132,58 @@ async fn announce_punch(
         }
     };
 
+    let ask = Control::PunchAt {
+        slot,
+        public_addr: public_addr.to_string(),
+    };
+    match ask_through_a_friend(row, store, borrow_timeout_ms, &key, &ask).await {
+        Some((carrier, _stream, _session)) => {
+            tracing::info!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                slot,
+                "peer punch: asked this peer to meet on the pair's derived port"
+            );
+            true
+        }
+        None => false,
+    }
+}
+
+/// Ask `row`'s Mac one thing through any Mac that will carry the frame, and
+/// hand the LIVE stream back so a caller may read an answer on it.
+///
+/// # Why this is one function and not two copies
+///
+/// Which carrier is tried, in which order, and what the inner header says are
+/// each one decision. A second spelling of the loop would be a second place
+/// that decides them, and the pair would disagree the first time either was
+/// edited: the punch's ask and the address exchange's ask travel the identical
+/// way and differ only in the frame.
+///
+/// # The signature, and why it hands three things back
+///
+/// The CARRIER's id, because every line either caller logs names the Mac that
+/// carried. The stream and the session, because the address exchange reads one
+/// bounded answer on this stream and a helper that closed it would make that
+/// impossible; a caller with nothing to read simply drops both, which is what
+/// [`announce_punch`] does and what it did before this was extracted.
+///
+/// The key comes IN rather than being loaded here, so each caller keeps its
+/// own sentence for "this node has no keypair": a shared helper would have to
+/// pick one of the two, and an operator reading the line needs to know which
+/// ask it was that could not be made.
+///
+/// A refusal on the way is a `None`, never an error: every one of them is a
+/// forwarder that said no, which is the ordinary answer and is already logged
+/// with its own reason by [`forward_through`].
+async fn ask_through_a_friend(
+    row: &PeerRow,
+    store: &PeerStore,
+    borrow_timeout_ms: u64,
+    key: &NodeKey,
+    ask: &Control,
+) -> Option<(PeerId, PeerStream, noise::PeerSession)> {
     for forwarder in forwarders_for(&row.node, store) {
         let Some(mut stream) =
             forward_through(&forwarder, &row.node, store, borrow_timeout_ms).await
@@ -3115,7 +3208,7 @@ async fn announce_punch(
                     peer = %row.node.display(),
                     via = %forwarder.display(),
                     error = %err,
-                    "peer punch: the carried handshake failed; trying another carrier"
+                    "peer carry: the carried handshake failed; trying another carrier"
                 );
                 continue;
             }
@@ -3125,50 +3218,182 @@ async fn announce_punch(
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "peer punch: this node could not mint a request id"
+                    "peer carry: this node could not mint a request id"
                 );
-                return false;
+                return None;
             }
         };
+        // **The carrier goes in the inner `via`, and only this end can put it
+        // there.** A blind forward writes no header of its own
+        // (`crate::peer::tunnel`'s doc on that point), so the origin is the
+        // only party that knows which Mac carried, and a receiver whose inner
+        // `via` is empty reads the socket in front of it as the peer's own.
+        // That socket is the carrier's connection and teaches nothing about
+        // the peer, which is what `listener::StreamOrigin` exists to say.
+        // Stamping it here is what lets the far end say it.
         let header = StreamHeader {
             kind: StreamKind::Control,
             target: None,
-            via: Vec::new(),
+            via: vec![forwarder],
             hops_remaining: 1,
             request_id,
         };
         let asked = async {
             send_control(&mut stream, &mut session, &header).await?;
-            send_control(
-                &mut stream,
-                &mut session,
-                &Control::PunchAt {
-                    slot,
-                    public_addr: public_addr.to_string(),
-                },
-            )
-            .await
+            send_control(&mut stream, &mut session, ask).await
         }
         .await;
         match asked {
-            Ok(()) => {
-                tracing::info!(
-                    peer = %row.node.display(),
-                    via = %forwarder.display(),
-                    slot,
-                    "peer punch: asked this peer to meet on the pair's derived port"
-                );
-                return true;
-            }
+            Ok(()) => return Some((forwarder, stream, session)),
             Err(err) => tracing::debug!(
                 peer = %row.node.display(),
                 via = %forwarder.display(),
                 error = %err,
-                "peer punch: the ask did not reach this peer through that carrier"
+                "peer carry: the ask did not reach this peer through that carrier"
             ),
         }
     }
-    false
+    None
+}
+
+/// How long the address exchange waits for the other Mac's hint back.
+///
+/// Bounded twice over, and both bounds matter. Never more than the caller's
+/// own borrow timeout, because a dial that overran it would report a peer
+/// unreachable after the operator's patience had already run out. And never
+/// more than this, because the answer is one frame on a stream that is already
+/// open and a peer that heard the hint but says nothing back would otherwise
+/// eat the punch that follows: the exchange exists to make the punch possible,
+/// so spending the punch's own waiting time on it is the one way it can make
+/// things worse. Five seconds is a whole `Probe` round trip across a relay
+/// with room to spare.
+const HINT_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Swap current addresses with `row`'s Mac through a friend they can both
+/// still reach. Answers whether an address was learned.
+///
+/// # The moment this is for
+///
+/// Both Macs changed networks, so each one's recorded address for the other is
+/// somewhere neither of them is any more. Neither can be told anything
+/// directly and neither has anything to aim at. What they do still share is a
+/// friend, so the hint goes out over the friend and the answer comes back on
+/// the same stream: one round trip, and then a direct path between the two of
+/// them that the friend carries nothing more of.
+///
+/// The row has to name SOME way to that peer for the question to be asked at
+/// all, which is [`punch_dial`]'s own guard and is recorded there: a row with
+/// nothing on it is a peer the dial reaches by asking a friend to carry, and
+/// spending that friend on a hint first is what takes the borrow's own carrier
+/// away.
+///
+/// # One exchange, one answer read
+///
+/// Exactly one bounded [`recv_control`], on [`HINT_ANSWER_TIMEOUT`]. A peer
+/// running a build with no arm for this frame closes the session instead of
+/// answering, which reads here as "this peer does not exchange addresses" and
+/// is the same thing the prober already does with an unanswered `Probe`: the
+/// caller falls through to the carry, which still works.
+///
+/// An answer naming a Mac other than the one asked is refused rather than
+/// believed. A hint is about its own sender, and a third party's address
+/// travels as a `NeighborBrief` under a grant
+/// ([`crate::peer::discovery::neighbor_brief_endpoints`]); believing one here
+/// would be transitive trust with nothing behind it, and the refusal is the
+/// same rule the listener's own arm applies in the other direction.
+async fn exchange_addresses(row: &PeerRow, store: &PeerStore, borrow_timeout_ms: u64) -> bool {
+    let key = match NodeKey::load_or_mint(&node_key_dir(store)) {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "peer aim: this node has no keypair to exchange addresses with"
+            );
+            return false;
+        }
+    };
+
+    let ask = Control::CollapseHint(crate::peer::reach::own_collapse_hint(key.id(), &row.node));
+    let Some((carrier, mut stream, mut session)) =
+        ask_through_a_friend(row, store, borrow_timeout_ms, &key, &ask).await
+    else {
+        tracing::debug!(
+            peer = %row.node.display(),
+            "peer aim: no pinned Mac could carry this node's address to that peer, so there \
+             is nothing to exchange"
+        );
+        return false;
+    };
+
+    let within = HINT_ANSWER_TIMEOUT.min(Duration::from_millis(borrow_timeout_ms));
+    let answered = match tokio::time::timeout(
+        within,
+        recv_control::<_, Control>(&mut stream, &mut session),
+    )
+    .await
+    {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(err)) => {
+            tracing::debug!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                error = %err,
+                "peer aim: that peer closed the carried session instead of answering with its \
+                 own address, so this build reads it as a peer that does not exchange \
+                 addresses"
+            );
+            return false;
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                timeout_ms = within.as_millis(),
+                "peer aim: that peer sent no address back inside the deadline"
+            );
+            return false;
+        }
+    };
+
+    let Control::CollapseHint(theirs) = answered else {
+        tracing::debug!(
+            peer = %row.node.display(),
+            via = %carrier.display(),
+            "peer aim: that peer answered an address exchange with another frame"
+        );
+        return false;
+    };
+    if theirs.node != row.node {
+        tracing::warn!(
+            peer = %row.node.display(),
+            via = %carrier.display(),
+            named = %theirs.node.display(),
+            "peer aim: that peer answered with a hint about a third Mac, which is a \
+             NeighborBrief's job and needs a grant, so nothing was recorded"
+        );
+        return false;
+    }
+    match crate::peer::reach::learn_from_hint(&row.node, &theirs) {
+        Some(addr) => {
+            tracing::info!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                addr = %addr,
+                "peer aim: that peer named where it is now, over a friend they both still \
+                 reach"
+            );
+            true
+        }
+        None => {
+            tracing::debug!(
+                peer = %row.node.display(),
+                via = %carrier.display(),
+                "peer aim: nothing that peer named is an address anything can dial, so this \
+                 node still has nowhere to aim"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
