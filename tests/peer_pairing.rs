@@ -335,6 +335,82 @@ async fn a_two_process_join_leaves_a_pinned_row_on_both_sides() {
     assert!(row.lend.is_empty(), "enrolment lends nothing");
 }
 
+/// **A headless join teaches the registrar a dialable port, never the
+/// accepted socket's ephemeral one.**
+///
+/// The registrar's only address fact about a joiner used to be the socket the
+/// enrolment frame arrived on, written whole at rank 0: a joiner's ephemeral
+/// source port for that one connection, which answers nothing once it closes.
+/// Measured in the lab: after a sealed pairing one side's row held
+/// `100.64.99.11:56804` while `7755` is what actually listened, and a connect
+/// on the recorded port was refused while a connect on the listening one was
+/// fine.
+///
+/// The joiner is given its own served listener, exactly as the registrar is
+/// above, so this test can tell the two ports apart: the registrar's row for
+/// the joiner must hold the joiner's LISTENING port and hold nothing at the
+/// ephemeral port the dial actually used.
+///
+/// Watched red: this test fails on the base with the recorded port being the
+/// ephemeral one, not the joiner's listening port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_headless_join_teaches_the_registrar_the_joiners_listening_port() {
+    let registrar = Node::new("enrol-port-registrar");
+    let joiner = Node::new("enrol-port-joiner");
+
+    let registrar_addr = serve(registrar.context()).await;
+    let mut file = registrar.file();
+    file.listen = Some(registrar_addr);
+    registrar.write_file(&file);
+
+    // The joiner also runs the shipped accept loop on its own kernel-chosen
+    // port and records it, the same way the registrar's own listen address is
+    // set above: this is the port a dial back has to reach, and it is not the
+    // port the joiner's outbound connection to the registrar happens to use.
+    let joiner_addr = serve(joiner.context()).await;
+    let mut joiner_file = joiner.file();
+    joiner_file.listen = Some(joiner_addr);
+    joiner.write_file(&joiner_file);
+
+    let store = config::PeerStore::open(&registrar.peers).expect("open the registrar's store");
+    let (_invite, token) = pair::mint_invite_as(&store, &registrar.key, "laptop-3", 600, 1, None)
+        .expect("mint a one-use invite");
+
+    let joiner_store = config::PeerStore::open(&joiner.peers).expect("open the joiner's store");
+    pair::join_as(&joiner_store, &joiner.key, &token, "this-mac")
+        .await
+        .expect("the join completes and is acknowledged");
+
+    let registrar_file = registrar.file();
+    let row = registrar_file
+        .peers
+        .iter()
+        .find(|row| row.node == joiner.key.id())
+        .expect("the registrar pinned a row for the joiner");
+
+    assert!(
+        row.endpoints
+            .iter()
+            .any(|endpoint| endpoint.direct_addr() == Some(joiner_addr)),
+        "the registrar must hold a dialable endpoint at the joiner's listening port \
+         {joiner_addr}: {:?}",
+        row.endpoints
+    );
+    assert!(
+        row.endpoints
+            .iter()
+            .all(|endpoint| endpoint.direct_addr() != Some(registrar_addr)),
+        "sanity: no endpoint on this row should equal the registrar's own listening address"
+    );
+    assert_eq!(
+        row.endpoints.len(),
+        1,
+        "the registrar must hold exactly the joiner's listening port and nothing else, not \
+         also the accepted socket's ephemeral source port: {:?}",
+        row.endpoints
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Item 2: a one-use invite is atomic
 // ---------------------------------------------------------------------------
@@ -400,7 +476,7 @@ fn two_concurrent_joiners_on_one_use_invite_leave_exactly_one_ok() {
                         &enroll,
                         &secret,
                         now,
-                        std::net::SocketAddr::from(([127, 0, 0, 1], 9600)),
+                        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
                     )
                 })
             })
@@ -2673,27 +2749,41 @@ fn a_peers_file_with_the_old_addrs_key_loads_and_re_saves_as_endpoints() {
 // reach
 // ---------------------------------------------------------------------------
 
-/// **Both writers of a pinned row record the address the pin was taken over.**
+/// **The `confirm` half of a pinned row records the address the pin was taken
+/// over; the `accept_enrolment` half never records the accepted socket at
+/// all.**
 ///
-/// There are exactly two: the six-digit compare (`pair::confirm`, run once on
-/// each Mac, each recording the socket ITS handshake ran over) and the
-/// registrar's half of an enrolment (`pair::accept_enrolment`, recording the
-/// socket the joiner arrived on). Before this fix the first passed `None` and
-/// the second wrote an empty list, so a Mac paired with six digits was pinned,
-/// trusted, and filtered out of every candidate set that asks whether a row
-/// can be reached at all.
+/// **What this test used to assert, and why that changed.** It used to assert
+/// that `accept_enrolment` wrote exactly one endpoint, `Some(arrived_from)`
+/// with `arrived_from` an ephemeral source port
+/// (`192.0.2.8:51234`), and that the row on disk carried it too. That was the
+/// bug this repository's "no address is ever learned from a carrier's socket"
+/// fix removed: `arrived_from`'s port is the far side's kernel's own choice
+/// for that ONE connection, never a port anything listens on, and writing it
+/// as a dialable endpoint is what left a Mac pinned at a port that refused
+/// every connect. The registrar records the joiner's IP and the ANNOUNCED
+/// port instead, never the accepted socket's port, and it learns the
+/// announced port from the joiner's own `Control::Hello`, sent on the same
+/// live stream immediately after this call returns
+/// (`pair::join_as`), through the ordinary CONTROL arm's combine
+/// (`config::endpoints_and_connection_from_hello`). `accept_enrolment` itself
+/// never sees that frame, so this test, which calls it directly, now asserts
+/// it writes nothing; `a_headless_join_teaches_the_registrar_the_joiners_listening_port`
+/// (above) is what watches the end-to-end port over the shipped accept loop.
 ///
-/// Both halves are in one test because the invariant is about the CLASS: a row
-/// a completed session created has at least one endpoint. A test per function
-/// would let a third writer arrive and satisfy neither.
+/// The `confirm` half's contract is unchanged: it is the CLASS invariant this
+/// test still keeps a live assertion for, a row a completed six-digit pin
+/// created has at least one endpoint, and its own watched-red line still
+/// holds.
 ///
 /// Watched red twice.
 /// - `confirm` half: with `pin_row(store, *peer, &label, addr)` changed back to
 ///   `None`, this fails on "the six-digit pin records the socket the compare
 ///   ran over" with `left: 0, right: 1`.
-/// - `accept_enrolment` half: with the `row.observe_endpoint(...)` line
-///   deleted, it fails on "the registrar records the socket the joiner arrived
-///   on", same numbers.
+/// - `accept_enrolment` half: restore `row.observe_endpoint(Endpoint::direct(from, ...))`
+///   with `from` widened back to a bare `SocketAddr`, and this fails on "the
+///   registrar records no endpoint from the socket it accepted" with
+///   `left: 1, right: 0`.
 #[test]
 fn every_pin_writer_records_the_address_it_was_reached_over() {
     let node = Node::new("pin-records-address");
@@ -2749,26 +2839,24 @@ fn every_pin_writer_records_the_address_it_was_reached_over() {
         },
         &invite.secret,
         1_767_225_600_000,
-        arrived_from,
+        Some(arrived_from),
     )
     .expect("the joiner proves the invite and is pinned");
 
     assert_eq!(
         enrolled.endpoints.len(),
-        1,
-        "the registrar records the socket the joiner arrived on: {:?}",
-        enrolled.endpoints
-    );
-    assert_eq!(
-        enrolled.endpoints[0].direct_addr(),
-        Some(arrived_from),
-        "and it is the observed socket, not anything the joiner claimed: {:?}",
+        0,
+        "the registrar records no endpoint from the socket it accepted: its port is the \
+         joiner's ephemeral one for this one connection, never a port to dial; the dialable \
+         one comes from the joiner's own Hello on the same stream, which this direct call \
+         does not send: {:?}",
         enrolled.endpoints
     );
 
-    // The row on disk carries it too, which is the half that survives a
-    // restart, a returned value nobody saved would pass the two assertions
-    // above and still leave the operator with an unreachable peer.
+    // The row on disk agrees, which is the half that survives a restart: an
+    // enrolment pins a joiner it cannot yet dial back, and stays that way
+    // until the joiner's own Hello, on the very next frame of the same
+    // stream, teaches the announced port.
     let saved = node
         .file()
         .peers
@@ -2777,7 +2865,7 @@ fn every_pin_writer_records_the_address_it_was_reached_over() {
         .expect("the enrolment pinned a row");
     assert_eq!(
         saved.endpoints, enrolled.endpoints,
-        "the endpoint is on disk and not only in the returned row"
+        "the empty endpoint list is on disk and not only in the returned row"
     );
 }
 
@@ -3685,7 +3773,7 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
                     &enroll,
                     &secret,
                     now,
-                    std::net::SocketAddr::from(([127, 0, 0, 1], 9600)),
+                    Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
                 )
             })
         };

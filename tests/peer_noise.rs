@@ -1778,7 +1778,7 @@ async fn a_two_sided_enrolment_leaves_a_pinned_row_on_both_sides() {
             &enroll,
             &matched,
             pair::now_ms(),
-            std::net::SocketAddr::from(([127, 0, 0, 1], 9600)),
+            Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
         )
         .expect("the joiner is pinned and the invite is spent");
 
@@ -1875,7 +1875,7 @@ fn a_one_use_invite_refuses_its_second_joiner() {
         &enroll,
         &invite.secret,
         pair::now_ms(),
-        std::net::SocketAddr::from(([127, 0, 0, 1], 9600)),
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
     )
     .expect("the first joiner proves the invite and is pinned");
     assert_eq!(first.node, PeerId([4_u8; 32]));
@@ -1886,7 +1886,7 @@ fn a_one_use_invite_refuses_its_second_joiner() {
         &enroll,
         &invite.secret,
         pair::now_ms(),
-        std::net::SocketAddr::from(([127, 0, 0, 1], 9600)),
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
     );
     let refusal = second.expect_err("a spent invite admits nobody");
     assert!(
@@ -1932,7 +1932,7 @@ fn a_hostile_enrolment_label_is_refused_and_spends_nothing() {
             },
             &invite.secret,
             pair::now_ms(),
-            std::net::SocketAddr::from(([127, 0, 0, 1], 9600)),
+            Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
         )
         .expect_err("a label this node will not render is refused");
         assert!(
@@ -2236,7 +2236,7 @@ fn a_pin_takes_the_file_lock_and_an_enrolment_still_completes() {
         },
         &invite.secret,
         pair::now_ms(),
-        std::net::SocketAddr::from(([127, 0, 0, 1], 9600)),
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9600))),
     )
     .expect("the registrar pins the joiner under its own lock");
     assert_eq!(row.node, joiner);

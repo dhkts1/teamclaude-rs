@@ -68,10 +68,12 @@ use tcr_peer_wire::{
 };
 
 use crate::peer::config::{
-    read_or_default, save, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore, PendingInvite,
+    read_or_default, save, ControlGrants, Endpoint, EndpointSource, PeerFile, PeerRow, PeerStore,
+    PendingInvite,
 };
 use crate::peer::dialaddrs;
 use crate::peer::id::{default_config_dir, NodeKey};
+use crate::peer::listener::{hello_for_peer, NodeFacts};
 use crate::peer::noise::{self, Handshake, KEY_BYTES};
 
 /// How many invites may be outstanding at once.
@@ -776,9 +778,14 @@ pub fn revoke_invite(store: &PeerStore, id: u64) -> Result<bool> {
 /// joiner under the operator's own invite label would hide which machine
 /// actually arrived. The invite is not spent on that path.
 ///
-/// `from` is the socket the enrolment arrived on, recorded as the joiner's
-/// first endpoint: a registrar that pinned a joiner and kept no way back to it
-/// would have trusted a machine it cannot reach.
+/// `from` is the socket the enrolment arrived on, when this node's own
+/// transport connection is the joiner's: `None` when it belongs to a carrier
+/// instead. Neither case records it as an endpoint. Its port is the joiner's
+/// ephemeral source port for this one connection, never the port anything
+/// listens on, so it was never the address to keep. What makes the joiner
+/// reachable is the `Control::Hello` it sends on this same stream right after
+/// this call, which the ordinary CONTROL arm combines with the accepted
+/// socket's host to write the announced, dialable port instead.
 ///
 /// Ordering and why the gate does not require a pinned row here:
 /// [`crate::peer::noise`]'s module docs.
@@ -788,7 +795,7 @@ pub fn accept_enrolment(
     enroll: &Enroll,
     secret: &[u8; KEY_BYTES],
     now_ms: i64,
-    from: SocketAddr,
+    from: Option<SocketAddr>,
 ) -> Result<PeerRow> {
     let label = sanitize_label(&enroll.label)
         .map_err(|refusal| anyhow!("peer enrol: the joiner's label is refused: {refusal}"))?;
@@ -819,9 +826,16 @@ pub fn accept_enrolment(
         file.pending_invites.remove(position);
     }
 
-    let mut row = PeerRow {
+    let row = PeerRow {
         node: joiner,
         label,
+        // No endpoint is written from the accepted socket. Its port is the
+        // joiner's ephemeral source port for this one connection, which is
+        // not the announced, dialable form: writing it here is the bug this
+        // repository's "no address from a carrier" fix removed. The row
+        // starts with none, and the joiner's own `Control::Hello`, sent on
+        // this same stream immediately after this function returns, teaches
+        // the dialable one through the ordinary CONTROL arm.
         endpoints: Vec::new(),
         added_at: now_ms,
         allow: crate::peer::config::Allow::default(),
@@ -831,11 +845,20 @@ pub fn accept_enrolment(
         rendezvous_secret: None,
         sees_us_at: None,
     };
-    // The socket this enrolment arrived on. Observed by this node and not
-    // claimed by the joiner, which is the only kind of address worth writing:
-    // a completed TCP handshake makes it real and the Noise handshake against
-    // the invite secret makes the peer real.
-    row.observe_endpoint(Endpoint::direct(from, now_ms, EndpointSource::Paired));
+    match from {
+        Some(socket) => tracing::debug!(
+            peer = %joiner.display(),
+            socket = %socket,
+            "peer enrol: not recording the accepted socket as an endpoint; its port is the \
+             joiner's ephemeral one for this connection and its own Hello on this stream \
+             teaches the dialable form"
+        ),
+        None => tracing::debug!(
+            peer = %joiner.display(),
+            "peer enrol: this enrolment arrived through a carrier; no socket is recorded as \
+             evidence about the joiner"
+        ),
+    }
     // A re-enrolment of a key already pinned replaces the row rather than
     // adding a second one, for the reason `pin_row` documents.
     file.peers.retain(|existing| existing.node != joiner);
@@ -977,6 +1000,50 @@ pub async fn join_as(
                 "peer join: the registrar's answer to the enrolment is not a control message",
             )
         }
+    }
+
+    // **The joiner's own Hello, on this same live stream.** `accept_enrolment`
+    // records no endpoint at all from the socket it accepted, because that
+    // socket's port is this node's ephemeral one for this one connection and
+    // never the port anything listens on. This frame is what gives the
+    // registrar something dialable: it lands on the ordinary CONTROL arm
+    // (`serve_control` continues on this stream right after the enrolment,
+    // `crate::peer::listener::serve_enrolment`'s tail call), which combines
+    // the accepted socket's host with the port this Hello announces, the same
+    // combine every later roam already goes through.
+    let facts = NodeFacts::listening(node.id(), store.file().listen);
+    let hello = hello_for_peer(&facts, &ControlGrants::default());
+    let hello_bytes = serde_json::to_vec(&Control::Hello(hello))
+        .context("peer join: this node's own Hello did not serialize")?;
+    noise::send_encrypted(&mut stream, &mut session.transport, &hello_bytes).await?;
+
+    // Read the registrar's answering Hello before returning, not because
+    // this join needs anything it carries, but because the registrar's
+    // CONTROL arm writes the row's endpoint and THEN sends this reply
+    // (`listener::serve_control`'s `Control::Hello` arm), so seeing it here
+    // is the join's own proof the write already landed. Advisory only: the
+    // registrar already pinned this Mac on the ack read above, so a slow or
+    // absent reply here is logged and not a refusal.
+    match tokio::time::timeout(
+        ENROL_ACK_TIMEOUT,
+        noise::recv_encrypted(&mut stream, &mut session.transport),
+    )
+    .await
+    {
+        Ok(Ok(_frame)) => {}
+        Ok(Err(err)) => tracing::debug!(
+            registrar = %token.registrar.display(),
+            error = %err,
+            "peer join: the registrar did not answer this Mac's own Hello; already pinned, \
+             so this Mac stays enrolled and will teach its port again at the next handshake"
+        ),
+        Err(_elapsed) => tracing::debug!(
+            registrar = %token.registrar.display(),
+            "peer join: the registrar did not answer this Mac's own Hello within {} s; \
+             already pinned, so this Mac stays enrolled and will teach its port again at \
+             the next handshake",
+            ENROL_ACK_TIMEOUT.as_secs()
+        ),
     }
 
     pin_row(store, token.registrar, &registrar_label(addr)?, Some(addr))?;

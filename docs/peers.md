@@ -305,6 +305,9 @@ the commonest way a Mac vanishes from its own mesh, and it used to happen withou
 At pairing, and again at every handshake after, each Mac writes down the address it saw the
 other one connect from: "I saw you from `ip:port`". That address is refreshed every time you
 talk, so it is what lets you find a peer again once it has left your network for a new one.
+A Mac reached through a friend is not seen by this Mac at all, so nothing is written down from
+that conversation, and what the two of them know about each other's addresses is whatever they
+last learned directly.
 
 Reaching it tries a few things, in order:
 
