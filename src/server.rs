@@ -2312,6 +2312,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let lock_account = manager.locked_account_name();
     let control_account = manager.control_name();
     let control_pooled = manager.control_pooled();
+    let control_identity = manager.control_identity().as_str();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         sha = build_info::SHA,
@@ -2332,6 +2333,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         lock_account,
         control_account,
         control_pooled,
+        control_identity,
         "server started"
     );
 

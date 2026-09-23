@@ -815,11 +815,59 @@ pub struct Profile {
     pub seat_tier: Option<String>,
 }
 
+impl Profile {
+    /// `account.email`, or `None` when the fetch failed or the endpoint sent none.
+    pub fn email(&self) -> Option<&str> {
+        self.email.as_deref()
+    }
+
+    /// `account.uuid`, or `None` when the fetch failed or the endpoint sent none.
+    pub fn account_uuid(&self) -> Option<&str> {
+        self.account_uuid.as_deref()
+    }
+}
+
 /// Fetch the account+org identity from the profile endpoint. Returns an
 /// all-`None` [`Profile`] on any failure (network, non-2xx, or malformed body)
 /// so the caller can still prompt for a name and login without org info. Serde
 /// ignores unknown fields, so extra profile keys are harmless.
 pub async fn fetch_profile(access_token: &str) -> Profile {
+    fetch_profile_at(PROFILE_URL, access_token).await
+}
+
+/// [`fetch_profile`] against an explicit profile URL — the proxy's client-identity
+/// check resolves a client bearer against its configured upstream, which in tests
+/// is a local fake rather than [`PROFILE_URL`].
+pub async fn fetch_profile_at(url: &str, access_token: &str) -> Profile {
+    try_fetch_profile_at(url, access_token)
+        .await
+        .unwrap_or(Profile {
+            email: None,
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+        })
+}
+
+/// Why a profile fetch produced no [`Profile`]. The proxy's client-identity check
+/// treats the two arms differently: a status is upstream's verdict on the bearer
+/// and can be remembered for a while, a transport failure says nothing about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileFetchError {
+    /// The request never completed, or the body did not parse.
+    Transport,
+    /// Upstream answered, with this non-2xx status.
+    Status(u16),
+}
+
+/// [`fetch_profile_at`], keeping the reason for a miss.
+pub async fn try_fetch_profile_at(
+    url: &str,
+    access_token: &str,
+) -> Result<Profile, ProfileFetchError> {
     #[derive(Deserialize)]
     struct ProfileResponse {
         account: Option<ProfileAccount>,
@@ -839,53 +887,49 @@ pub async fn fetch_profile(access_token: &str) -> Profile {
         seat_tier: Option<String>,
     }
 
-    async fn inner(access_token: &str) -> Option<ProfileResponse> {
-        let client = reqwest::Client::builder().no_proxy().build().ok()?;
+    async fn inner(url: &str, access_token: &str) -> Result<ProfileResponse, ProfileFetchError> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|_| ProfileFetchError::Transport)?;
         let response = client
-            .get(PROFILE_URL)
+            .get(url)
             .header("Authorization", format!("Bearer {access_token}"))
             .send()
             .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
+            .map_err(|_| ProfileFetchError::Transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProfileFetchError::Status(status.as_u16()));
         }
-        response.json().await.ok()
+        response
+            .json()
+            .await
+            .map_err(|_| ProfileFetchError::Transport)
     }
 
     let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
-    match inner(access_token).await {
-        Some(profile) => {
-            let account = profile.account;
-            let organization = profile.organization;
-            Profile {
-                email: non_empty(account.as_ref().and_then(|a| a.email.clone())),
-                account_uuid: non_empty(account.and_then(|a| a.uuid)),
-                org_uuid: non_empty(organization.as_ref().and_then(|o| o.uuid.clone())),
-                org_name: non_empty(organization.as_ref().and_then(|o| o.name.clone())),
-                organization_type: non_empty(
-                    organization
-                        .as_ref()
-                        .and_then(|o| o.organization_type.clone()),
-                ),
-                rate_limit_tier: non_empty(
-                    organization
-                        .as_ref()
-                        .and_then(|o| o.rate_limit_tier.clone()),
-                ),
-                seat_tier: non_empty(organization.and_then(|o| o.seat_tier)),
-            }
+    inner(url, access_token).await.map(|profile| {
+        let account = profile.account;
+        let organization = profile.organization;
+        Profile {
+            email: non_empty(account.as_ref().and_then(|a| a.email.clone())),
+            account_uuid: non_empty(account.and_then(|a| a.uuid)),
+            org_uuid: non_empty(organization.as_ref().and_then(|o| o.uuid.clone())),
+            org_name: non_empty(organization.as_ref().and_then(|o| o.name.clone())),
+            organization_type: non_empty(
+                organization
+                    .as_ref()
+                    .and_then(|o| o.organization_type.clone()),
+            ),
+            rate_limit_tier: non_empty(
+                organization
+                    .as_ref()
+                    .and_then(|o| o.rate_limit_tier.clone()),
+            ),
+            seat_tier: non_empty(organization.and_then(|o| o.seat_tier)),
         }
-        None => Profile {
-            email: None,
-            account_uuid: None,
-            org_uuid: None,
-            org_name: None,
-            organization_type: None,
-            rate_limit_tier: None,
-            seat_tier: None,
-        },
-    }
+    })
 }
 
 /// Prompt for an account name on stdin, falling back to `fallback` on empty

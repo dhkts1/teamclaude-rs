@@ -86,6 +86,13 @@ pub(super) enum RequestClass {
     ControlPreferred,
 }
 
+// Only a request WITHOUT a client bearer reaches this classifier on a `Noise`
+// or `ControlPreferred` path: with one, `proxy::relay_mode` relays every
+// non-inference path under the client's own credential first, and the
+// `controlIdentity` check (`crate::control_identity`) has already confirmed
+// that credential IS the control account. So the control-preferred pick below
+// is the bearer-less fallback, not the identity plane's main road.
+
 /// Why the group-respecting first pass of [`Manager::select_with_group`] came up
 /// empty, so the soft fallback had to drop the group and serve from the whole
 /// pool.
@@ -3049,6 +3056,7 @@ mod revalidation_sticky_tests {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
@@ -3204,6 +3212,7 @@ mod sticky_divert_replay_tests {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
@@ -3373,6 +3382,7 @@ mod strict_group_door_tests {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
@@ -4175,6 +4185,7 @@ mod reset_urgency_tests {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: tier_hours,
             http1_only: false,
             accounts,
@@ -4429,6 +4440,7 @@ mod fable_last_resort_tests {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
@@ -4813,6 +4825,7 @@ mod stale_pin_load_tests {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts: vec![account("alice@example.com"), account("bob@example.com")],

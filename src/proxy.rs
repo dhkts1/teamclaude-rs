@@ -977,6 +977,11 @@ pub(crate) const LOCAL_PREFIX: &str = "/_tcr";
 /// `pub(crate)` so `src/peer/serve.rs` reads THIS list rather than a copy of it.
 /// A borrower must refuse to open a SERVE for every path here, and a copy of a
 /// security list in two files is a fact in two places that will drift.
+///
+/// This list is no longer the only way onto the client-credential relay: a request
+/// that carries its own bearer is relayed under it on EVERY non-inference path
+/// (see [`relay_mode`]). The list still decides for a request with no bearer, and
+/// it is still the whole of the peer borrower's refusal.
 pub(crate) const CLIENT_CREDENTIAL_PREFIXES: [&str; 6] = [
     "/v1/code",
     "/api/oauth/files",
@@ -1208,7 +1213,16 @@ fn is_cross_site_request(headers: &HeaderMap) -> bool {
 ///
 /// Sound only on a path [`path_is_ambiguous`] has already rejected: on a path that
 /// still contains a dot segment, what this classifies is not what goes on the wire.
-fn relay_mode(method: &Method, path: &str) -> Option<RelayMode> {
+///
+/// `client_bearer` is whether the request arrived with an `Authorization: Bearer`
+/// of its own. With one, every path that is not inference is relayed under it:
+/// the bookkeeping calls (`/api/claude_cli/bootstrap`, `/api/oauth/profile`,
+/// `/api/organizations/<org>/…`, feature gates, telemetry) all answer "who am I
+/// and what am I allowed", and a pooled account answers that for the wrong
+/// person. The prefix list above stays for two reasons this rule does not cover:
+/// a client with no bearer at all, and the peer borrower's refusal
+/// (`src/peer/serve.rs`), which is path-only.
+fn relay_mode(method: &Method, path: &str, client_bearer: bool) -> Option<RelayMode> {
     if *method == Method::POST && path_is_under(path, CLIENT_TOKEN_REFRESH_PATH) {
         return Some(RelayMode::Raw);
     }
@@ -1218,7 +1232,81 @@ fn relay_mode(method: &Method, path: &str) -> Option<RelayMode> {
     {
         return Some(RelayMode::ClientCredential);
     }
+    if client_bearer && !is_inference_path(path) {
+        return Some(RelayMode::ClientCredential);
+    }
     None
+}
+
+/// The two paths that spend quota and therefore ALWAYS take the pooled path,
+/// whatever credential the client sent. Exact match, mirroring
+/// `manager::select::classify_request`.
+fn is_inference_path(path: &str) -> bool {
+    path == "/v1/messages" || path == "/v1/messages/count_tokens"
+}
+
+/// The client's own OAuth bearer, if the request carries one. `Bearer` is
+/// matched case-insensitively (RFC 9110 §11.1); an empty token is no bearer.
+fn client_bearer_of(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.trim().split_once(char::is_whitespace)?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+/// The `controlIdentity` check — see [`crate::control_identity`]. `Some` is the
+/// refusal to return; `None` means the request proceeds.
+///
+/// Runs on every request that carries a client bearer, relayed or pooled: a
+/// session on the wrong account must fail at its FIRST request, which is a
+/// bootstrap call, not at the first turn. Inert without a control account, in
+/// mode `off`, and for a request with no bearer. Fail-open on `Unknown` — a
+/// profile fetch that failed is logged at debug and the request is served.
+async fn refuse_foreign_client(manager: &Manager, bearer: &str) -> Option<Response> {
+    use crate::config::ControlIdentityMode;
+    use crate::control_identity::{verdict, Verdict};
+
+    let mode = manager.control_identity();
+    if mode == ControlIdentityMode::Off {
+        return None;
+    }
+    let control = manager.control_identity_target()?;
+    let profile_url = format!("{}/api/oauth/profile", manager.upstream());
+    let Some(client) = manager
+        .client_identities()
+        .resolve(&profile_url, bearer)
+        .await
+    else {
+        tracing::debug!("control identity: client bearer did not resolve to an identity; serving");
+        return None;
+    };
+    let Verdict::Mismatch(client) = verdict(&control, &client) else {
+        return None;
+    };
+    let control_email = crate::identity::email_of(&control.name).to_string();
+    let client_shown = client.display();
+    if manager.client_identities().first_warning(bearer).await {
+        tracing::warn!(
+            client = %client_shown,
+            control_account = %control_email,
+            mode = mode.as_str(),
+            "control identity: the client is signed in as a different account than controlAccount"
+        );
+    }
+    if mode == ControlIdentityMode::Warn {
+        return None;
+    }
+    Some(error_response(
+        StatusCode::FORBIDDEN,
+        "permission_error",
+        &format!(
+            "tcr: this client is signed in as {client_shown}, but controlAccount is {control_email}, \
+             so its connectors, plugins and settings would come from the wrong account. \
+             Run /logout, then /login as {control_email} — or set \"controlIdentity\": \"warn\" \
+             (or \"off\") in the tcr config to serve it anyway."
+        ),
+        None,
+    ))
 }
 
 /// Build the proxy router. Every method and path funnels through the single
@@ -2245,7 +2333,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //     and the host guard (1c): relaying for an unauthenticated caller, on a path
     //     that means something else upstream, or to a host we just refused to forward
     //     to, would each be a new hole. Gate first, then relay.
-    if let Some(mode) = relay_mode(&method, &path) {
+    //
+    //     Before either: the `controlIdentity` check, on the client's own bearer.
+    //     It sits here rather than inside the relay because a wrong-account
+    //     session must be refused on its bookkeeping calls AND its inference.
+    let client_bearer = client_bearer_of(&req_headers);
+    if let Some(bearer) = client_bearer {
+        if let Some(refusal) = refuse_foreign_client(&manager, bearer).await {
+            return refusal;
+        }
+    }
+    if let Some(mode) = relay_mode(&method, &path, client_bearer.is_some()) {
         return relay_upstream(&manager, mode, method, &path_and_query, &req_headers, body).await;
     }
 
@@ -5906,6 +6004,7 @@ mod tests {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts: vec![Account {
@@ -9757,18 +9856,18 @@ mod tests {
             "/v1/sessions/session_abc/archive",
         ] {
             assert_eq!(
-                relay_mode(&Method::POST, path),
+                relay_mode(&Method::POST, path, false),
                 Some(RelayMode::ClientCredential),
                 "{path} is client-credential"
             );
             assert_eq!(
-                relay_mode(&Method::GET, path),
+                relay_mode(&Method::GET, path, false),
                 Some(RelayMode::ClientCredential),
                 "{path} is client-credential on GET too"
             );
         }
         assert_eq!(
-            relay_mode(&Method::POST, CLIENT_TOKEN_REFRESH_PATH),
+            relay_mode(&Method::POST, CLIENT_TOKEN_REFRESH_PATH, false),
             Some(RelayMode::Raw)
         );
         for (method, path) in [
@@ -9779,7 +9878,7 @@ mod tests {
             (Method::GET, "/"),
         ] {
             assert_eq!(
-                relay_mode(&method, path),
+                relay_mode(&method, path, false),
                 None,
                 "{method} {path} must take the normal rotation path"
             );
@@ -9801,15 +9900,351 @@ mod tests {
             "/api/oauth/organizations".to_string(),
         ] {
             assert_eq!(
-                relay_mode(&Method::GET, &path),
+                relay_mode(&Method::GET, &path, false),
                 Some(RelayMode::ClientCredential),
                 "{path} is bound to the client's own org"
             );
         }
         assert_eq!(
-            relay_mode(&Method::GET, "/api/oauth/organizations_v2"),
+            relay_mode(&Method::GET, "/api/oauth/organizations_v2", false),
             None,
             "a longer identifier sharing the prefix is a different route"
+        );
+    }
+
+    /// A request carrying the client's own bearer is relayed under it on every
+    /// path that is not inference — the bookkeeping calls are questions about the
+    /// CLIENT's identity, and a pooled account answers them for someone else. The
+    /// two inference paths stay pooled whatever credential arrives: they are the
+    /// quota the proxy exists to rotate.
+    #[test]
+    fn a_client_bearer_relays_every_non_inference_path() {
+        for (method, path) in [
+            (Method::GET, "/api/claude_cli/bootstrap"),
+            (Method::GET, "/api/oauth/profile"),
+            (Method::GET, "/api/oauth/account/settings"),
+            (
+                Method::GET,
+                "/api/organizations/11111111-2222-3333-4444-555555555555/model_selector/cc",
+            ),
+            (Method::GET, "/v1/ultrareview/quota"),
+            (Method::GET, "/mcp-registry/v0/servers"),
+            (Method::POST, "/api/event_logging/v2/batch"),
+            (Method::GET, "/v1/models"),
+            (Method::GET, "/"),
+        ] {
+            assert_eq!(
+                relay_mode(&method, path, true),
+                Some(RelayMode::ClientCredential),
+                "{method} {path} with a client bearer is the client's own call"
+            );
+            assert_eq!(
+                relay_mode(&method, path, false),
+                None,
+                "{method} {path} without a bearer still takes the pooled path"
+            );
+        }
+        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+            assert_eq!(
+                relay_mode(&Method::POST, path, true),
+                None,
+                "{path} spends quota and is pooled even with a client bearer"
+            );
+        }
+        assert_eq!(
+            relay_mode(&Method::POST, CLIENT_TOKEN_REFRESH_PATH, true),
+            Some(RelayMode::Raw),
+            "a bearer does not turn the token refresh into a credentialled relay"
+        );
+    }
+
+    #[test]
+    fn client_bearer_of_reads_the_scheme_case_insensitively_and_rejects_empty() {
+        let mut h = HeaderMap::new();
+        assert_eq!(client_bearer_of(&h), None);
+        h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer tok-1"));
+        assert_eq!(client_bearer_of(&h), Some("tok-1"));
+        h.insert(AUTHORIZATION, HeaderValue::from_static("bearer   tok-2  "));
+        assert_eq!(client_bearer_of(&h), Some("tok-2"));
+        h.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwdw=="),
+        );
+        assert_eq!(client_bearer_of(&h), None, "not a bearer");
+        h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        assert_eq!(client_bearer_of(&h), None, "an empty token is no bearer");
+    }
+
+    /// The `controlIdentity` check end to end, through `app()` against a fake
+    /// upstream: the client's bearer is resolved via `/api/oauth/profile` and
+    /// compared to the control account. A foreign bearer is refused on a
+    /// bookkeeping call AND on inference, before anything reaches upstream; the
+    /// control account's own bearer passes, and its bookkeeping call goes out
+    /// under THAT bearer (the relay rule), not a pooled one. `warn` serves,
+    /// `off` never asks, no bearer never asks, and a profile fetch that fails is
+    /// fail-open. Identities are fake.
+    #[tokio::test]
+    async fn control_identity_refuses_a_client_signed_in_as_another_account() {
+        use axum::extract::State;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt as _;
+
+        const ALICE_UUID: &str = "11111111-1111-1111-1111-111111111111";
+        const BOB_UUID: &str = "22222222-2222-2222-2222-222222222222";
+
+        struct NoRefresh;
+        impl crate::oauth::TokenRefresher for NoRefresh {
+            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct Seen {
+            profile_hits: Arc<AtomicUsize>,
+            messages_hits: Arc<AtomicUsize>,
+            bootstrap_auth: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        async fn profile(State(s): State<Seen>, headers: HeaderMap) -> axum::response::Response {
+            use axum::response::IntoResponse as _;
+            s.profile_hits.fetch_add(1, Ordering::SeqCst);
+            let (email, uuid) = match client_bearer_of(&headers) {
+                Some("tok-alice") => ("alice@example.com", ALICE_UUID),
+                Some("tok-bob") => ("bob@example.com", BOB_UUID),
+                Some("tok-dead") => return StatusCode::UNAUTHORIZED.into_response(),
+                _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            Json(serde_json::json!({
+                "account": {"uuid": uuid, "email": email},
+                "organization": {"uuid": "33333333-3333-3333-3333-333333333333", "name": "acme-corp"}
+            }))
+            .into_response()
+        }
+        async fn messages(State(s): State<Seen>) -> Json<serde_json::Value> {
+            s.messages_hits.fetch_add(1, Ordering::SeqCst);
+            Json(
+                serde_json::json!({"usage": {"input_tokens": 1, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0, "output_tokens": 1}}),
+            )
+        }
+        async fn bootstrap(State(s): State<Seen>, headers: HeaderMap) -> Json<serde_json::Value> {
+            let auth = headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            s.bootstrap_auth.lock().unwrap().push(auth);
+            Json(serde_json::json!({}))
+        }
+
+        let seen = Seen::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = listener.local_addr().unwrap();
+        let fake = Router::new()
+            .route("/api/oauth/profile", get(profile))
+            .route("/v1/messages", post(messages))
+            .route("/api/claude_cli/bootstrap", get(bootstrap))
+            .with_state(seen.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, fake).await;
+        });
+
+        let manager_with = |mode: crate::config::ControlIdentityMode| {
+            let mut config = dummy_config(None, &format!("http://{up_addr}"));
+            config.accounts[0].name = "alice@example.com".to_string();
+            config.accounts[0].account_uuid = Some(ALICE_UUID.to_string());
+            config.control_account = Some(crate::config::ControlAccountRef::Name(
+                "alice@example.com".to_string(),
+            ));
+            config.control_pooled = true;
+            config.control_identity = mode;
+            Manager::new(
+                config,
+                Arc::new(NoRefresh),
+                Arc::new(crate::probe::LiveUsageProber::new()),
+                Arc::new(crate::warmer::LiveWarmer::new()),
+                None,
+            )
+        };
+        let request = |method: Method, uri: &str, bearer: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/json");
+            if let Some(token) = bearer {
+                builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let body = if method == Method::POST {
+                Body::from(r#"{"system":"hi","messages":[]}"#)
+            } else {
+                Body::empty()
+            };
+            let mut req = builder.body(body).expect("build request");
+            req.extensions_mut().insert(SessionKey(0xF00D));
+            req.extensions_mut().insert(ClientAddr(loopback_peer()));
+            req
+        };
+        async fn body_text(response: Response) -> String {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        // refuse: bob is refused on a bookkeeping call and on inference, and
+        // neither reaches upstream.
+        let manager = manager_with(crate::config::ControlIdentityMode::Refuse);
+        let response = app(manager.clone())
+            .oneshot(request(
+                Method::GET,
+                "/api/claude_cli/bootstrap",
+                Some("tok-bob"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let text = body_text(response).await;
+        assert!(
+            text.contains("bob@example.com") && text.contains("alice@example.com"),
+            "the refusal names both identities: {text}"
+        );
+        assert!(
+            text.contains("/logout"),
+            "the refusal names the fix: {text}"
+        );
+        let response = app(manager.clone())
+            .oneshot(request(
+                Method::POST,
+                "/v1/messages?beta=true",
+                Some("tok-bob"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "inference is refused too"
+        );
+        assert_eq!(seen.messages_hits.load(Ordering::SeqCst), 0);
+        assert!(seen.bootstrap_auth.lock().unwrap().is_empty());
+        assert_eq!(
+            seen.profile_hits.load(Ordering::SeqCst),
+            1,
+            "one profile fetch for two requests on one bearer"
+        );
+
+        // The control account's own bearer passes, and its bootstrap call is
+        // relayed under that bearer rather than the pooled token.
+        let response = app(manager.clone())
+            .oneshot(request(
+                Method::GET,
+                "/api/claude_cli/bootstrap",
+                Some("tok-alice"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            seen.bootstrap_auth.lock().unwrap().as_slice(),
+            ["Bearer tok-alice".to_string()],
+            "a bookkeeping call carries the CLIENT's credential upstream"
+        );
+        let response = app(manager.clone())
+            .oneshot(request(
+                Method::POST,
+                "/v1/messages?beta=true",
+                Some("tok-alice"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.messages_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 2);
+
+        // A bearer the profile endpoint cannot resolve is fail-open, and is
+        // asked again next time because a failure is never cached.
+        for _ in 0..2 {
+            let response = app(manager.clone())
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/messages?beta=true",
+                    Some("tok-broken"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "an unresolved identity is served"
+            );
+        }
+        assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 4);
+
+        // A bearer upstream REFUSES (expired or revoked) is served too, but is
+        // remembered: two requests on it cost one profile fetch, not two.
+        for _ in 0..2 {
+            let response = app(manager.clone())
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/messages?beta=true",
+                    Some("tok-dead"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a refused bearer is fail-open"
+            );
+        }
+        assert_eq!(
+            seen.profile_hits.load(Ordering::SeqCst),
+            5,
+            "a 401 on the profile endpoint is cached, a 500 is not"
+        );
+
+        // No bearer: nothing to check, nothing asked.
+        let response = app(manager.clone())
+            .oneshot(request(Method::POST, "/v1/messages?beta=true", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 5);
+
+        // warn: bob is served.
+        let manager = manager_with(crate::config::ControlIdentityMode::Warn);
+        let response = app(manager)
+            .oneshot(request(
+                Method::POST,
+                "/v1/messages?beta=true",
+                Some("tok-bob"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "warn serves a foreign client"
+        );
+        assert_eq!(seen.profile_hits.load(Ordering::SeqCst), 6);
+
+        // off: bob is served and the profile endpoint is never asked.
+        let manager = manager_with(crate::config::ControlIdentityMode::Off);
+        let response = app(manager)
+            .oneshot(request(
+                Method::POST,
+                "/v1/messages?beta=true",
+                Some("tok-bob"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            seen.profile_hits.load(Ordering::SeqCst),
+            6,
+            "off never resolves"
         );
     }
 
@@ -9827,13 +10262,13 @@ mod tests {
             "/v1/sessions",
         ] {
             assert_eq!(
-                relay_mode(&Method::POST, path),
+                relay_mode(&Method::POST, path, false),
                 Some(RelayMode::ClientCredential),
                 "the bare {path} is the same route as {path}/"
             );
         }
         assert_eq!(
-            relay_mode(&Method::POST, "/v1/sessions/session_abc/archive"),
+            relay_mode(&Method::POST, "/v1/sessions/session_abc/archive", false),
             Some(RelayMode::ClientCredential),
             "a session sub-path is still client-credential"
         );
@@ -9847,7 +10282,7 @@ mod tests {
             "/v1/sessions_v2",
         ] {
             assert_eq!(
-                relay_mode(&Method::POST, path),
+                relay_mode(&Method::POST, path, false),
                 None,
                 "{path} only shares a prefix — it is not the route"
             );
@@ -9857,13 +10292,13 @@ mod tests {
         // a client's own credential exchange must never have.
         for path in ["/v1/oauth/token", "/v1/oauth/token/"] {
             assert_eq!(
-                relay_mode(&Method::POST, path),
+                relay_mode(&Method::POST, path, false),
                 Some(RelayMode::Raw),
                 "{path} is the client's own token exchange"
             );
         }
         assert_eq!(
-            relay_mode(&Method::POST, "/v1/oauth/tokens"),
+            relay_mode(&Method::POST, "/v1/oauth/tokens", false),
             None,
             "a longer identifier is not the token endpoint"
         );
@@ -9874,19 +10309,19 @@ mod tests {
     fn the_connector_list_never_takes_a_pooled_token() {
         for method in [Method::GET, Method::POST] {
             assert_eq!(
-                relay_mode(&method, "/v1/mcp_servers"),
+                relay_mode(&method, "/v1/mcp_servers", false),
                 Some(RelayMode::ClientCredential),
                 "{method} /v1/mcp_servers must not be re-credentialled"
             );
         }
         assert_eq!(
-            relay_mode(&Method::GET, "/v1/mcp_servers/srv_0123"),
+            relay_mode(&Method::GET, "/v1/mcp_servers/srv_0123", false),
             Some(RelayMode::ClientCredential),
             "one connector is the same route as the collection"
         );
         for path in ["/v1/mcp_servers_v2", "/v1/mcp_serversX"] {
             assert_eq!(
-                relay_mode(&Method::GET, path),
+                relay_mode(&Method::GET, path, false),
                 None,
                 "{path} only shares a prefix — it is not the route"
             );
@@ -10878,6 +11313,12 @@ mod tests {
     /// The segment-boundary fix on the wire, in both directions. The bare `/v1/code`
     /// is the Remote Control route and must carry the CLIENT's token; the longer
     /// identifier `/api/oauth/file_upload_v2` is NOT that route and takes rotation.
+    ///
+    /// The second half is observable only WITHOUT a client bearer: with one, every
+    /// non-inference path is relayed under it (the bearer rule in [`relay_mode`]),
+    /// so the boundary decides nothing a client with its own login can see. The
+    /// last leg pins that too — the same longer identifier, sent WITH a bearer,
+    /// goes out under the client's credential and spends no account.
     #[tokio::test]
     async fn segment_boundaries_decide_which_credential_goes_on_the_wire() {
         let (upstream, _hits) = spawn_echo_upstream().await;
@@ -10913,6 +11354,28 @@ mod tests {
             Method::POST,
             "/api/oauth/file_upload_v2",
             Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"model":"claude-sonnet-5"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            parse_echo(&body).header("authorization"),
+            Some("Bearer at-dummy"),
+            "a longer identifier is not the upload route — without a client bearer it takes the pooled token"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
+            1,
+            "…and is counted against the serving account"
+        );
+
+        let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            "/api/oauth/file_upload_v2",
+            Some(loopback_peer()),
             &[
                 ("authorization", "Bearer client-own-token"),
                 ("content-type", "application/json"),
@@ -10923,13 +11386,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             parse_echo(&body).header("authorization"),
-            Some("Bearer at-dummy"),
-            "a longer identifier is not the upload route — it takes the pooled token"
+            Some("Bearer client-own-token"),
+            "with a client bearer the same non-inference path is the client's own call"
         );
         assert_eq!(
             manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
-            1,
-            "…and is counted against the serving account"
+            0,
+            "…and spends no account"
         );
     }
 

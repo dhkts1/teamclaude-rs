@@ -902,6 +902,39 @@ impl ThrottleConfig {
     }
 }
 
+/// The `controlIdentity` key: what the proxy does when a client's own OAuth
+/// identity — resolved once per bearer via `/api/oauth/profile` — is not the
+/// control account. See [`crate::control_identity`] for why this is a CHECK
+/// rather than a routing decision: the client's login, not the proxy, decides
+/// which account every connector, plugin and setting comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlIdentityMode {
+    /// Answer a mismatched client with a 403 naming both identities and the
+    /// fix, so a session on the wrong account fails at its first request
+    /// instead of running for hours with the wrong connectors. Intended to
+    /// become the default once a release of `warn` has shown how common the
+    /// drift is; a headless `tcr run` worker sharing a drifted keychain would
+    /// otherwise be refused with nothing on any screen saying why.
+    Refuse,
+    /// Serve the request, log the mismatch once per bearer. The default.
+    #[default]
+    Warn,
+    /// Do not resolve client identities at all.
+    Off,
+}
+
+impl ControlIdentityMode {
+    /// The `controlIdentity` spelling, for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::Warn => "warn",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// The `controlAccount` key on disk: an account `name`, or the identity object
 /// (`name`/`accountUuid`/`orgUuid`/`orgName`) a `tcr` from the duplicated-email
 /// era wrote. `#[serde(untagged)]` is unambiguous here because the two shapes
@@ -1062,6 +1095,11 @@ pub struct Config {
     /// plane only", exactly as the control-account design defines it.
     #[serde(default)]
     pub control_pooled: bool,
+    /// What the proxy does with a client whose own OAuth identity is not the
+    /// control account. Absent → [`ControlIdentityMode::Warn`]. Inert without a
+    /// `controlAccount`, and for a request that carries no `Authorization: Bearer`.
+    #[serde(default)]
+    pub control_identity: ControlIdentityMode,
     /// Width, in hours, of the reset-urgency bucket rotation ranks by within a
     /// priority tier — see [`default_reset_urgency_tier_hours`] for why this is
     /// a bucket and not the raw reset instant. Absent → 24. `0` disables the
@@ -4755,6 +4793,31 @@ mod tests {
     fn control_account_absent_defaults_none() {
         let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
         assert_eq!(config.control_account, None);
+    }
+
+    /// `controlIdentity` reads its three lowercase spellings, defaults to
+    /// `warn` when absent, and rejects anything else rather than guessing.
+    #[test]
+    fn control_identity_parses_lowercase_and_defaults_to_warn() {
+        let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        assert_eq!(config.control_identity, ControlIdentityMode::Warn);
+        for (spelling, expected) in [
+            ("refuse", ControlIdentityMode::Refuse),
+            ("warn", ControlIdentityMode::Warn),
+            ("off", ControlIdentityMode::Off),
+        ] {
+            let config: Config = serde_json::from_str(&format!(
+                r#"{{ "accounts": [], "controlIdentity": "{spelling}" }}"#
+            ))
+            .unwrap();
+            assert_eq!(config.control_identity, expected, "{spelling}");
+            assert_eq!(expected.as_str(), spelling);
+        }
+        assert!(
+            serde_json::from_str::<Config>(r#"{ "accounts": [], "controlIdentity": "Refuse" }"#)
+                .is_err(),
+            "an unknown spelling is an error, not a silent default"
+        );
     }
 
     /// `skip_serializing_if` round trip: setting then serializing must NOT emit

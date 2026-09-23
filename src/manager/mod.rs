@@ -1224,6 +1224,12 @@ pub struct Manager {
     /// can burn the control account into `rejected` and cost the identity plane
     /// its anchor until the weekly window resets.
     control_pooled: bool,
+    /// Boot-time snapshot of `config.control_identity` — see
+    /// [`crate::control_identity`].
+    control_identity: crate::config::ControlIdentityMode,
+    /// Client bearers the proxy has resolved to an identity, for the check
+    /// [`Self::control_identity`] governs.
+    client_identities: crate::control_identity::ClientIdentityCache,
     /// Width in MILLISECONDS of the reset-urgency bucket that rotation ranks by
     /// within a priority tier, resolved once from
     /// [`crate::config::Config::reset_urgency_tier_hours`] at construction
@@ -1404,6 +1410,7 @@ impl Manager {
         // Read before `config` is moved into the struct below, same reason as
         // `locked_name` above.
         let control_pooled = config.control_pooled;
+        let control_identity = config.control_identity;
 
         // Hours → ms once, at construction. `i64::from` then a checked multiply:
         // a hand-edited `resetUrgencyTierHours` of, say, 100_000_000 would
@@ -1494,6 +1501,8 @@ impl Manager {
             divert_ledger: Mutex::new(HashMap::new()),
             control_reserve,
             control_pooled,
+            control_identity,
+            client_identities: crate::control_identity::ClientIdentityCache::new(),
             reset_urgency_tier_ms,
         });
         // Hand the manager its own `Arc` (weakly) now that one exists — see the
@@ -2515,6 +2524,30 @@ impl Manager {
         self.control_pooled
     }
 
+    /// The boot-time `controlIdentity` snapshot — see [`crate::control_identity`].
+    pub fn control_identity(&self) -> crate::config::ControlIdentityMode {
+        self.control_identity
+    }
+
+    /// The identity the control account must be checked against: its `name`
+    /// and `accountUuid`. `None` when no control account is set.
+    pub fn control_identity_target(&self) -> Option<crate::control_identity::ControlIdentity> {
+        let idx = self.control()?;
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| crate::control_identity::ControlIdentity {
+                name: a.name.clone(),
+                account_uuid: a.account_uuid.clone(),
+            })
+    }
+
+    /// The resolved-client-identity cache the check reads and fills.
+    pub fn client_identities(&self) -> &crate::control_identity::ClientIdentityCache {
+        &self.client_identities
+    }
+
     /// The resolved `lockAccount` name, or `None` when unlocked / the name did
     /// not match any account. `locked_idx` is fixed at construction (see
     /// [`Self::assemble`]), so this is a plain resolve against the live
@@ -3399,6 +3432,7 @@ mod tests {
             control_account: None,
             control_reserve: 0.05,
             control_pooled: false,
+            control_identity: Default::default(),
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
