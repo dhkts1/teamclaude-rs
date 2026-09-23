@@ -2,11 +2,20 @@
 //! [`crate::bound_tokens`], mirroring `pins.rs`'s split for session affinity.
 //!
 //! The rule this map serves: **a request whose history carries an account-bound token is served
-//! by the account that minted that token, or by nobody**, and — when the history is bound but
-//! no token is known to this process — by the account the session is PINNED to, rather than
-//! being allowed to divert. A thinking signature, an advisor result or server-side thread state
-//! is unusable off its minting account, so an eligible sibling answers the whole request with a
-//! 400 or a 404: a 429 costs a retry, a divert costs the turn.
+//! by the account that minted that token while that account can hold it**, and — when the
+//! history is bound but no token is known to this process — by the account the session is
+//! PINNED to. A thinking signature, an advisor result or server-side thread state is unusable
+//! off its minting account, so a sibling answers the first request with a 400 or a 404.
+//!
+//! "Can hold it" is [`Manager::bound_account_holds`], and it is deliberately narrower than "is
+//! bound". Claude Code recovers from all three rejections on its own, in one extra round trip
+//! (read in the 2.1.277..2.1.280 binaries: `retry:thinking-signature-strip`,
+//! `retry:advisor-strip`, and `retry:tether-replay` on a 404 `thread_not_found`). So holding a
+//! conversation on its account is worth a short wait, and never worth one that outlasts the
+//! cache: an account that is gone, or out for longer than [`super::CACHE_WARM_HOLD_SECS`],
+//! releases the conversation to the fleet. The cost of the other choice, measured 2026-09-22: a
+//! conversation bound to a `rejected` account got a 429 on every turn, 6-11 a minute, until the
+//! operator abandoned the session, because `/compact` keeps the thread id.
 //!
 //! Two responsibilities the store next door does not have, same as `pins.rs`:
 //!
@@ -17,6 +26,8 @@
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
+
+use time::OffsetDateTime;
 
 use crate::bound_tokens::{
     self, BoundTokenKind, LoadReport, StoredAccount, BOUND_TOKEN_CAP, BOUND_TOKEN_TTL_MS,
@@ -104,6 +115,44 @@ impl Manager {
             .filter_map(|token| map.get(&bound_tokens::hash_token(token)).copied())
             .max_by_key(|&(_, _, minted)| minted)
             .map(|(index, kind, _)| (index, kind))
+    }
+
+    /// Whether the account at `idx` can still hold a conversation whose history is bound to it:
+    /// the one question that decides between holding the request there and releasing it to the
+    /// fleet.
+    ///
+    /// Yes while the account is alive for every model class ([`Self::account_hard_ok`], which
+    /// passes a hold that clears while the cache is warm) and for THIS request's class
+    /// ([`Self::model_blocked`]). A short hold is waited out, or answered with that hold's own
+    /// `retry-after`. The soft quota threshold is not consulted: an account over it still serves
+    /// until the upstream says otherwise.
+    ///
+    /// No once the account is terminally gated (`disabled`, a dead login, a `rejected` unified
+    /// status), parked, reserved away from this request, held for longer than the cache lives,
+    /// or out of this model class's weekly bucket. None of those clears soon, and the client
+    /// recovers from the one rejection a sibling gives (see this module's doc). An index that
+    /// names no account is a no too: there is nothing to hold the request to.
+    pub fn bound_account_holds(
+        &self,
+        idx: usize,
+        now: OffsetDateTime,
+        is_fable: bool,
+        group: Option<&str>,
+    ) -> bool {
+        let now_ms = super::odt_to_ms(now);
+        let reserved = self.reserved_groups();
+        let parked = self.parked_groups();
+        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        accounts.get(idx).is_some_and(|account| {
+            Self::account_hard_ok(account, now_ms, group, &reserved, &parked)
+                && !Self::model_blocked(
+                    account,
+                    self.global_threshold,
+                    self.fable_weekly_threshold,
+                    now,
+                    is_fable,
+                )
+        })
     }
 
     /// Whether `tokens` name more than one distinct account — the disagreement

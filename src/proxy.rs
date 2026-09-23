@@ -2371,7 +2371,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // than rejecting the request: this is an observability peek, never a validation gate.
     // The fourth value is NOT observability: `bound` is every account-bound token this
     // conversation carries — advisor ids, thinking signatures, redacted-thinking payloads and
-    // any `previous_message_id` — and it decides which account may serve this request at all,
+    // any thread `previous_message_id` — and it decides which account may serve this request,
     // see `crate::bound_tokens` and the bench below. Scanned from the same borrowed `messages`
     // in the same pass, over ALL messages rather than the tail window the tool events use,
     // because the block that binds the conversation was minted on its FIRST turn.
@@ -2383,11 +2383,16 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             messages: Option<&'a serde_json::value::RawValue>,
             /// Server-side thread state, named at the top level…
             previous_message_id: Option<String>,
-            /// …or under `thread`, or under `diagnostics`. Which of the three a client sends
-            /// has not been captured, so all three are read and the first sighting of each is
-            /// logged (see `note_previous_message_id_path`) rather than guessed at.
+            /// …or under `thread`, which is where Claude Code sends it: `thread: {type:
+            /// "continue", previous_message_id}` with only the new messages. The first sighting
+            /// of each path is logged (see `note_previous_message_id_path`).
+            ///
+            /// `diagnostics.previous_message_id` is deliberately NOT read. Claude Code sends it
+            /// when it has just given up on a thread and is replaying the full history as a new
+            /// one (`thread: {type: "create"}`), so it names no state the request depends on,
+            /// and binding on it pins the RECOVERY request to the account that just failed it.
+            /// Zero upstream rejections named it over 2026-09-19..22.
             thread: Option<PreviousMessagePeek>,
-            diagnostics: Option<PreviousMessagePeek>,
         }
         #[derive(serde::Deserialize)]
         struct RequestSessionMeta {
@@ -2416,10 +2421,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     (
                         "thread.previous_message_id",
                         peek.thread.and_then(|t| t.previous_message_id),
-                    ),
-                    (
-                        "diagnostics.previous_message_id",
-                        peek.diagnostics.and_then(|d| d.previous_message_id),
                     ),
                 ] {
                     let Some(id) = id else {
@@ -2587,16 +2588,24 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         );
     }
     // A conversation whose history carries ACCOUNT-BOUND state is served by the account that
-    // minted that state, or by nobody.
+    // minted that state for as long as that account can hold it.
     //
     // An advisor result decrypts only on the org that produced it, a `thinking` signature is an
     // attestation that org signed, and the thread state behind a `previous_message_id` lives on
-    // that account alone. Every other account answers the WHOLE request with a 400 or a 404:
+    // that account alone. Another account answers the first such request with a 400 or a 404:
     // measured 2026-09-20..22 over 173k calls, 8,322 advisor 400s, 170 thinking 400s and 66
     // thread-state 404s, each cluster starting where a pinned conversation was diverted (4,420
-    // diverts in the same window). So an eligible sibling is never the right answer, and a 429
-    // ("no eligible account") is the honest one when the bound account cannot serve: the client
-    // retries, and a 429 costs a retry where a divert costs the turn.
+    // diverts in the same window). So while the bound account can serve, a sibling is the wrong
+    // answer, and a short wait on the bound account is the right one.
+    //
+    // But the rejection is not fatal. Claude Code recovers from each of the three in one extra
+    // round trip: it strips the thinking blocks, strips the advisor blocks, or replays the full
+    // history as a new thread (see `crate::manager::bound_tokens`'s module doc for where that was
+    // read). So the hold ends where the bound account stops being able to serve soon — gone,
+    // `rejected`, or held past the cache's life (`Manager::bound_account_holds`). Past that
+    // point a hold is a 429 on every turn until the account resets, possibly for days, and
+    // `/compact` does not clear it, because the thread id survives the compaction (2026-09-22:
+    // one `rejected` account held one conversation at 6-11 refusals a minute).
     //
     // Enforced by BENCHING every other account into `tried`, exactly as the account-set scope
     // above does and for the same three reasons — it can only narrow, the affinity fast-path
@@ -2605,24 +2614,23 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // fleet every account ends up benched and the client gets the same honest 429 an exhausted
     // fleet produces.
     //
-    // Two rungs, because a token is not always knowable:
+    // Two rungs name the bound account, because a token is not always knowable:
     //
     //  1. A token this process minted names its account outright.
-    //  2. No token resolves, but the history IS bound and the session has a pin: hold it to the
-    //     pin. This is every conversation older than this build, and the pin is where that
-    //     history was made as long as it never diverted — a guess, but the only one that can be
-    //     better than diverting, which is a guaranteed rejection.
+    //  2. No token resolves, but the history IS bound and the session has a pin: the pin. This
+    //     is every conversation older than this build, and the pin is where that history was
+    //     made as long as it never diverted.
     //
     // Neither: today's behaviour, so the rule never blocks a conversation it knows nothing
-    // about.
+    // about. Either, with an account that cannot hold it: released, and logged, so the one
+    // rejection that follows can be traced to this decision.
     //
     // `bound_to` carries the one account this request may use down to the terminals, which
     // must answer for THAT account: the wait they size and the `retry-after` they advertise
     // are its own, and a fallback provider (a peer's credential) is refused outright, since
     // it is one more account that cannot read this history.
-    let mut bound_to: Option<usize> = None;
-    if let Some((bound_idx, bound_kind)) = manager.bound_token_account(&bound.tokens) {
-        bound_to = Some(bound_idx);
+    let minted = manager.bound_token_account(&bound.tokens);
+    if let Some((_, bound_kind)) = minted {
         if manager.bound_tokens_disagree(&bound.tokens) {
             tracing::warn!(
                 tokens = bound.tokens.len(),
@@ -2630,33 +2638,48 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 "bound tokens in one conversation name different accounts; taking the newest mint"
             );
         }
-        let affinity_would_have_picked = session_key.and_then(|key| manager.affinity_pin(key));
-        for idx in 0..account_count {
-            if idx != bound_idx {
-                tried.insert(idx);
-            }
+    }
+    let session_pin = session_key.and_then(|key| manager.affinity_pin(key));
+    let bound_candidate: Option<(usize, &'static str)> = match (minted, session_pin) {
+        (Some((bound_idx, bound_kind)), _) => Some((bound_idx, bound_kind.as_str())),
+        (None, Some(pinned_idx)) if bound.carries_bound_history => {
+            Some((pinned_idx, "session-pin"))
         }
-        if affinity_would_have_picked.is_some_and(|pinned| pinned != bound_idx) {
+        (None, _) => None,
+    };
+    let mut bound_to: Option<usize> = None;
+    if let Some((bound_idx, via)) = bound_candidate {
+        let now = OffsetDateTime::now_utc();
+        if manager.bound_account_holds(bound_idx, now, request_is_fable, request_group.as_deref()) {
+            bound_to = Some(bound_idx);
+            for idx in 0..account_count {
+                if idx != bound_idx {
+                    tried.insert(idx);
+                }
+            }
+            if via == "session-pin" {
+                if session_key.is_some_and(|key| manager.first_bound_history_hold(key)) {
+                    tracing::info!(
+                        account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
+                        "bound history, no minted token known: holding session to its pin"
+                    );
+                }
+            } else if session_pin.is_some_and(|pinned| pinned != bound_idx) {
+                tracing::info!(
+                    account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
+                    kind = via,
+                    "bound token pins request to the account that minted it"
+                );
+            }
+        } else {
             tracing::info!(
                 account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
-                kind = bound_kind.as_str(),
-                "bound token pins request to the account that minted it"
-            );
-        }
-    } else if let (true, Some(pinned_idx)) = (
-        bound.carries_bound_history,
-        session_key.and_then(|key| manager.affinity_pin(key)),
-    ) {
-        bound_to = Some(pinned_idx);
-        for idx in 0..account_count {
-            if idx != pinned_idx {
-                tried.insert(idx);
-            }
-        }
-        if session_key.is_some_and(|key| manager.first_bound_history_hold(key)) {
-            tracing::info!(
-                account = manager.account_name(pinned_idx).as_deref().unwrap_or("?"),
-                "bound history, no minted token known: holding session to its pin"
+                kind = via,
+                gated = ?manager
+                    .exhaustion_hint_for_account(now, request_is_fable, bound_idx)
+                    .gated,
+                "bound history's account cannot hold it; releasing the request to the fleet, \
+                 where the client recovers from the one rejection it gets"
             );
         }
     }
@@ -5327,10 +5350,11 @@ fn push_bound_token(tokens: &mut Vec<MintedToken>, kind: BoundTokenKind, token: 
 
 /// Say, once per process per field path, that a client sent `previous_message_id` there.
 ///
-/// Three shapes are read on the request path because no capture tells us which one Claude Code
-/// actually sends — and a field nobody ever sends is indistinguishable, from the code, from one
-/// that is read wrongly. One line the first time each path is seen turns that guess into a
-/// measurement; a line per request would be a flood on a busy proxy.
+/// Two shapes are read on the request path, and a field nobody ever sends is indistinguishable,
+/// from the code, from one that is read wrongly. One line the first time each path is seen
+/// turns that into a measurement; a line per request would be a flood on a busy proxy. (This
+/// line is how the third shape, `diagnostics.previous_message_id`, was found to be live and
+/// then found to be no binding at all: see the request peek in `handle`.)
 fn note_previous_message_id_path(path: &'static str) {
     static SEEN: std::sync::Mutex<Option<HashSet<&'static str>>> = std::sync::Mutex::new(None);
     let mut seen = match SEEN.lock() {
@@ -5341,8 +5365,8 @@ fn note_previous_message_id_path(path: &'static str) {
     if seen.get_or_insert_with(HashSet::new).insert(path) {
         tracing::info!(
             field = path,
-            "a client names server-side thread state here; requests carrying it are pinned to \
-             the account that holds it"
+            "a client names server-side thread state here; requests carrying it are held to \
+             the account that holds it while that account can serve"
         );
     }
 }
@@ -5577,8 +5601,9 @@ fn exhausted_response(
     let bound_name = bound_to.and_then(|idx| manager.account_name(idx));
     let detail = match (bound_to, strict_group) {
         (Some(_), _) => format!(
-            "This conversation's history can only be read by the account that produced it, \
-             which is not available{causes}; any other account would reject it. {when}"
+            "This conversation's history is held on the account that produced it, which is \
+             briefly unavailable{causes}; it moves to another account only if this one stays \
+             out. {when}"
         ),
         (None, Some(group)) => format!(
             "No account in reserved group '{group}' is available, and a reserved \
@@ -10962,11 +10987,16 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
-    /// When the bound account cannot serve, the honest answer is a 429 — never an eligible
-    /// sibling, which would reject the whole request and burn the turn. The hit counter is the
-    /// assertion that matters: no upstream may be touched at all.
+    /// A bound account that is OUT (here `disabled`, the same terminal gate a `rejected` unified
+    /// status or a dead login hits) releases the conversation to the fleet. The old answer was a
+    /// 429 on every turn until the account came back, which for a `rejected` account is days
+    /// (2026-09-22). The sibling rejects the bound state once and Claude Code recovers on its
+    /// own, by stripping it or replaying the thread; see `crate::manager::bound_tokens`.
+    ///
+    /// The bench still exists while the bound account is alive:
+    /// `a_bound_token_pins_later_turns_to_the_minting_account` is that control.
     #[tokio::test]
-    async fn a_hard_ineligible_bound_account_answers_429_instead_of_a_sibling() {
+    async fn a_bound_account_that_is_out_releases_the_conversation_to_a_sibling() {
         let (upstream, hits, _seen) = spawn_bound_upstream().await;
         // Account 0 is out of rotation; the signature was minted on it before it went out.
         let manager =
@@ -10976,6 +11006,13 @@ mod tests {
             0,
             crate::now_ms(),
         );
+        assert_eq!(
+            manager
+                .bound_token_account(&["sig_fake_1".to_string()])
+                .map(|(idx, _)| idx),
+            Some(0),
+            "precondition: the history IS bound, to the account that is out"
+        );
 
         let (status, body) = drive_conversation(
             Arc::clone(&manager),
@@ -10984,25 +11021,131 @@ mod tests {
         .await;
         assert_eq!(
             status,
-            StatusCode::TOO_MANY_REQUESTS,
-            "a body that only the disabled account can answer gets a 429: {}",
+            StatusCode::OK,
+            "bound to an account that cannot serve, the request goes to one that can: {}",
             String::from_utf8_lossy(&body)
         );
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the eligible sibling must never be handed a foreign signature"
+            1,
+            "the sibling served it"
+        );
+    }
+
+    /// The pin rung releases on the same rule, and this is where the boundary sits: a hold past
+    /// the cache's life (`CACHE_WARM_HOLD_SECS`, 300s) releases the conversation, while a
+    /// shorter one still answers 429 with that hold's own `retry-after`
+    /// (`a_bound_request_on_a_long_hold_answers_429_with_that_holds_retry_after`, 45s).
+    #[tokio::test]
+    async fn bound_history_on_a_hold_past_the_cache_goes_to_a_sibling() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+
+        // Pin the session to account 1 by making it the only choice for one turn.
+        manager.mark_rate_limited(0, 60);
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-far", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        manager.clear_rate_limited(0);
+        let pinned_auth = seen.lock().expect("recorder")[0].clone();
+        assert_eq!(
+            manager.affinity_pin(stable_hash("uid:", "sess-far")),
+            Some(1)
         );
 
-        // The control, on the same manager: the same session with no bound history is served
-        // normally by the account that IS eligible.
+        // Bound history this process never minted, so the pin rung names account 1, which is
+        // now held for ten minutes.
+        manager.mark_rate_limited(1, 600);
+        let (status, body) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-far", &["sig_fake_minted_before_this_build"]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a hold past the cache's life releases the conversation: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_ne!(
+            seen.lock().expect("recorder")[1],
+            pinned_auth,
+            "served by the sibling, not the held pin"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// `body` with one top-level field set, for the two places a request names thread state.
+    fn with_body_field(body: &str, key: &str, value: serde_json::Value) -> String {
+        let mut parsed: serde_json::Value = serde_json::from_str(body).expect("test body is JSON");
+        parsed[key] = value;
+        parsed.to_string()
+    }
+
+    /// Of the two places Claude Code sends a `previous_message_id`, only `thread` names state
+    /// the request depends on. `diagnostics` rides on the full-history replay the client sends
+    /// AFTER a thread was lost; binding on it pinned the recovery request to the account that
+    /// had just failed it (2026-09-22). The `thread` half is the control: the same id there
+    /// still holds the request to the account that minted it.
+    #[tokio::test]
+    async fn only_the_thread_previous_message_id_binds() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+
+        // Turn 1 on its own session mints `msg_fake_1` on account 0 (priority order).
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-mint", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        let minting_auth = seen.lock().expect("recorder")[0].clone();
+        assert_eq!(
+            manager.bound_token_account(&["msg_fake_1".to_string()]),
+            Some((0, BoundTokenKind::MessageId)),
+            "precondition: the response's message id was recorded against account 0"
+        );
+
+        // A second session pinned to account 1.
+        manager.mark_rate_limited(0, 60);
         let (status, _) = drive_conversation(
             Arc::clone(&manager),
-            &thinking_turn_body("sess-pinned", &[]),
+            &thinking_turn_body("sess-replay", &[]),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        manager.clear_rate_limited(0);
+        let pinned_auth = seen.lock().expect("recorder")[1].clone();
+        assert_ne!(
+            pinned_auth, minting_auth,
+            "control: the pin is the OTHER account"
+        );
+
+        let diagnostics = with_body_field(
+            &thinking_turn_body("sess-replay", &[]),
+            "diagnostics",
+            serde_json::json!({"previous_message_id": "msg_fake_1"}),
+        );
+        let (status, _) = drive_conversation(Arc::clone(&manager), &diagnostics).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.lock().expect("recorder")[2],
+            pinned_auth,
+            "a diagnostics id binds nothing: the session's own pin decides"
+        );
+
+        let thread = with_body_field(
+            &thinking_turn_body("sess-replay", &[]),
+            "thread",
+            serde_json::json!({"type": "continue", "previous_message_id": "msg_fake_1"}),
+        );
+        let (status, _) = drive_conversation(Arc::clone(&manager), &thread).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.lock().expect("recorder")[3],
+            minting_auth,
+            "a thread id holds the request to the account that holds the thread"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     /// A token this process never minted — from before this shipped, or aged out of the map —
