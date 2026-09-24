@@ -385,6 +385,45 @@ pub(crate) fn classify_transient_429(
     }
 }
 
+/// Whether an upstream `429` refused the REQUEST rather than the account, so it is
+/// forwarded to the client as-is instead of parking the account and rotating.
+///
+/// True only when both hold:
+/// - upstream gave no quota guidance at all: no `unified-*` rejection, no
+///   `retry-after` header, no `anthropic-ratelimit-unified-status` header;
+/// - the request lacks `?beta=true`, which Claude Code's own client puts on every
+///   `/v1/messages` call (10,575 of 10,575 on 2026-09-24).
+///
+/// Measured over this proxy's log for 2026-09-20 to 2026-09-24: all 1,704 upstream
+/// 429s on `/v1/messages` without `?beta=true` carried no guidance, and an account
+/// that refused one such request served the same client's next request 0.4 s
+/// later. The refusal followed the request, not the account. Each of those 429s
+/// used to park the account for 15 to 20 s and rotate to the next, so one direct
+/// API client walked the fleet into "All 18 accounts exhausted" for every Claude
+/// Code session behind it.
+///
+/// Claude Code traffic also draws no-guidance 429s (93 in the same window) and
+/// keeps the park-and-rotate handling: nothing measured says those are about the
+/// request.
+pub(crate) fn is_request_scoped_429(
+    path_and_query: &str,
+    up_headers: &HeaderMap,
+    quota_rejected: bool,
+) -> bool {
+    let guided = quota_rejected
+        || up_headers.contains_key("retry-after")
+        || up_headers.contains_key("anthropic-ratelimit-unified-status");
+    !guided && !carries_beta_flag(path_and_query)
+}
+
+/// Whether the query string has a `beta=true` pair, the mark Claude Code's client
+/// (the Anthropic SDK's beta namespace) puts on every Messages call.
+fn carries_beta_flag(path_and_query: &str) -> bool {
+    path_and_query
+        .split_once('?')
+        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "beta=true"))
+}
+
 /// Decide whether an all-accounts-unavailable state is a *transient* fleet-park
 /// worth soft-waiting (Some(secs) to sleep) vs genuine exhaustion (None → hard 429).
 /// `soonest_free_secs` is `Manager::retry_after_hint`; `already_waited` caps us to
@@ -3714,71 +3753,92 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 model = request_model.as_deref().unwrap_or("?"),
                 "429 diagnostic"
             );
-            // Upstream's own words for this 429, which the headers above cannot
-            // give when it carries none (`quota_rejected=false`, every header
-            // `<absent>`). Every path out of this arm `continue`s, so the body was
-            // always discarded unread; reading it here costs one small buffer.
-            // Bounded in time as well as size: this arm used to return without
-            // touching the body, so a body that never completes must not become
-            // a hang it did not have before.
-            match tokio::time::timeout(
-                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
-                read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
-            )
-            .await
-            {
-                Ok(Ok(body)) => {
-                    log_upstream_error_body(idx, account_name.as_deref(), status, &body)
-                }
-                Ok(Err(_)) | Err(_) => tracing::warn!(
+            let retry_after_raw = parse_retry_after(&up_headers);
+            // A 429 about the REQUEST, not the account: no quota guidance at all, on
+            // a request that did not come through Claude Code's own client. Parking
+            // the account for it is wrong and rotating is wasted, so it is forwarded
+            // as-is and every account stays in rotation. See
+            // [`is_request_scoped_429`] for the measurements that draw this line.
+            if is_request_scoped_429(&path_and_query, &up_headers, !rejections.is_empty()) {
+                tracing::warn!(
                     account = account_name.as_deref().unwrap_or("?"),
                     account_index = idx,
-                    "upstream 429 body could not be read within the cap"
-                ),
-            }
-            let retry_after_raw = parse_retry_after(&up_headers);
-            let retry_after = retry_after_raw.unwrap_or(60);
-            if !rejections.is_empty() {
-                // A model-scoped rejection is recorded in the window the selector
-                // already gates that model class on, NOT as an account-wide hold:
-                // the account still serves every other model class, and the window
-                // self-frees at its own reset (issue #178). A rejection any shared
-                // scope reports is account-wide and still arms the hold — clamped
-                // to `MAX_RATE_LIMIT_HOLD_SECONDS` by `mark_rate_limited`, whose
-                // doc-comment explains why durable exhaustion must be carried by
-                // the learned quota rather than by an unbounded hold.
-                if rejections.contains(&UnifiedRejectionKind::FableWeekly) {
-                    manager.mark_model_weekly_rejected(idx, &up_headers);
-                }
-                if rejections
-                    .iter()
-                    .any(|kind| !matches!(kind, UnifiedRejectionKind::FableWeekly))
+                    path = %path_and_query,
+                    "upstream 429 with no quota guidance on a request without ?beta=true: \
+                     refused for the request, not the account, so it is forwarded and no \
+                     account is parked"
+                );
+                // Falls through to the terminal outcome below, which counts the
+                // request, logs the body (`log_upstream_error_body`) and forwards it
+                // verbatim, the same path a 400 or a spent 529 takes.
+            } else {
+                // Upstream's own words for this 429, which the headers above cannot
+                // give when it carries none (`quota_rejected=false`, every header
+                // `<absent>`). Every path out of this branch `continue`s, so the body was
+                // always discarded unread; reading it here costs one small buffer.
+                // Bounded in time as well as size: this arm used to return without
+                // touching the body, so a body that never completes must not become
+                // a hang it did not have before.
+                match tokio::time::timeout(
+                    Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                    read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
+                )
+                .await
                 {
-                    manager
-                        .mark_rate_limited(idx, jittered_quota_hold(retry_after, now.nanosecond()));
+                    Ok(Ok(body)) => {
+                        log_upstream_error_body(idx, account_name.as_deref(), status, &body)
+                    }
+                    Ok(Err(_)) | Err(_) => tracing::warn!(
+                        account = account_name.as_deref().unwrap_or("?"),
+                        account_index = idx,
+                        "upstream 429 body could not be read within the cap"
+                    ),
                 }
-                tried.insert(idx);
-                continue;
-            }
-            let count = retried_429.entry(idx).or_insert(0);
-            // Desync the no-guidance un-park across accounts that tripped together;
-            // derive the jitter from the loop clock so no `rand` dependency is needed.
-            let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
-            match classify_transient_429(retry_after_raw, *count, jitter) {
-                Transient429::InlineWait(wait) => {
-                    *count += 1;
-                    tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                    next_idx = Some(idx);
-                    continue; // retry the same account after the bounded wait
-                }
-                Transient429::Park(wait) => {
-                    manager.mark_rate_limited(idx, wait);
+                let retry_after = retry_after_raw.unwrap_or(60);
+                if !rejections.is_empty() {
+                    // A model-scoped rejection is recorded in the window the selector
+                    // already gates that model class on, NOT as an account-wide hold:
+                    // the account still serves every other model class, and the window
+                    // self-frees at its own reset (issue #178). A rejection any shared
+                    // scope reports is account-wide and still arms the hold — clamped
+                    // to `MAX_RATE_LIMIT_HOLD_SECONDS` by `mark_rate_limited`, whose
+                    // doc-comment explains why durable exhaustion must be carried by
+                    // the learned quota rather than by an unbounded hold.
+                    if rejections.contains(&UnifiedRejectionKind::FableWeekly) {
+                        manager.mark_model_weekly_rejected(idx, &up_headers);
+                    }
+                    if rejections
+                        .iter()
+                        .any(|kind| !matches!(kind, UnifiedRejectionKind::FableWeekly))
+                    {
+                        manager.mark_rate_limited(
+                            idx,
+                            jittered_quota_hold(retry_after, now.nanosecond()),
+                        );
+                    }
                     tried.insert(idx);
-                    // Record WHY this entry is in `tried`: a timer that expires on
-                    // its own, so the soft-wait above may take it back. Every other
-                    // `tried.insert` in this loop deliberately omits this.
-                    parked_transient.insert(idx);
                     continue;
+                }
+                let count = retried_429.entry(idx).or_insert(0);
+                // Desync the no-guidance un-park across accounts that tripped together;
+                // derive the jitter from the loop clock so no `rand` dependency is needed.
+                let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+                match classify_transient_429(retry_after_raw, *count, jitter) {
+                    Transient429::InlineWait(wait) => {
+                        *count += 1;
+                        tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+                        next_idx = Some(idx);
+                        continue; // retry the same account after the bounded wait
+                    }
+                    Transient429::Park(wait) => {
+                        manager.mark_rate_limited(idx, wait);
+                        tried.insert(idx);
+                        // Record WHY this entry is in `tried`: a timer that expires on
+                        // its own, so the soft-wait above may take it back. Every other
+                        // `tried.insert` in this loop deliberately omits this.
+                        parked_transient.insert(idx);
+                        continue;
+                    }
                 }
             }
         }
@@ -14150,6 +14210,133 @@ mod tests {
             "no attempt of {ATTEMPTS} logged both an `upstream error response` and a \
              `429 diagnostic` line for the upstream 429; last log: {log:?}"
         );
+    }
+
+    /// A `429` with no quota guidance at all (no `retry-after`, no `unified-*`
+    /// header) and upstream's own error body. A direct API client draws this shape
+    /// on `/v1/messages` without `?beta=true`.
+    fn raw_429_no_guidance() -> String {
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"upstream-own-words"}}"#;
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The request-scoped arm: a no-guidance 429 on a request WITHOUT `?beta=true`
+    /// reaches the client with upstream's own body after ONE upstream attempt, and
+    /// no account is parked. Before the fix the same reply parked the account and
+    /// rotated, so account `b` answered and one direct client could walk the whole
+    /// fleet into "exhausted" for everyone else.
+    #[tokio::test]
+    async fn a_no_guidance_429_without_the_beta_flag_is_forwarded_and_parks_nothing() {
+        let (up_addr, attempts) =
+            spawn_counted_upstream(vec![Some(raw_429_no_guidance()), Some(raw_200())]).await;
+        let manager = fleet_configured(up_addr, &["a", "b"], |_| {});
+
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            "/v1/messages",
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"model":"claude-opus-5-5","messages":[]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the forwarded body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("upstream-own-words"),
+            "the client must get upstream's own 429 body, not a synthesized one: {body:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a request-scoped 429 must not rotate to another account"
+        );
+        let parked: Vec<_> = manager
+            .snapshot(OffsetDateTime::now_utc())
+            .accounts
+            .into_iter()
+            .filter(|a| a.rate_limited_until.is_some())
+            .map(|a| a.name)
+            .collect();
+        assert!(
+            parked.is_empty(),
+            "no account may be parked, got {parked:?}"
+        );
+    }
+
+    /// The other side of the line: the SAME no-guidance 429 on a Claude Code
+    /// request (`?beta=true`) keeps the park-and-rotate handling, because nothing
+    /// measured says those are about the request.
+    #[tokio::test]
+    async fn a_no_guidance_429_with_the_beta_flag_still_parks_and_rotates() {
+        let (up_addr, attempts) =
+            spawn_counted_upstream(vec![Some(raw_429_no_guidance()), Some(raw_200())]).await;
+        let manager = fleet_configured(up_addr, &["a", "b"], |_| {});
+
+        let response = drive_full(
+            Arc::clone(&manager),
+            Method::POST,
+            "/v1/messages?beta=true",
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"model":"claude-opus-5-5","messages":[]}"#,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the second account answers"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let parked = manager
+            .snapshot(OffsetDateTime::now_utc())
+            .accounts
+            .into_iter()
+            .filter(|a| a.rate_limited_until.is_some())
+            .count();
+        assert_eq!(
+            parked, 1,
+            "the account that answered 429 is parked, as before"
+        );
+    }
+
+    #[test]
+    fn request_scoped_429_needs_no_guidance_and_no_beta_flag() {
+        let none = HeaderMap::new();
+        let mut retry = HeaderMap::new();
+        retry.insert("retry-after", HeaderValue::from_static("5"));
+        let mut unified = HeaderMap::new();
+        unified.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed"),
+        );
+
+        assert!(is_request_scoped_429("/v1/messages", &none, false));
+        assert!(is_request_scoped_429("/v1/messages?foo=1", &none, false));
+        assert!(is_request_scoped_429(
+            "/v1/messages?beta=false",
+            &none,
+            false
+        ));
+        assert!(!is_request_scoped_429(
+            "/v1/messages?beta=true",
+            &none,
+            false
+        ));
+        assert!(!is_request_scoped_429(
+            "/v1/messages?x=1&beta=true",
+            &none,
+            false
+        ));
+        assert!(!is_request_scoped_429("/v1/messages", &retry, false));
+        assert!(!is_request_scoped_429("/v1/messages", &unified, false));
+        assert!(!is_request_scoped_429("/v1/messages", &none, true));
     }
 
     /// The relay paths are served with the CALLER's own credential, so their
