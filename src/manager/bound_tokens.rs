@@ -293,6 +293,22 @@ impl Manager {
         }
     }
 
+    /// Whether this session was told, within [`SWITCH_WARNING_TTL_MS`], that its held
+    /// conversation is moving off account `idx`: the read-only half of
+    /// [`Self::first_switch_warning`].
+    ///
+    /// The request path reads it before [`Self::bound_account_holds`], so a warning is a
+    /// commitment. The warning says the retry moves the conversation; an account whose hold
+    /// crept back under the cache's life in the 3 s before the retry would otherwise hold it
+    /// again and answer the retry with a 429 of its own (found in review, 2026-09-24).
+    pub fn switch_warned(&self, session_key: u64, idx: usize, now_ms: i64) -> bool {
+        self.bound_switch_warned
+            .lock()
+            .expect("bound switch warned map poisoned")
+            .get(&(session_key, idx))
+            .is_some_and(|&at| now_ms.saturating_sub(at) < SWITCH_WARNING_TTL_MS)
+    }
+
     /// The map as persistable records — each live entry's index replaced by the identity of the
     /// account at that index.
     ///
@@ -610,6 +626,45 @@ mod tests {
         assert!(manager.first_bound_history_hold(11));
         assert!(!manager.first_bound_history_hold(11));
         assert!(manager.first_bound_history_hold(22));
+    }
+
+    /// `select_bound` serves the held account only where this request may go. Its strict-group
+    /// check is the only thing keeping a group-scoped request inside its group on this path,
+    /// because `bound_account_holds` passes an account outside a strict group (found in review,
+    /// 2026-09-24).
+    #[test]
+    fn select_bound_serves_the_held_account_only_where_this_request_may_go() {
+        let mut member = account("a@example.com", "uuid-a");
+        member.groups = Some(vec!["g".to_string()]);
+        let manager = manager_over(&[member]);
+        let now = OffsetDateTime::now_utc();
+        let untried = HashSet::new();
+        assert_eq!(
+            manager.select_bound(0, &untried, now, false, Some("g"), Some("g")),
+            Some(0),
+            "a member of the strict group it asked for"
+        );
+        assert_eq!(
+            manager.select_bound(0, &untried, now, false, Some("other"), Some("other")),
+            None,
+            "outside the strict group it asked for"
+        );
+        assert_eq!(
+            manager.select_bound(0, &HashSet::from([0]), now, false, None, None),
+            None,
+            "already failed this request"
+        );
+        assert_eq!(
+            manager.select_bound(1, &untried, now, false, None, None),
+            None,
+            "no such account"
+        );
+        manager.mark_rate_limited(0, 60);
+        assert_eq!(
+            manager.select_bound(0, &untried, now, false, None, None),
+            None,
+            "on a live hold"
+        );
     }
 
     /// One warning per session per account, so the client's retry of the warning moves; told
