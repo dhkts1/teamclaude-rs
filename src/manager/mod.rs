@@ -1148,6 +1148,11 @@ pub struct Manager {
     /// Session keys already logged as held to their pin by bound history, so a long
     /// conversation costs one line and not one per turn. Diagnostic only: nothing routes on it.
     bound_history_logged: Mutex<HashSet<u64>>,
+    /// `(session key, account index)` → when that session was told its held conversation is
+    /// moving off that account, so the warning is one 429 and the client's retry moves it.
+    /// Unlike [`Self::bound_history_logged`] this one routes: see
+    /// [`Self::first_switch_warning`].
+    bound_switch_warned: Mutex<HashMap<(u64, usize), i64>>,
     /// Per-session serving stats (session key → account/count/last-seen), for
     /// live per-session visibility in the TUI. Separate from `affinity` so the
     /// routing pin stays byte-for-byte unchanged; bounded in `record_served`.
@@ -1492,6 +1497,7 @@ impl Manager {
             bound_tokens: Mutex::new(HashMap::new()),
             bound_tokens_dirty: AtomicBool::new(false),
             bound_history_logged: Mutex::new(HashSet::new()),
+            bound_switch_warned: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
             wire_sessions_dirty: AtomicBool::new(false),

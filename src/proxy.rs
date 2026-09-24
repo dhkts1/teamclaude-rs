@@ -2657,13 +2657,30 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         (None, _) => None,
     };
     let mut bound_to: Option<usize> = None;
+    // The accounts the hold benched, and only those, so a release mid-request can re-admit
+    // them without re-admitting what another rule benched: `tried` already carries the
+    // account-set scope of a borrowed request (above), and that bench is the lease's only
+    // enforcement on this path. Clearing `tried` wholesale served a lease scoped to one
+    // account on another (found in review, 2026-09-24).
+    let mut benched_for_hold: Vec<usize> = Vec::new();
     if let Some((bound_idx, via)) = bound_candidate {
         let now = OffsetDateTime::now_utc();
-        if manager.bound_account_holds(bound_idx, now, request_is_fable, request_group.as_deref()) {
+        // A session already told this conversation is moving off `bound_idx` moves, even if the
+        // account has crept back inside the hold since: the warning said the retry moves it.
+        let told =
+            session_key.is_some_and(|key| manager.switch_warned(key, bound_idx, crate::now_ms()));
+        if !told
+            && manager.bound_account_holds(
+                bound_idx,
+                now,
+                request_is_fable,
+                request_group.as_deref(),
+            )
+        {
             bound_to = Some(bound_idx);
             for idx in 0..account_count {
-                if idx != bound_idx {
-                    tried.insert(idx);
+                if idx != bound_idx && tried.insert(idx) {
+                    benched_for_hold.push(idx);
                 }
             }
             if via == "session-pin" {
@@ -2681,6 +2698,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 );
             }
         } else {
+            // Told first, once: the client's retry of this 429 is the request that moves.
+            if let Some(warning) = switch_warning(
+                &manager,
+                session_key,
+                bound_idx,
+                now,
+                request_is_fable,
+                request_group.as_deref(),
+            ) {
+                return warning;
+            }
             tracing::info!(
                 account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
                 kind = via,
@@ -3073,15 +3101,83 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             // strict arm in `select_with_group` refused to. A
                             // reserved group falls straight through to the honest
                             // 429 instead.
-                            if strict_group.is_none() && manager.revalidation_serve_enabled() {
-                                if let Some(idx) = manager.select_revalidation(
+                            //
+                            // HELD HISTORY IS NOT A FLEET QUESTION. A request held to
+                            // its bound account has every other account benched, so
+                            // "the whole fleet is over the threshold" here means only
+                            // "that one account is", and the fleet's revalidation
+                            // window (one serve per 2 s, shared by every session) is
+                            // the wrong gate for it: the turn that lost the race got
+                            // a 429 naming the account's 5-hour window, which Claude
+                            // Code shows as "You've hit your session limit"
+                            // (2026-09-24). `bound_account_holds` already decided the
+                            // soft threshold does not release this conversation, so
+                            // the serve agrees with it: `Manager::select_bound`.
+                            //
+                            // And when the held account went out DURING this request
+                            // (an upstream rejection on it just turned
+                            // `bound_account_holds` to no), this is the same move the
+                            // top of the handler makes on a later turn, so it gets the
+                            // same answer now instead of a 429 that waits for that
+                            // turn: the warning once, then the fleet.
+                            if let Some(bound) = bound_to {
+                                if !manager.bound_account_holds(
+                                    bound,
+                                    now,
+                                    request_is_fable,
+                                    request_group.as_deref(),
+                                ) {
+                                    if let Some(warning) = switch_warning(
+                                        &manager,
+                                        session_key,
+                                        bound,
+                                        now,
+                                        request_is_fable,
+                                        request_group.as_deref(),
+                                    ) {
+                                        return warning;
+                                    }
+                                    tracing::info!(
+                                        account =
+                                            manager.account_name(bound).as_deref().unwrap_or("?"),
+                                        "bound history's account went out during the request; \
+                                         releasing the request to the fleet"
+                                    );
+                                    // Re-admit only what the hold benched: a lease's
+                                    // account-set scope stays benched (see
+                                    // `benched_for_hold`), and so does `bound`, which
+                                    // failed this request.
+                                    for idx in benched_for_hold.drain(..) {
+                                        tried.remove(&idx);
+                                    }
+                                    bound_to = None;
+                                    continue;
+                                }
+                            }
+                            let served = match bound_to {
+                                Some(bound) => manager.select_bound(
+                                    bound,
                                     &tried,
                                     now,
-                                    request_model.as_deref(),
-                                    session_key,
-                                ) {
-                                    idx
-                                } else {
+                                    request_is_fable,
+                                    request_group.as_deref(),
+                                    strict_group,
+                                ),
+                                None if strict_group.is_none()
+                                    && manager.revalidation_serve_enabled() =>
+                                {
+                                    manager.select_revalidation(
+                                        &tried,
+                                        now,
+                                        request_model.as_deref(),
+                                        session_key,
+                                    )
+                                }
+                                None => None,
+                            };
+                            match served {
+                                Some(idx) => idx,
+                                None => {
                                     return exhausted_or_fallback(
                                         &manager,
                                         now,
@@ -3093,17 +3189,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     )
                                     .await;
                                 }
-                            } else {
-                                return exhausted_or_fallback(
-                                    &manager,
-                                    now,
-                                    account_count,
-                                    request_is_fable,
-                                    strict_group,
-                                    bound_to,
-                                    fallback_ask.as_ref(),
-                                )
-                                .await;
                             }
                         }
                     }
@@ -5605,7 +5690,8 @@ async fn exhausted_or_fallback(
 /// client maps to its own limit types, and the client renders a usage limit with
 /// the real reset instant. A hold or an unknown gate stays a plain 429: an
 /// upstream `retry-after` is not the user's usage limit, and claiming one would
-/// be the same lie in the other direction.
+/// be the same lie in the other direction. So does a 429 for held history
+/// (`bound_to`), whatever gates its one account: see the comment at the claim.
 ///
 /// The `retry-after` figure is computed live from when an account actually
 /// frees, never a constant — the only fixed number here is the 60 the hint falls
@@ -5633,7 +5719,7 @@ fn exhausted_response(
     let when = match hint.free_at {
         Some(at) => format!(
             "Retry in {retry_after}s (soonest account frees at {}).",
-            at_utc(at)
+            at_utc(at, now)
         ),
         None => format!("No account reports a reset time; retry in {retry_after}s."),
     };
@@ -5667,7 +5753,16 @@ fn exhausted_response(
         &detail,
         Some(advertised_retry_after),
     );
-    if let (Some(claim), Some(at)) = (hint.binding.and_then(unified_claim_for), hint.free_at) {
+    // Held history never carries a claim. The held account's window is not this user's limit:
+    // an account that is really out releases the conversation to the fleet
+    // (`Manager::bound_account_holds`), so a 429 that reaches here for held history is a wait
+    // on one account, and a claim would have Claude Code show "You've hit your session limit"
+    // and stop, where a plain 429 is retried by the client on its own.
+    let claim = match bound_to {
+        Some(_) => None,
+        None => hint.binding.and_then(unified_claim_for),
+    };
+    if let (Some(claim), Some(at)) = (claim, hint.free_at) {
         let headers = response.headers_mut();
         headers.insert(
             "anthropic-ratelimit-unified-status",
@@ -5719,27 +5814,102 @@ fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
     }
 }
 
+/// How long the client is asked to wait before retrying [`switch_warning`]'s 429.
+///
+/// Long enough that the warning is on screen for a moment before the retry clears it, short
+/// enough that a switch, which happens once per conversation per account running out, costs
+/// the user a few seconds and no action.
+const SWITCH_WARNING_RETRY_AFTER_SECS: i64 = 3;
+
+/// The one 429 a held conversation gets before tcr moves it to another account, or `None`
+/// when it should just move.
+///
+/// A move costs the conversation its prompt cache, and before this it happened silently; the
+/// operator asked to be told first (2026-09-24). The 429 is PLAIN, with no unified quota
+/// headers, because only a plain one shows this text: measured against Claude Code 2.1.281, a
+/// plain 429 prints "API Error: Server is temporarily limiting requests (not your usage
+/// limit) · <this message>" and is retried by the client on its own, while one carrying a
+/// claim prints "You've hit your session limit" and drops the text. The retry is the request
+/// that moves ([`Manager::first_switch_warning`] answers no the second time, and
+/// [`Manager::switch_warned`] releases it even if the account crept back meanwhile).
+///
+/// `None`, and the request moves silently as it did before, in three cases:
+/// - this session was already told about this account;
+/// - there is no session key to remember the warning by, so warning would warn the retry too,
+///   forever;
+/// - only this request's MODEL CLASS is out (a Fable request on an account out of its Fable
+///   weekly window). Then just this one request diverts and the conversation stays where it
+///   is, so there is no move to announce, and announcing one would spend the session's one
+///   warning on a move that never happens.
+///
+/// Names no account, because the body can travel to a borrowing peer.
+fn switch_warning(
+    manager: &Manager,
+    session_key: Option<u64>,
+    bound_idx: usize,
+    now: OffsetDateTime,
+    is_fable: bool,
+    group: Option<&str>,
+) -> Option<Response> {
+    let key = session_key?;
+    if is_fable && manager.bound_account_holds(bound_idx, now, false, group) {
+        return None;
+    }
+    if !manager.first_switch_warning(key, bound_idx, crate::now_ms()) {
+        return None;
+    }
+    let hint = manager.exhaustion_hint_for_account(now, is_fable, bound_idx);
+    // `binding` is only the gate that TIMES a wait; a terminal one (rejected, disabled, a dead
+    // login) has no clear instant and leaves it `None`. Over one account, `gated` holds that
+    // account's own reason either way.
+    let why = hint
+        .binding
+        .or_else(|| hint.gated.keys().next().copied())
+        .map_or("unavailable", gate_phrase);
+    let until = hint
+        .free_at
+        .map(|at| format!(" until {}", at_utc(at, now)))
+        .unwrap_or_default();
+    tracing::info!(
+        account = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
+        binding = ?hint.binding,
+        retry_after = SWITCH_WARNING_RETRY_AFTER_SECS,
+        "held conversation's account is out; warning the client once before moving it"
+    );
+    Some(error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limit_error",
+        &format!(
+            "tcr: the account holding this conversation is out ({why}{until}); the retry moves \
+             it to another account, where its prompt cache starts cold."
+        ),
+        Some(SWITCH_WARNING_RETRY_AFTER_SECS),
+    ))
+}
+
+/// What a gate means, in words a person reads after an account count or after "out".
+fn gate_phrase(reason: GateReason) -> &'static str {
+    match reason {
+        GateReason::Ok => "in rotation",
+        GateReason::Hold => "on an upstream hold",
+        GateReason::FiveHour => "in the 5-hour window",
+        GateReason::SevenDay => "in the weekly window",
+        GateReason::FableWeekly => "in the Fable weekly window",
+        GateReason::Standard => "at a token limit",
+        GateReason::Login => "needing re-login",
+        GateReason::Rejected => "rejected upstream",
+        GateReason::Disabled => "disabled",
+        GateReason::Reserved => "reserved for another group",
+        GateReason::Parked => "in a parked group",
+    }
+}
+
 /// `: 3 in the 5-hour window, 1 on an upstream hold` — or empty when nothing is
 /// gated, so the message never ends in a dangling colon.
 fn describe_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
     let parts: Vec<String> = gated
         .iter()
-        .map(|(reason, n)| {
-            let what = match reason {
-                GateReason::Ok => "in rotation",
-                GateReason::Hold => "on an upstream hold",
-                GateReason::FiveHour => "in the 5-hour window",
-                GateReason::SevenDay => "in the weekly window",
-                GateReason::FableWeekly => "in the Fable weekly window",
-                GateReason::Standard => "at a token limit",
-                GateReason::Login => "needing re-login",
-                GateReason::Rejected => "rejected upstream",
-                GateReason::Disabled => "disabled",
-                GateReason::Reserved => "reserved for another group",
-                GateReason::Parked => "in a parked group",
-            };
-            format!("{n} {what}")
-        })
+        .map(|(reason, n)| format!("{n} {}", gate_phrase(*reason)))
         .collect();
     if parts.is_empty() {
         String::new()
@@ -5748,9 +5918,18 @@ fn describe_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> Stri
     }
 }
 
-/// `HH:MM:SS UTC` for a message a human reads next to a seconds count.
-fn at_utc(at: OffsetDateTime) -> String {
-    format!("{:02}:{:02}:{:02} UTC", at.hour(), at.minute(), at.second())
+/// `HH:MM:SS UTC` for a message a human reads next to a seconds count, with the date in front
+/// once the instant is a day or more after `now`.
+///
+/// It was the time alone, which reads as today: the live log of 2026-09-24 carries "Retry in
+/// 260209s (soonest account frees at 13:00:00 UTC)" for a weekly window three days out.
+fn at_utc(at: OffsetDateTime, now: OffsetDateTime) -> String {
+    let clock = format!("{:02}:{:02}:{:02} UTC", at.hour(), at.minute(), at.second());
+    if at - now < time::Duration::DAY {
+        clock
+    } else {
+        format!("{} {clock}", at.date())
+    }
 }
 
 /// Whether a 502 is the honest verdict: at least one attempt failed in transport
@@ -11034,6 +11213,9 @@ mod tests {
     /// (2026-09-22). The sibling rejects the bound state once and Claude Code recovers on its
     /// own, by stripping it or replaying the thread; see `crate::manager::bound_tokens`.
     ///
+    /// The move is told first: the first request gets one plain 429 saying so, spending no
+    /// account, and the client's retry of it is the request that moves (`switch_warning`).
+    ///
     /// The bench still exists while the bound account is alive:
     /// `a_bound_token_pins_later_turns_to_the_minting_account` is that control.
     #[tokio::test]
@@ -11054,22 +11236,520 @@ mod tests {
             Some(0),
             "precondition: the history IS bound, to the account that is out"
         );
+        let turn = thinking_turn_body("sess-pinned", &["sig_fake_1"]);
 
-        let (status, body) = drive_conversation(
-            Arc::clone(&manager),
-            &thinking_turn_body("sess-pinned", &["sig_fake_1"]),
-        )
-        .await;
+        let (status, body) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first request is told the conversation is moving: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("(disabled)"),
+            "and why: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the warning spends no account"
+        );
+
+        let (status, body) = drive_conversation(Arc::clone(&manager), &turn).await;
         assert_eq!(
             status,
             StatusCode::OK,
-            "bound to an account that cannot serve, the request goes to one that can: {}",
+            "bound to an account that cannot serve, the retry goes to one that can: {}",
             String::from_utf8_lossy(&body)
         );
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the sibling served it"
+        );
+    }
+
+    /// A bound account over the SOFT threshold still holds its conversation
+    /// (`Manager::bound_account_holds` ignores the threshold on purpose), so it must also SERVE
+    /// it, on every turn. It used to reach the fleet's last-resort revalidation serve, which lets
+    /// one request through per 2 s across the whole fleet: the turn that lost that race got an
+    /// exhausted 429 naming the 5-hour window, and Claude Code renders that claim as "session
+    /// limit". Measured 2026-09-24: 3 of 3 such 429s came 0.05-1.4 s after another turn on the
+    /// same account, while four other accounts sat at 0%.
+    ///
+    /// The session is pinned to the OTHER account on purpose. When the pin IS the bound account,
+    /// the affinity fast-path already serves it over the threshold and this never happened.
+    #[tokio::test]
+    async fn a_bound_account_over_the_soft_threshold_serves_every_turn() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+
+        // Pin the session to account 1, by the same route the pin test above uses.
+        manager.mark_rate_limited(0, 60);
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-held", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        manager.clear_rate_limited(0);
+        let pin_key = stable_hash("uid:", "sess-held");
+        let pinned_before = manager.affinity_pin(pin_key);
+        assert_eq!(
+            pinned_before,
+            Some(1),
+            "precondition: the session is pinned to account 1"
+        );
+        let pinned_auth = seen.lock().expect("recorder")[0].clone();
+
+        // The history is signed on account 0, and account 0 reads over the soft threshold (0.90
+        // in `dummy_config`) on its 5-hour window, through the same headers a live reply carries.
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+        let mut over = HeaderMap::new();
+        over.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.96"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_str(&(crate::now_ms() / 1000 + 660).to_string())
+                .expect("reset header"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed_warning"),
+        );
+        manager.update_quota(0, &over);
+
+        // Three turns back to back, all inside one 2 s revalidation window.
+        for turn in 1..=3 {
+            let response = drive_conversation_full(
+                Arc::clone(&manager),
+                &thinking_turn_body("sess-held", &["sig_held"]),
+            )
+            .await;
+            let status = response.status();
+            let claim = response
+                .headers()
+                .get("anthropic-ratelimit-unified-representative-claim")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .expect("read body");
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "turn {turn}: a held conversation on an account over the soft threshold is served \
+                 there, not refused (claim={claim:?}): {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let seen = seen.lock().expect("recorder");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(
+            seen[1..].iter().all(|auth| *auth != pinned_auth),
+            "every held turn reached the signing account, never the pin: {seen:?}"
+        );
+        assert_eq!(
+            manager.affinity_pin(pin_key),
+            pinned_before,
+            "serving the held account is for these requests; the session's pin stays"
+        );
+    }
+
+    /// An instant under a day away reads as a time; one a day or more away carries its date, so
+    /// a weekly window three days out is not read as later today.
+    #[test]
+    fn a_reset_a_day_or_more_away_carries_its_date() {
+        let now = time::macros::datetime!(2026-09-24 12:43:11 UTC);
+        assert_eq!(
+            at_utc(now + time::Duration::minutes(17), now),
+            "13:00:11 UTC"
+        );
+        assert_eq!(
+            at_utc(now + time::Duration::seconds(260_209), now),
+            "2026-09-27 13:00:00 UTC"
+        );
+    }
+
+    /// A 429 for held history never claims a quota window, even when its one account is over
+    /// the threshold on its 5-hour window. The claim makes Claude Code print "You've hit your
+    /// session limit" and stop (measured 2026-09-24 against Claude Code 2.1.281), and it is
+    /// false for held history, whose account releases the conversation to the fleet once it is
+    /// really out. A plain 429 is retried by the client on its own.
+    ///
+    /// The control is the same fleet with no history held: every account is over, so the
+    /// fleet's 429 still names the window.
+    #[tokio::test]
+    async fn a_held_429_never_claims_a_quota_window() {
+        let manager = Manager::with_live_refresher(
+            two_accounts_over("http://127.0.0.1:9", &[false, false]),
+            None,
+        );
+        let mut over = HeaderMap::new();
+        over.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.96"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_str(&(crate::now_ms() / 1000 + 660).to_string())
+                .expect("reset header"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed_warning"),
+        );
+        manager.update_quota(0, &over);
+        manager.update_quota(1, &over);
+        let now = OffsetDateTime::now_utc();
+        let claim = |response: &Response| {
+            response
+                .headers()
+                .get("anthropic-ratelimit-unified-representative-claim")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let fleet = exhausted_response(&manager, now, 2, false, None, None);
+        assert_eq!(
+            claim(&fleet).as_deref(),
+            Some("five_hour"),
+            "control: with no history held, the fleet's 429 names the window"
+        );
+
+        let held = exhausted_response(&manager, now, 2, false, None, Some(0));
+        assert_eq!(held.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(claim(&held), None, "a held 429 names no window");
+        assert!(
+            held.headers()
+                .get("anthropic-ratelimit-unified-status")
+                .is_none(),
+            "and carries no unified status, so the client retries it"
+        );
+    }
+
+    /// An upstream on which the FIRST test account (`at-aaaaaaaaaaaa`) is out, answering every
+    /// request with a `rejected` 429 on its 5-hour window, and every other account serves a
+    /// 200. Counts each side's hits, which is how these tests read who was asked.
+    async fn spawn_first_account_out_upstream() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits_first = Arc::new(AtomicUsize::new(0));
+        let hits_other = Arc::new(AtomicUsize::new(0));
+        let (first, other) = (Arc::clone(&hits_first), Arc::clone(&hits_other));
+        let reset = (crate::now_ms() / 1000 + 3600).to_string();
+        let upstream = Router::new().fallback(move |req: Request| {
+            let (first, other, reset) = (Arc::clone(&first), Arc::clone(&other), reset.clone());
+            async move {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                if auth.contains("at-aaaaaaaaaaaa") {
+                    first.fetch_add(1, Ordering::SeqCst);
+                    return Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("retry-after", "3600")
+                        .header("anthropic-ratelimit-unified-status", "rejected")
+                        .header("anthropic-ratelimit-unified-5h-status", "rejected")
+                        .header("anthropic-ratelimit-unified-5h-utilization", "1.0")
+                        .header("anthropic-ratelimit-unified-5h-reset", reset)
+                        .body(Body::from(
+                            r#"{"type":"error","error":{"type":"rate_limit_error","message":"out"}}"#,
+                        ))
+                        .expect("429 response");
+                }
+                other.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"msg_fake_ok","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+                    ))
+                    .expect("200 response")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let addr = listener.local_addr().expect("upstream addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        (format!("http://{addr}"), hits_first, hits_other)
+    }
+
+    /// `/v1/messages` with NO `SessionKey` extension, so the request has no session key: the
+    /// one kind a switch warning cannot be remembered for, and so the one that moves silently.
+    async fn drive_unkeyed(
+        manager: Arc<Manager>,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, bytes)
+    }
+
+    /// The held account runs out DURING a request: its upstream answers a `rejected` 429. The
+    /// client is told once, in a plain 429 whose own text says the conversation is moving, and
+    /// the client's retry of that 429 is served by the sibling. It used to get the exhausted
+    /// 429 with the window's claim ("You've hit your session limit") and move only on the next
+    /// turn the user typed.
+    #[tokio::test]
+    async fn a_held_account_running_out_mid_request_warns_once_then_moves() {
+        use std::sync::atomic::Ordering;
+        let (upstream, hits_first, hits_other) = spawn_first_account_out_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+        let turn = thinking_turn_body("sess-moving", &["sig_held"]);
+
+        let warned = drive_conversation_full(Arc::clone(&manager), &turn).await;
+        assert_eq!(warned.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            warned
+                .headers()
+                .get("anthropic-ratelimit-unified-representative-claim")
+                .is_none()
+                && warned
+                    .headers()
+                    .get("anthropic-ratelimit-unified-status")
+                    .is_none(),
+            "the warning is a plain 429, the only kind whose text the client shows"
+        );
+        assert_eq!(
+            warned
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some(SWITCH_WARNING_RETRY_AFTER_SECS.to_string().as_str()),
+        );
+        let body = to_bytes(warned.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("moves it to another account")
+                && text.contains("(rejected upstream)")
+                && !text.contains("example.com"),
+            "the warning says what is happening and why, and names no account: {text}"
+        );
+        assert_eq!(
+            (
+                hits_first.load(Ordering::SeqCst),
+                hits_other.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "only the held account was asked"
+        );
+
+        // The client's retry of the warning: the same request, and it moves.
+        let (status, body) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the retry is served by the sibling: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            (
+                hits_first.load(Ordering::SeqCst),
+                hits_other.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+    }
+
+    /// With no session key there is nothing to remember a warning by, so a held account that
+    /// runs out mid-request releases the request IN that request, and the sibling serves it.
+    #[tokio::test]
+    async fn a_held_account_running_out_mid_request_moves_within_it_when_no_warning_can_stick() {
+        use std::sync::atomic::Ordering;
+        let (upstream, hits_first, hits_other) = spawn_first_account_out_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+
+        let (status, body) = drive_unkeyed(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-unkeyed", &["sig_held"]),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "released in the same request: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            (
+                hits_first.load(Ordering::SeqCst),
+                hits_other.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "the held account refused it, then the sibling served it"
+        );
+    }
+
+    /// The same mid-request release, on a BORROWED request whose lease names only the held
+    /// account (`x-tcr-accounts`). The release re-admits only what the hold benched, so the
+    /// lease's scope still keeps the other account out: the borrower gets a 429, and the account
+    /// outside the lease is never asked. Clearing `tried` wholesale served it there (found in
+    /// review, 2026-09-24: status 200 with the other account hit once).
+    #[tokio::test]
+    async fn a_mid_request_release_keeps_a_leases_account_set_scope() {
+        use std::sync::atomic::Ordering;
+        let (upstream, hits_first, hits_other) = spawn_first_account_out_upstream().await;
+        let mut config = two_accounts_over(&upstream, &[false, false]);
+        config.accounts[0].name = "alice".to_string();
+        config.accounts[1].name = "bob".to_string();
+        let manager = Manager::with_live_refresher(config, None);
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+        let label = tcr_peer_wire::sanitize_label("alice").expect("label");
+
+        let (status, body) = drive_unkeyed(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-scoped", &["sig_held"]),
+            &[
+                (RELAYED_HEADER_NAME, "1"),
+                (ACCOUNTS_HEADER_NAME, label.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            hits_other.load(Ordering::SeqCst),
+            0,
+            "the account outside the lease is never asked (status {status}): {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(hits_first.load(Ordering::SeqCst), 1);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A warning is a commitment. Once this session was told its conversation is moving off
+    /// account 0, the next request moves even though account 0 would hold it again: here its
+    /// hold is 200 s, under the cache's life, which on its own keeps the conversation there and
+    /// answers the retry with a 429 of its own (found in review, 2026-09-24).
+    #[tokio::test]
+    async fn a_told_session_moves_even_if_its_account_would_hold_it_again() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+        manager.mark_rate_limited(0, 200);
+        let key = stable_hash("uid:", "sess-told");
+        assert!(
+            manager.first_switch_warning(key, 0, crate::now_ms()),
+            "precondition: the session is told once"
+        );
+
+        let (status, body) = drive_conversation(
+            Arc::clone(&manager),
+            &thinking_turn_body("sess-told", &["sig_held"]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the told session moves: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            seen.lock().expect("recorder")[0].contains("at-bbbbbbbbbbbb"),
+            "served by the sibling"
+        );
+    }
+
+    /// A Fable request on a held account that is out only of its Fable weekly window diverts
+    /// that one request, as before, and the conversation stays where it is. So there is no move
+    /// to announce: no warning, and the session's one warning is left for a real move.
+    #[tokio::test]
+    async fn a_fable_only_block_diverts_without_a_warning() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+        let mut fable_out = HeaderMap::new();
+        fable_out.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            HeaderValue::from_static("1.0"),
+        );
+        fable_out.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            HeaderValue::from_str(&(crate::now_ms() / 1000 + 259_200).to_string())
+                .expect("reset header"),
+        );
+        manager.update_quota(0, &fable_out);
+        let body = with_body_field(
+            &thinking_turn_body("sess-fable", &["sig_held"]),
+            "model",
+            serde_json::json!("claude-fable-5"),
+        );
+
+        let (status, response) = drive_conversation(Arc::clone(&manager), &body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the Fable request diverts, no warning first: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            seen.lock().expect("recorder")[0].contains("at-bbbbbbbbbbbb"),
+            "served by the sibling"
+        );
+        assert!(
+            !manager.switch_warned(stable_hash("uid:", "sess-fable"), 0, crate::now_ms()),
+            "the session's warning is still unspent"
         );
     }
 
@@ -11098,11 +11778,21 @@ mod tests {
         // Bound history this process never minted, so the pin rung names account 1, which is
         // now held for ten minutes.
         manager.mark_rate_limited(1, 600);
-        let (status, body) = drive_conversation(
-            Arc::clone(&manager),
-            &thinking_turn_body("sess-far", &["sig_fake_minted_before_this_build"]),
-        )
-        .await;
+        let turn = thinking_turn_body("sess-far", &["sig_fake_minted_before_this_build"]);
+        // Told first (`switch_warning`), and the client's retry is the request that moves.
+        let (status, body) = drive_conversation(Arc::clone(&manager), &turn).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first request is told the conversation is moving: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("(on an upstream hold until "),
+            "and why: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let (status, body) = drive_conversation(Arc::clone(&manager), &turn).await;
         assert_eq!(
             status,
             StatusCode::OK,

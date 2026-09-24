@@ -24,6 +24,7 @@
 //! - **Translating index ↔ identity.** The live map is positional, because the response path
 //!   learns an index and must not pay the accounts lock per token; the file is not.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -36,6 +37,12 @@ use crate::config::ConfigError;
 use crate::identity;
 
 use super::Manager;
+
+/// How long a session stays told that its held conversation is moving off one account (see
+/// [`Manager::first_switch_warning`]). The client's own retry comes within seconds; this only
+/// has to outlast a user who cancels the retry and sends the next turn by hand, without
+/// silencing a warning that is due again much later.
+pub const SWITCH_WARNING_TTL_MS: i64 = 10 * 60 * 1000;
 
 /// One token as the response path hands it over: its kind and the token itself, unhashed. The
 /// hashing happens here, once, so no caller can forget it.
@@ -155,6 +162,68 @@ impl Manager {
         })
     }
 
+    /// Serve a held request on the account its history is bound to, over the soft threshold if
+    /// need be: `Some(idx)` when that account can answer this request now.
+    ///
+    /// [`Self::bound_account_holds`] keeps a conversation on its account without consulting the
+    /// soft threshold, so the serve side has to agree with it. It did not: a held request on an
+    /// account over the threshold fell through to [`Self::select_revalidation`], whose fallback
+    /// lets one request through per 2 s across the whole fleet, and the turn that lost that race
+    /// got an exhausted 429 naming the account's 5-hour window. Claude Code renders that as
+    /// "You've hit your session limit" (2026-09-24: 3 of 3 such 429s came 0.05-1.4 s after
+    /// another turn on the same account, while four other accounts sat at 0%).
+    ///
+    /// Served the way `select_revalidation` serves a session's pin: the hard gates for THIS
+    /// request ([`Self::hard_ok`] with the request's own group, so a live hold of any length
+    /// still refuses), no revalidation window, and the session's pin left alone. `None` when the
+    /// account already failed this request (`tried`), cannot serve it now, or sits outside the
+    /// group this request asked for strictly: a strict group never serves from outside itself,
+    /// held history included.
+    pub fn select_bound(
+        &self,
+        idx: usize,
+        tried: &HashSet<usize>,
+        now: OffsetDateTime,
+        is_fable: bool,
+        group: Option<&str>,
+        strict_group: Option<&str>,
+    ) -> Option<usize> {
+        if tried.contains(&idx) {
+            return None;
+        }
+        let now_ms = super::odt_to_ms(now);
+        let reserved = self.reserved_groups();
+        let parked = self.parked_groups();
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let account = accounts.get_mut(idx)?;
+        let outside_strict_group =
+            strict_group.is_some_and(|g| !account.groups.iter().any(|carried| carried == g));
+        if outside_strict_group
+            || !Self::hard_ok(
+                account,
+                self.global_threshold,
+                self.fable_weekly_threshold,
+                now,
+                now_ms,
+                is_fable,
+                group,
+                &reserved,
+                &parked,
+            )
+        {
+            return None;
+        }
+        let utilization = account.quota.max_utilization(now, is_fable);
+        account.last_selected_seq = self.select_seq.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            account = %account.name,
+            utilization,
+            is_fable,
+            "revalidation-serve (bound-honor): serving the account this conversation's history is bound to"
+        );
+        Some(idx)
+    }
+
     /// Whether `tokens` name more than one distinct account — the disagreement
     /// [`Self::bound_token_account`] resolves by taking the newest.
     pub fn bound_tokens_disagree(&self, tokens: &[String]) -> bool {
@@ -191,6 +260,53 @@ impl Manager {
             seen.clear();
         }
         seen.insert(session_key)
+    }
+
+    /// Whether to warn this session before its held conversation moves off account `idx`:
+    /// `true` the first time within [`SWITCH_WARNING_TTL_MS`], `false` after that.
+    ///
+    /// The move itself is [`Self::bound_account_holds`] answering no. Before this existed the
+    /// move was silent. Now the first request that would move gets one plain 429 that says so,
+    /// and Claude Code retries a plain 429 on its own (measured 2026-09-24 against 2.1.281: two
+    /// retries allowed, three requests seen), so the retry is the request that moves. Keyed by
+    /// account as well as session, so a conversation that moves again later, off the account it
+    /// moved to, is told again.
+    ///
+    /// Bounded like [`Self::first_bound_history_hold`]: stale entries go on every call, and the
+    /// map is cleared wholesale if it still fills. The worst case of forgetting is one extra
+    /// warning.
+    pub fn first_switch_warning(&self, session_key: u64, idx: usize, now_ms: i64) -> bool {
+        let mut warned = self
+            .bound_switch_warned
+            .lock()
+            .expect("bound switch warned map poisoned");
+        warned.retain(|_, &mut at| now_ms.saturating_sub(at) < SWITCH_WARNING_TTL_MS);
+        if warned.len() >= BOUND_TOKEN_CAP {
+            warned.clear();
+        }
+        match warned.entry((session_key, idx)) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(now_ms);
+                true
+            }
+        }
+    }
+
+    /// Whether this session was told, within [`SWITCH_WARNING_TTL_MS`], that its held
+    /// conversation is moving off account `idx`: the read-only half of
+    /// [`Self::first_switch_warning`].
+    ///
+    /// The request path reads it before [`Self::bound_account_holds`], so a warning is a
+    /// commitment. The warning says the retry moves the conversation; an account whose hold
+    /// crept back under the cache's life in the 3 s before the retry would otherwise hold it
+    /// again and answer the retry with a 429 of its own (found in review, 2026-09-24).
+    pub fn switch_warned(&self, session_key: u64, idx: usize, now_ms: i64) -> bool {
+        self.bound_switch_warned
+            .lock()
+            .expect("bound switch warned map poisoned")
+            .get(&(session_key, idx))
+            .is_some_and(|&at| now_ms.saturating_sub(at) < SWITCH_WARNING_TTL_MS)
     }
 
     /// The map as persistable records — each live entry's index replaced by the identity of the
@@ -510,5 +626,73 @@ mod tests {
         assert!(manager.first_bound_history_hold(11));
         assert!(!manager.first_bound_history_hold(11));
         assert!(manager.first_bound_history_hold(22));
+    }
+
+    /// `select_bound` serves the held account only where this request may go. Its strict-group
+    /// check is the only thing keeping a group-scoped request inside its group on this path,
+    /// because `bound_account_holds` passes an account outside a strict group (found in review,
+    /// 2026-09-24).
+    #[test]
+    fn select_bound_serves_the_held_account_only_where_this_request_may_go() {
+        let mut member = account("a@example.com", "uuid-a");
+        member.groups = Some(vec!["g".to_string()]);
+        let manager = manager_over(&[member]);
+        let now = OffsetDateTime::now_utc();
+        let untried = HashSet::new();
+        assert_eq!(
+            manager.select_bound(0, &untried, now, false, Some("g"), Some("g")),
+            Some(0),
+            "a member of the strict group it asked for"
+        );
+        assert_eq!(
+            manager.select_bound(0, &untried, now, false, Some("other"), Some("other")),
+            None,
+            "outside the strict group it asked for"
+        );
+        assert_eq!(
+            manager.select_bound(0, &HashSet::from([0]), now, false, None, None),
+            None,
+            "already failed this request"
+        );
+        assert_eq!(
+            manager.select_bound(1, &untried, now, false, None, None),
+            None,
+            "no such account"
+        );
+        manager.mark_rate_limited(0, 60);
+        assert_eq!(
+            manager.select_bound(0, &untried, now, false, None, None),
+            None,
+            "on a live hold"
+        );
+    }
+
+    /// One warning per session per account, so the client's retry of the warning moves; told
+    /// again when the conversation later moves off a different account, or once the warning's
+    /// life has run out.
+    #[test]
+    fn a_switch_is_warned_once_per_session_and_account() {
+        let manager = manager_over(&[account("a@example.com", "uuid-a")]);
+        let t0 = 1_000_000;
+        assert!(
+            manager.first_switch_warning(11, 0, t0),
+            "first request: warn"
+        );
+        assert!(
+            !manager.first_switch_warning(11, 0, t0 + 3_000),
+            "its retry: move"
+        );
+        assert!(
+            manager.first_switch_warning(11, 1, t0 + 3_000),
+            "another account: warn"
+        );
+        assert!(
+            manager.first_switch_warning(22, 0, t0 + 3_000),
+            "another session: warn"
+        );
+        assert!(
+            manager.first_switch_warning(11, 0, t0 + SWITCH_WARNING_TTL_MS),
+            "past the warning's life: warn again"
+        );
     }
 }
