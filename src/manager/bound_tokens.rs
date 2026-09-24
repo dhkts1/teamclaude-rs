@@ -38,6 +38,12 @@ use crate::identity;
 
 use super::Manager;
 
+/// How long a session stays told that its held conversation is moving off one account (see
+/// [`Manager::first_switch_warning`]). The client's own retry comes within seconds; this only
+/// has to outlast a user who cancels the retry and sends the next turn by hand, without
+/// silencing a warning that is due again much later.
+pub const SWITCH_WARNING_TTL_MS: i64 = 10 * 60 * 1000;
+
 /// One token as the response path hands it over: its kind and the token itself, unhashed. The
 /// hashing happens here, once, so no caller can forget it.
 pub type MintedToken = (BoundTokenKind, String);
@@ -254,6 +260,37 @@ impl Manager {
             seen.clear();
         }
         seen.insert(session_key)
+    }
+
+    /// Whether to warn this session before its held conversation moves off account `idx`:
+    /// `true` the first time within [`SWITCH_WARNING_TTL_MS`], `false` after that.
+    ///
+    /// The move itself is [`Self::bound_account_holds`] answering no. Before this existed the
+    /// move was silent. Now the first request that would move gets one plain 429 that says so,
+    /// and Claude Code retries a plain 429 on its own (measured 2026-09-24 against 2.1.281: two
+    /// retries allowed, three requests seen), so the retry is the request that moves. Keyed by
+    /// account as well as session, so a conversation that moves again later, off the account it
+    /// moved to, is told again.
+    ///
+    /// Bounded like [`Self::first_bound_history_hold`]: stale entries go on every call, and the
+    /// map is cleared wholesale if it still fills. The worst case of forgetting is one extra
+    /// warning.
+    pub fn first_switch_warning(&self, session_key: u64, idx: usize, now_ms: i64) -> bool {
+        let mut warned = self
+            .bound_switch_warned
+            .lock()
+            .expect("bound switch warned map poisoned");
+        warned.retain(|_, &mut at| now_ms.saturating_sub(at) < SWITCH_WARNING_TTL_MS);
+        if warned.len() >= BOUND_TOKEN_CAP {
+            warned.clear();
+        }
+        match warned.entry((session_key, idx)) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(now_ms);
+                true
+            }
+        }
     }
 
     /// The map as persistable records — each live entry's index replaced by the identity of the
@@ -573,5 +610,34 @@ mod tests {
         assert!(manager.first_bound_history_hold(11));
         assert!(!manager.first_bound_history_hold(11));
         assert!(manager.first_bound_history_hold(22));
+    }
+
+    /// One warning per session per account, so the client's retry of the warning moves; told
+    /// again when the conversation later moves off a different account, or once the warning's
+    /// life has run out.
+    #[test]
+    fn a_switch_is_warned_once_per_session_and_account() {
+        let manager = manager_over(&[account("a@example.com", "uuid-a")]);
+        let t0 = 1_000_000;
+        assert!(
+            manager.first_switch_warning(11, 0, t0),
+            "first request: warn"
+        );
+        assert!(
+            !manager.first_switch_warning(11, 0, t0 + 3_000),
+            "its retry: move"
+        );
+        assert!(
+            manager.first_switch_warning(11, 1, t0 + 3_000),
+            "another account: warn"
+        );
+        assert!(
+            manager.first_switch_warning(22, 0, t0 + 3_000),
+            "another session: warn"
+        );
+        assert!(
+            manager.first_switch_warning(11, 0, t0 + SWITCH_WARNING_TTL_MS),
+            "past the warning's life: warn again"
+        );
     }
 }
