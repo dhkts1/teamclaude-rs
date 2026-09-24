@@ -57,6 +57,10 @@ enum RenderStates {
     private static var scenes: [(name: String, state: PollState, awake: Bool, control: String?)] {
         [
             ("01-healthy", .loaded(fleet(healthyJSON)), false, nil),
+            // The README's top image: `01-healthy`'s two accounts with the
+            // proxy running, as a reader's own panel would be. `01-healthy`
+            // itself stays unsupervised; see `supervisedScenes`.
+            ("01b-healthy-running", .loaded(fleet(healthyJSON)), false, nil),
             ("01c-divergent-windows", .loaded(fleet(divergentWindowsJSON)), false, nil),
             ("01d-unmeasured-window-proof", .loaded(fleet(unmeasuredWindowJSON)), false, nil),
             ("01e-plan-labels", .loaded(fleet(planLabelsJSON)), false, nil),
@@ -535,16 +539,14 @@ enum RenderStates {
 
         let view =
             FleetView(
-                poller: StatusPoller(pinnedState: scene.state, lastPollAt: referenceDate),
-                // The parity scene compares against a mockup whose proxy was
-                // running, so its server is pinned to the supervised state:
-                // otherwise the app draws "Start server", "Take over port…" and
-                // "Not supervised by TcrBar" — three real controls for a state
-                // the mockup never had — and the two panels differ by a fact
-                // about this machine rather than by a layout decision. Pinned,
-                // never spawned: `ServerController.harness(pinned:)` signals
-                // nothing.
-                server: parityScenes.contains(scene.name)
+                poller: StatusPoller(pinnedState: scene.state, lastPollAt: recentPoll),
+                // A scene in `supervisedScenes` has its server pinned to the
+                // supervised state. Otherwise the app draws "Start server",
+                // "Take over port…" and "Not supervised by TcrBar", which
+                // depend on what is running on the machine doing the render,
+                // not on the layout. Pinned, never spawned:
+                // `ServerController.harness(pinned:)` signals nothing.
+                server: supervisedScenes.contains(scene.name)
                     ? ServerController.harness(pinned: .supervising(pid: 4242))
                     : ServerController(),
                 loginItem: LoginItem(),
@@ -628,7 +630,7 @@ enum RenderStates {
         let panel =
             FleetView(
                 poller: StatusPoller(
-                    pinnedState: .loaded(fleet(healthyJSON)), lastPollAt: referenceDate),
+                    pinnedState: .loaded(fleet(healthyJSON)), lastPollAt: recentPoll),
                 server: ServerController.harness(pinned: .supervising(pid: 4242)),
                 loginItem: LoginItem(),
                 accounts: AccountController(),
@@ -2374,6 +2376,18 @@ enum RenderStates {
     private static let parityScenes: Set<String> = [
         "19-accounts-tab-parity", "16-sessions-tab", "17-tools-tab",
     ]
+
+    /// Every scene drawn with a running, supervised proxy: the parity scenes,
+    /// and the README's top image, which should look like a reader's own
+    /// panel rather than a stopped one.
+    private static let supervisedScenes: Set<String> =
+        parityScenes.union(["01b-healthy-running"])
+
+    /// The poll time every scene's header shows. "updated … ago" is measured
+    /// against the real clock, so a poll pinned to `referenceDate` read
+    /// "updated 50d ago" and grew by a day every day. A poll two seconds
+    /// before the render reads "updated 2s ago" whatever the date.
+    private static var recentPoll: Date { Date().addingTimeInterval(-2) }
 
     // MARK: - Fixtures
     //
