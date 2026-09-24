@@ -43,22 +43,17 @@ enum RenderStates {
     /// orthogonal to the poll: the mode can be on under any fleet at all. Two
     /// scenes carry it ON — one on the Accounts tab, one on Sessions, since
     /// `FleetView.v4FooterAwakeQuit` draws on every tab and a single scene
-    /// would only prove the Accounts case. Neither scene reviews the switch's
-    /// visual ON state, and that is a measured limitation, not an oversight:
+    /// would only prove the Accounts case.
     ///
     ///  - The tinted mark is drawn on the status item (``MenuBarShell``), which
     ///    is not part of this view, so no scene here renders it.
-    ///  - The thumb position is not rendered either. `ImageRenderer` draws a
-    ///    `.switch` toggle as the same "prohibited" placeholder regardless of
-    ///    `isOn` — the same limitation this file already records for a
-    ///    `.checkbox` toggle. Measured, not assumed: `01-healthy-auto-dark.png`
-    ///    against `12-keeping-awake-auto-dark.png` (same fleet, `awake` the
-    ///    only input that differs) has zero pixels over a channel delta of 8,
-    ///    same dimensions. What these scenes prove is that the row renders at
-    ///    all on each tab, not what it looks like on.
-    ///
-    /// Those figures move whenever the footer's wording or spacing does; if they
-    /// look stale, re-measure rather than trusting them.
+    ///  - The switch itself is drawn by ``SnapshotSwitch`` in `snapshotMode`,
+    ///    not by the live `.switch` Toggle: `ImageRenderer` draws a `.switch`
+    ///    toggle as the same yellow "prohibited" placeholder regardless of
+    ///    `isOn` (the limitation this file records for a `.checkbox` toggle
+    ///    too), and these renders are the README's screenshots. So the ON scenes
+    ///    now show the thumb on the right; what they still do not prove is how
+    ///    the live AppKit switch looks.
     private static var scenes: [(name: String, state: PollState, awake: Bool, control: String?)] {
         [
             ("01-healthy", .loaded(fleet(healthyJSON)), false, nil),

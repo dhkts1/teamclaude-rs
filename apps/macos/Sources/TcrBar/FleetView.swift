@@ -783,17 +783,31 @@ struct FleetView: View {
     /// second kind of update check.
     private var v4FooterAwakeQuit: some View {
         HStack(spacing: V4.buttonGap) {
-            Toggle(
-                isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
-            ) {
-                Text("Keep awake")
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
+            if snapshotMode {
+                // `ImageRenderer` draws a `.switch` Toggle as a yellow
+                // "prohibited" placeholder whatever its state, and these renders
+                // are the README's screenshots. So the harness draws the switch
+                // itself, which also makes its on/off state visible in a render
+                // for the first time. The live panel never takes this branch.
+                HStack(spacing: V4.buttonGap) {
+                    Text("Keep awake")
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.mute)
+                    SnapshotSwitch(isOn: awake.isOn)
+                }
+            } else {
+                Toggle(
+                    isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
+                ) {
+                    Text("Keep awake")
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.mute)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("While any session is busy.")
+                .accessibilityLabel("Keep this Mac awake")
             }
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .help("While any session is busy.")
-            .accessibilityLabel("Keep this Mac awake")
             Spacer(minLength: 0)
             Button {
                 updater.checkForUpdates()
@@ -3703,6 +3717,30 @@ struct RowHeightsKey: PreferenceKey {
 /// nothing to sum and no gap count to infer. `max` for the same reason the two
 /// usage keys use it: sibling subtrees in the same reader contribute and the
 /// tallest is the one the viewport has to hold.
+/// The keep-awake switch as `--render-states` draws it: a track and a thumb, at
+/// about the size of the mini `.switch` the live panel uses. On is the system
+/// accent with the thumb right; off is a dim track with the thumb left.
+/// Decorative, because it only ever appears in a rendered image.
+struct SnapshotSwitch: View {
+    let isOn: Bool
+    private static let width: CGFloat = 26
+    private static let height: CGFloat = 15
+    private static let inset: CGFloat = 1.5
+
+    var body: some View {
+        Capsule()
+            .fill(isOn ? Tok.accent : Tok.ink.opacity(0.22))
+            .frame(width: Self.width, height: Self.height)
+            .overlay(alignment: isOn ? .trailing : .leading) {
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: Self.height - 2 * Self.inset, height: Self.height - 2 * Self.inset)
+                    .padding(Self.inset)
+            }
+            .accessibilityHidden(true)
+    }
+}
+
 struct V4ContentHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
