@@ -34,9 +34,10 @@
 # commit that scenario passes 10/10 under --netlab's Docker container. That
 # is the one behaviour netlab-design.md section 10 already named as reasoned
 # rather than observed ("miniupnpd against iptables-legacy in a namespace"),
-# now observed and red, not yet root-caused. The CI netlab job runs Docker
-# only until that is fixed; --native is not wired into CI and is a local,
-# Linux-and-root option with this one known gap.
+# now observed and red, not yet root-caused. --native is a local,
+# Linux-and-root option with this one known gap. Neither mode runs in CI:
+# the netlab job was removed on 2026-09-24 because it no longer fit its time
+# limit, so these scenarios run only when someone runs them by hand.
 #
 # This is the container half of the peer end-to-end. The in-process half,
 # `scripts/peer-e2e-local.sh` over `tests/peer_e2e.rs`, stays the fast gate and
