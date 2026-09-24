@@ -69,6 +69,15 @@ const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// well under 1 KiB) with room to spare, small enough that a log line never
 /// carries an upstream's full multi-KiB HTML error page.
 const ERROR_BODY_LOG_CAP: usize = 2 * 1024;
+/// Most bytes of an upstream `429` body read just to log it. A 429 is always
+/// discarded after logging (every path out of its arm rotates or retries), so
+/// this only has to hold Anthropic's small JSON envelope; a larger body is not
+/// logged at all rather than buffered at [`MAX_BODY_BYTES`].
+const RATE_LIMIT_BODY_CAP: usize = 64 * 1024;
+/// Seconds to wait for an upstream `429` body before giving up on logging it.
+/// The arm returned without reading the body before it logged one, so a body
+/// that never finishes must not stall the rotation it did not stall before.
+const RATE_LIMIT_BODY_READ_SECS: u64 = 5;
 /// Header `tcr run --group <name>` sets via `ANTHROPIC_CUSTOM_HEADERS` (see
 /// `src/main.rs`'s `compose_group_header`), which Claude Code forwards
 /// verbatim as a real outbound header on every `/v1/messages` request. `pub`
@@ -3608,8 +3617,40 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
                 unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
                 quota_rejected = !rejections.is_empty(),
+                // WHO asked, so a 429 that follows one client around can be told
+                // from one that follows an account. Measured 2026-09-24: 143 of 145
+                // requests to `/v1/messages` WITHOUT `?beta=true` got a 429 with no
+                // quota headers, on accounts at 0% used, while 10,575 of 10,575 on
+                // `?beta=true` got a 200, and nothing in the log named the client.
+                user_agent = req_headers
+                    .get(USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<absent>"),
+                model = request_model.as_deref().unwrap_or("?"),
                 "429 diagnostic"
             );
+            // Upstream's own words for this 429, which the headers above cannot
+            // give when it carries none (`quota_rejected=false`, every header
+            // `<absent>`). Every path out of this arm `continue`s, so the body was
+            // always discarded unread; reading it here costs one small buffer.
+            // Bounded in time as well as size: this arm used to return without
+            // touching the body, so a body that never completes must not become
+            // a hang it did not have before.
+            match tokio::time::timeout(
+                Duration::from_secs(RATE_LIMIT_BODY_READ_SECS),
+                read_capped_body(resp.bytes_stream(), RATE_LIMIT_BODY_CAP),
+            )
+            .await
+            {
+                Ok(Ok(body)) => {
+                    log_upstream_error_body(idx, account_name.as_deref(), status, &body)
+                }
+                Ok(Err(_)) | Err(_) => tracing::warn!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    "upstream 429 body could not be read within the cap"
+                ),
+            }
             let retry_after_raw = parse_retry_after(&up_headers);
             let retry_after = retry_after_raw.unwrap_or(60);
             if !rejections.is_empty() {
@@ -13340,6 +13381,84 @@ mod tests {
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the lock must prevent a retry on account b"
+        );
+    }
+
+    /// An upstream `429` is logged with upstream's own words and with the client
+    /// that asked. Before this, the 429 arm rotated without reading the body, so
+    /// a 429 carrying no quota headers left nothing in the log to say why, and
+    /// nothing said which client's requests kept drawing it.
+    ///
+    /// Runs the request up to three times for the reason written out on
+    /// `src/server.rs`'s `boot_line_carries_every_new_knob_with_its_configured_value`:
+    /// other 429 tests in this binary reach these log callsites on threads with
+    /// no subscriber, `tracing` caches `Interest::never` for them process-wide,
+    /// and this sink then stays empty however long anything waits (measured
+    /// here 2026-09-24: passes alone, empty sink under the parallel suite, still
+    /// empty with one rebuild). A rebuild before each attempt covers every
+    /// callsite registered by the attempt before it. Only a MISSING line is
+    /// retried; a line that is present with the wrong content fails at once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn upstream_429_logs_its_body_and_the_asking_client() {
+        const ATTEMPTS: usize = 3;
+        let body =
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"probe-429-message"}}"#;
+        let raw = format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\nretry-after: 120\r\n\
+             anthropic-ratelimit-unified-status: rejected\r\n\r\n{body}",
+            body.len()
+        );
+
+        let mut log = String::new();
+        for _ in 0..ATTEMPTS {
+            let (up_addr, _) = spawn_counted_upstream(vec![Some(raw.clone())]).await;
+            let manager = fleet_configured(up_addr, &["a"], |config| {
+                config.lock_account = Some("a".to_string());
+            });
+            let sink = SharedBuf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+
+            let response = drive_full(
+                manager,
+                Method::POST,
+                "/v1/messages",
+                Some(loopback_peer()),
+                &[
+                    ("content-type", "application/json"),
+                    ("user-agent", "probe-client/9.9"),
+                ],
+                r#"{"model":"claude-probe-model"}"#,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+            log = sink.contents();
+            let error_line = log.lines().find(|l| l.contains("upstream error response"));
+            let diagnostic = log.lines().find(|l| l.contains("429 diagnostic"));
+            let (Some(error_line), Some(diagnostic)) = (error_line, diagnostic) else {
+                continue;
+            };
+            assert!(
+                error_line.contains("status=429")
+                    && error_line.contains(r#"error.message="probe-429-message""#),
+                "the 429 body must be logged as an upstream error response, got: {log:?}"
+            );
+            assert!(
+                diagnostic.contains(r#"user_agent="probe-client/9.9""#)
+                    && diagnostic.contains(r#"model="claude-probe-model""#),
+                "the 429 diagnostic must name the asking client and model, got: {log:?}"
+            );
+            return;
+        }
+        panic!(
+            "no attempt of {ATTEMPTS} logged both an `upstream error response` and a \
+             `429 diagnostic` line for the upstream 429; last log: {log:?}"
         );
     }
 
