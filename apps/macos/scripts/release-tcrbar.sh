@@ -425,6 +425,42 @@ quarantine_if_assetless() {
   gh release edit "$tag" --prerelease --repo "$repo" >/dev/null 2>&1 || true
 }
 
+# Upload the DMG and this release's appcast to the GitHub Release, then prove the release
+# carries THIS appcast.
+#
+# --clobber so a re-run replaces its assets rather than failing. But --clobber is not atomic:
+# gh lists the release's assets, deletes the same-named ones, then uploads. And
+# .github/workflows/appcast-guard.yml attaches the COMMITTED appcast, one version old, to a new
+# release that has none. On 2026-09-24 (v1.1.17) it did that inside the gap, one second after
+# the DMG went up; the appcast upload failed with HTTP 422 "ReleaseAsset.name already exists"
+# and the release stopped with the old feed file attached, offering no update. So one retry:
+# the second attempt lists again, and its --clobber replaces the guard's copy. The guard
+# uploads without --clobber, so it cannot replace ours afterwards.
+#
+# Then read the asset back and compare it byte for byte with the local file. gh's exit status
+# says the upload went through, not what the release ends up serving.
+upload_release_assets() {
+  local tag="$1" repo="$2" dmg="$3" appcast="$4" check
+  if ! gh release upload "$tag" "$dmg" "$appcast" --clobber --repo "$repo"; then
+    note "upload failed once; retrying (the appcast guard can attach its copy between gh's --clobber check and its upload)"
+    gh release upload "$tag" "$dmg" "$appcast" --clobber --repo "$repo" \
+      || die "gh release upload failed for $tag."
+  fi
+  check="$(mktemp -d)"
+  if ! gh release download "$tag" --repo "$repo" --pattern appcast.xml --dir "$check" >/dev/null 2>&1; then
+    rm -rf "$check"
+    die "uploaded, but the appcast.xml on $tag cannot be read back to check it."
+  fi
+  if ! cmp -s "$check/appcast.xml" "$appcast"; then
+    rm -rf "$check"
+    die "$tag carries an appcast.xml that is not the one this release wrote." \
+        "  Replace it:" \
+        "    gh release upload $tag '$appcast' --clobber --repo $repo"
+  fi
+  rm -rf "$check"
+  note "the release's appcast.xml is this release's own (read back and compared)"
+}
+
 # Runs quarantine_if_assetless in the background every 10s for the whole
 # build/sign/notarize duration — the actual window this guard exists to
 # close. Sets `quarantine_watcher_pid`; stop_quarantine_watcher tears it down.
@@ -817,9 +853,7 @@ main() {
       || die "could not mark $tag prerelease before uploading." \
              "  Uploading anyway would leave the update feed 404ing on a cached miss."
 
-    # --clobber so a re-run replaces its assets rather than failing.
-    gh release upload "$tag" "$dmg" "$appcast_path" --clobber --repo "$repo" \
-      || die "gh release upload failed for $tag."
+    upload_release_assets "$tag" "$repo" "$dmg" "$appcast_path"
 
     # Only now is it safe to be the newest thing Sparkle looks at.
     gh release edit "$tag" --prerelease=false --latest --repo "$repo" >/dev/null \
