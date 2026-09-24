@@ -332,11 +332,9 @@ struct AccountCard<Actions: View>: View {
     }
 
     /// `"henry10"` — everything before the first `@`, or the whole name when
-    /// it has none.
-    private var localPart: String {
-        guard let at = account.name.firstIndex(of: "@") else { return account.name }
-        return String(account.name[account.name.startIndex..<at])
-    }
+    /// it has none (``AccountName/localPart(_:)``, the rule the Sessions tab
+    /// shortens by too).
+    private var localPart: String { AccountName.localPart(account.name) }
 
     /// `"@example.com"`, `@` included so the split does not have to be undone
     /// by whatever draws it — or `nil` for a name with no `@` at all.

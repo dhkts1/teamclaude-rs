@@ -771,20 +771,56 @@ struct FleetView: View {
     /// Left, the keep-awake switch; right, Quit behind the same confirm alert
     /// Settings uses (``QuitConfirmation``) — the panel's own most-expensive
     /// action, same as `v4Actions`' "Take over port…".
+    ///
+    /// Beside Quit, "Check for updates" as a text link rather than a fifth
+    /// button: five bordered buttons do not fit across the panel, which is why
+    /// the check left it once already (see ``fleetActions``). It sits on THIS row
+    /// because the row is about TcrBar itself, and because the version line
+    /// below the rule, its first home in the mockup, has no room: with the
+    /// build hash the label already runs to the server sha, and the link cut it
+    /// to "TcrBar 1.1.18 · a…" in `--render-states`. The same `Updater` as the
+    /// menu bar item and the "Update…" button, so the panel cannot start a
+    /// second kind of update check.
     private var v4FooterAwakeQuit: some View {
         HStack(spacing: V4.buttonGap) {
-            Toggle(
-                isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
-            ) {
-                Text("Keep awake")
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
+            if snapshotMode {
+                // `ImageRenderer` draws a `.switch` Toggle as a yellow
+                // "prohibited" placeholder whatever its state, and these renders
+                // are the README's screenshots. So the harness draws the switch
+                // itself, which also makes its on/off state visible in a render
+                // for the first time. The live panel never takes this branch.
+                HStack(spacing: V4.buttonGap) {
+                    Text("Keep awake")
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.mute)
+                    SnapshotSwitch(isOn: awake.isOn)
+                }
+            } else {
+                Toggle(
+                    isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
+                ) {
+                    Text("Keep awake")
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.mute)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("While any session is busy.")
+                .accessibilityLabel("Keep this Mac awake")
             }
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .help("While any session is busy.")
-            .accessibilityLabel("Keep this Mac awake")
             Spacer(minLength: 0)
+            Button {
+                updater.checkForUpdates()
+            } label: {
+                Text("Check for updates")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.accent)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .help("Runs the same check as Check for Updates in the menu bar.")
+            .accessibilityLabel("Check for updates")
             V4Button(title: "Quit", role: .danger) { QuitConfirmation.confirm() }
         }
     }
@@ -818,14 +854,15 @@ struct FleetView: View {
     /// spend that. What does NOT survive is its layout: a hairline of its own
     /// under the footer text, which put the panel's most expensive control below
     /// the line that ends the panel.
+    ///
+    /// The everyday pair sits on the left and the server control on the right
+    /// edge, directly above Quit in ``v4FooterAwakeQuit``: the two controls
+    /// that stop something share one column, and the two rows line up instead
+    /// of one hugging the left while the other splits left and right (operator
+    /// ask, 2026-09-24, chosen from a drawn mockup).
     private var v4Actions: some View {
         VStack(alignment: .leading, spacing: V4.buttonGap) {
             HStack(spacing: V4.buttonGap) {
-                if server.state.isOurChild {
-                    V4Button(title: "Stop server") { server.stop() }
-                } else {
-                    V4Button(title: "Start server") { server.start() }
-                }
                 V4Button(title: "Refresh") { Task { await poller.pollOnce() } }
                 if !fleetIsEmpty {
                     V4Button(
@@ -834,6 +871,11 @@ struct FleetView: View {
                     ) { addAccount() }
                 }
                 Spacer(minLength: 0)
+                if server.state.isOurChild {
+                    V4Button(title: "Stop server") { server.stop() }
+                } else {
+                    V4Button(title: "Start server") { server.start() }
+                }
             }
             // Disabled rather than silently no-op: the spawn path refuses a
             // second child, so with one already supervised the click would do
@@ -1549,9 +1591,22 @@ struct FleetView: View {
     /// (``sessionsList(_:)``'s headed branch): the header already names the
     /// project, and stating it again on every row under it is exactly the
     /// restatement the project-header rewrite exists to remove.
+    ///
+    /// The account the session is on sits between the two, short-named by
+    /// ``AccountName/short(_:)`` ("henry3", or "henry/research" for a second row
+    /// of one login): which Claude account a session runs on was the one thing
+    /// the tab did not say (operator ask, 2026-09-24). BEFORE the model, because
+    /// a compact row truncates this line's tail, and drawn last it was the
+    /// account that got cut ("sonnet-5 · h…" in `--render-states`). Absent while
+    /// the proxy has not attributed the session to an account yet, never
+    /// guessed.
     private func sessionSubtitle(_ row: JoinedSession, showProject: Bool) -> String {
-        [showProject ? row.project : nil, row.session.model.map(QuotaFormat.modelLabel)]
-            .compactMap { $0 }.joined(separator: " · ")
+        [
+            showProject ? row.project : nil,
+            row.session.account.map(AccountName.short),
+            row.session.model.map(QuotaFormat.modelLabel),
+        ]
+        .compactMap { $0 }.joined(separator: " · ")
     }
 
     /// `docs/design/panel-tabs-review.md` finding 2: a session with a tool
@@ -3662,6 +3717,30 @@ struct RowHeightsKey: PreferenceKey {
 /// nothing to sum and no gap count to infer. `max` for the same reason the two
 /// usage keys use it: sibling subtrees in the same reader contribute and the
 /// tallest is the one the viewport has to hold.
+/// The keep-awake switch as `--render-states` draws it: a track and a thumb, at
+/// about the size of the mini `.switch` the live panel uses. On is the system
+/// accent with the thumb right; off is a dim track with the thumb left.
+/// Decorative, because it only ever appears in a rendered image.
+struct SnapshotSwitch: View {
+    let isOn: Bool
+    private static let width: CGFloat = 26
+    private static let height: CGFloat = 15
+    private static let inset: CGFloat = 1.5
+
+    var body: some View {
+        Capsule()
+            .fill(isOn ? Tok.accent : Tok.ink.opacity(0.22))
+            .frame(width: Self.width, height: Self.height)
+            .overlay(alignment: isOn ? .trailing : .leading) {
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: Self.height - 2 * Self.inset, height: Self.height - 2 * Self.inset)
+                    .padding(Self.inset)
+            }
+            .accessibilityHidden(true)
+    }
+}
+
 struct V4ContentHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
