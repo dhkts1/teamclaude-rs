@@ -3073,15 +3073,42 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             // strict arm in `select_with_group` refused to. A
                             // reserved group falls straight through to the honest
                             // 429 instead.
-                            if strict_group.is_none() && manager.revalidation_serve_enabled() {
-                                if let Some(idx) = manager.select_revalidation(
+                            //
+                            // HELD HISTORY IS NOT A FLEET QUESTION. A request held to
+                            // its bound account has every other account benched, so
+                            // "the whole fleet is over the threshold" here means only
+                            // "that one account is", and the fleet's revalidation
+                            // window (one serve per 2 s, shared by every session) is
+                            // the wrong gate for it: the turn that lost the race got
+                            // a 429 naming the account's 5-hour window, which Claude
+                            // Code shows as "You've hit your session limit"
+                            // (2026-09-24). `bound_account_holds` already decided the
+                            // soft threshold does not release this conversation, so
+                            // the serve agrees with it: `Manager::select_bound`.
+                            let served = match bound_to {
+                                Some(bound) => manager.select_bound(
+                                    bound,
                                     &tried,
                                     now,
-                                    request_model.as_deref(),
-                                    session_key,
-                                ) {
-                                    idx
-                                } else {
+                                    request_is_fable,
+                                    request_group.as_deref(),
+                                    strict_group,
+                                ),
+                                None if strict_group.is_none()
+                                    && manager.revalidation_serve_enabled() =>
+                                {
+                                    manager.select_revalidation(
+                                        &tried,
+                                        now,
+                                        request_model.as_deref(),
+                                        session_key,
+                                    )
+                                }
+                                None => None,
+                            };
+                            match served {
+                                Some(idx) => idx,
+                                None => {
                                     return exhausted_or_fallback(
                                         &manager,
                                         now,
@@ -3093,17 +3120,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     )
                                     .await;
                                 }
-                            } else {
-                                return exhausted_or_fallback(
-                                    &manager,
-                                    now,
-                                    account_count,
-                                    request_is_fable,
-                                    strict_group,
-                                    bound_to,
-                                    fallback_ask.as_ref(),
-                                )
-                                .await;
                             }
                         }
                     }
@@ -5605,7 +5621,8 @@ async fn exhausted_or_fallback(
 /// client maps to its own limit types, and the client renders a usage limit with
 /// the real reset instant. A hold or an unknown gate stays a plain 429: an
 /// upstream `retry-after` is not the user's usage limit, and claiming one would
-/// be the same lie in the other direction.
+/// be the same lie in the other direction. So does a 429 for held history
+/// (`bound_to`), whatever gates its one account: see the comment at the claim.
 ///
 /// The `retry-after` figure is computed live from when an account actually
 /// frees, never a constant — the only fixed number here is the 60 the hint falls
@@ -5667,7 +5684,16 @@ fn exhausted_response(
         &detail,
         Some(advertised_retry_after),
     );
-    if let (Some(claim), Some(at)) = (hint.binding.and_then(unified_claim_for), hint.free_at) {
+    // Held history never carries a claim. The held account's window is not this user's limit:
+    // an account that is really out releases the conversation to the fleet
+    // (`Manager::bound_account_holds`), so a 429 that reaches here for held history is a wait
+    // on one account, and a claim would have Claude Code show "You've hit your session limit"
+    // and stop, where a plain 429 is retried by the client on its own.
+    let claim = match bound_to {
+        Some(_) => None,
+        None => hint.binding.and_then(unified_claim_for),
+    };
+    if let (Some(claim), Some(at)) = (claim, hint.free_at) {
         let headers = response.headers_mut();
         headers.insert(
             "anthropic-ratelimit-unified-status",
@@ -11070,6 +11096,155 @@ mod tests {
             hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the sibling served it"
+        );
+    }
+
+    /// A bound account over the SOFT threshold still holds its conversation
+    /// (`Manager::bound_account_holds` ignores the threshold on purpose), so it must also SERVE
+    /// it, on every turn. It used to reach the fleet's last-resort revalidation serve, which lets
+    /// one request through per 2 s across the whole fleet: the turn that lost that race got an
+    /// exhausted 429 naming the 5-hour window, and Claude Code renders that claim as "session
+    /// limit". Measured 2026-09-24: 3 of 3 such 429s came 0.05-1.4 s after another turn on the
+    /// same account, while four other accounts sat at 0%.
+    ///
+    /// The session is pinned to the OTHER account on purpose. When the pin IS the bound account,
+    /// the affinity fast-path already serves it over the threshold and this never happened.
+    #[tokio::test]
+    async fn a_bound_account_over_the_soft_threshold_serves_every_turn() {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager =
+            Manager::with_live_refresher(two_accounts_over(&upstream, &[false, false]), None);
+
+        // Pin the session to account 1, by the same route the pin test above uses.
+        manager.mark_rate_limited(0, 60);
+        let (status, _) =
+            drive_conversation(Arc::clone(&manager), &thinking_turn_body("sess-held", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        manager.clear_rate_limited(0);
+        let pin_key = stable_hash("uid:", "sess-held");
+        let pinned_before = manager.affinity_pin(pin_key);
+        assert_eq!(
+            pinned_before,
+            Some(1),
+            "precondition: the session is pinned to account 1"
+        );
+        let pinned_auth = seen.lock().expect("recorder")[0].clone();
+
+        // The history is signed on account 0, and account 0 reads over the soft threshold (0.90
+        // in `dummy_config`) on its 5-hour window, through the same headers a live reply carries.
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+        let mut over = HeaderMap::new();
+        over.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.96"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_str(&(crate::now_ms() / 1000 + 660).to_string())
+                .expect("reset header"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed_warning"),
+        );
+        manager.update_quota(0, &over);
+
+        // Three turns back to back, all inside one 2 s revalidation window.
+        for turn in 1..=3 {
+            let response = drive_conversation_full(
+                Arc::clone(&manager),
+                &thinking_turn_body("sess-held", &["sig_held"]),
+            )
+            .await;
+            let status = response.status();
+            let claim = response
+                .headers()
+                .get("anthropic-ratelimit-unified-representative-claim")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .expect("read body");
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "turn {turn}: a held conversation on an account over the soft threshold is served \
+                 there, not refused (claim={claim:?}): {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let seen = seen.lock().expect("recorder");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(
+            seen[1..].iter().all(|auth| *auth != pinned_auth),
+            "every held turn reached the signing account, never the pin: {seen:?}"
+        );
+        assert_eq!(
+            manager.affinity_pin(pin_key),
+            pinned_before,
+            "serving the held account is for these requests; the session's pin stays"
+        );
+    }
+
+    /// A 429 for held history never claims a quota window, even when its one account is over
+    /// the threshold on its 5-hour window. The claim makes Claude Code print "You've hit your
+    /// session limit" and stop (measured 2026-09-24 against Claude Code 2.1.281), and it is
+    /// false for held history, whose account releases the conversation to the fleet once it is
+    /// really out. A plain 429 is retried by the client on its own.
+    ///
+    /// The control is the same fleet with no history held: every account is over, so the
+    /// fleet's 429 still names the window.
+    #[tokio::test]
+    async fn a_held_429_never_claims_a_quota_window() {
+        let manager = Manager::with_live_refresher(
+            two_accounts_over("http://127.0.0.1:9", &[false, false]),
+            None,
+        );
+        let mut over = HeaderMap::new();
+        over.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.96"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_str(&(crate::now_ms() / 1000 + 660).to_string())
+                .expect("reset header"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed_warning"),
+        );
+        manager.update_quota(0, &over);
+        manager.update_quota(1, &over);
+        let now = OffsetDateTime::now_utc();
+        let claim = |response: &Response| {
+            response
+                .headers()
+                .get("anthropic-ratelimit-unified-representative-claim")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let fleet = exhausted_response(&manager, now, 2, false, None, None);
+        assert_eq!(
+            claim(&fleet).as_deref(),
+            Some("five_hour"),
+            "control: with no history held, the fleet's 429 names the window"
+        );
+
+        let held = exhausted_response(&manager, now, 2, false, None, Some(0));
+        assert_eq!(held.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(claim(&held), None, "a held 429 names no window");
+        assert!(
+            held.headers()
+                .get("anthropic-ratelimit-unified-status")
+                .is_none(),
+            "and carries no unified status, so the client retries it"
         );
     }
 

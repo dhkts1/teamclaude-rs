@@ -24,6 +24,7 @@
 //! - **Translating index ↔ identity.** The live map is positional, because the response path
 //!   learns an index and must not pay the accounts lock per token; the file is not.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -153,6 +154,68 @@ impl Manager {
                     is_fable,
                 )
         })
+    }
+
+    /// Serve a held request on the account its history is bound to, over the soft threshold if
+    /// need be: `Some(idx)` when that account can answer this request now.
+    ///
+    /// [`Self::bound_account_holds`] keeps a conversation on its account without consulting the
+    /// soft threshold, so the serve side has to agree with it. It did not: a held request on an
+    /// account over the threshold fell through to [`Self::select_revalidation`], whose fallback
+    /// lets one request through per 2 s across the whole fleet, and the turn that lost that race
+    /// got an exhausted 429 naming the account's 5-hour window. Claude Code renders that as
+    /// "You've hit your session limit" (2026-09-24: 3 of 3 such 429s came 0.05-1.4 s after
+    /// another turn on the same account, while four other accounts sat at 0%).
+    ///
+    /// Served the way `select_revalidation` serves a session's pin: the hard gates for THIS
+    /// request ([`Self::hard_ok`] with the request's own group, so a live hold of any length
+    /// still refuses), no revalidation window, and the session's pin left alone. `None` when the
+    /// account already failed this request (`tried`), cannot serve it now, or sits outside the
+    /// group this request asked for strictly: a strict group never serves from outside itself,
+    /// held history included.
+    pub fn select_bound(
+        &self,
+        idx: usize,
+        tried: &HashSet<usize>,
+        now: OffsetDateTime,
+        is_fable: bool,
+        group: Option<&str>,
+        strict_group: Option<&str>,
+    ) -> Option<usize> {
+        if tried.contains(&idx) {
+            return None;
+        }
+        let now_ms = super::odt_to_ms(now);
+        let reserved = self.reserved_groups();
+        let parked = self.parked_groups();
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let account = accounts.get_mut(idx)?;
+        let outside_strict_group =
+            strict_group.is_some_and(|g| !account.groups.iter().any(|carried| carried == g));
+        if outside_strict_group
+            || !Self::hard_ok(
+                account,
+                self.global_threshold,
+                self.fable_weekly_threshold,
+                now,
+                now_ms,
+                is_fable,
+                group,
+                &reserved,
+                &parked,
+            )
+        {
+            return None;
+        }
+        let utilization = account.quota.max_utilization(now, is_fable);
+        account.last_selected_seq = self.select_seq.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            account = %account.name,
+            utilization,
+            is_fable,
+            "revalidation-serve (bound-honor): serving the account this conversation's history is bound to"
+        );
+        Some(idx)
     }
 
     /// Whether `tokens` name more than one distinct account — the disagreement
