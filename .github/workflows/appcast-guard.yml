@@ -35,7 +35,21 @@
 # IDEMPOTENT. A release that already carries an appcast is left untouched, so a
 # real TcrBar release (which uploads its own, with the new version's entry and a
 # matching enclosure length) is never overwritten by the repository's copy.
-# Order does not matter: whichever of the two runs second is a no-op.
+#
+# A PRERELEASE IS LEFT ALONE TOO, because order DID matter. This header used to
+# say whichever of the two runs second is a no-op. On 2026-09-24 (v1.1.17) this
+# guard attached the committed, one-version-old appcast one second after the
+# release was published and one second before release-tcrbar.sh's own upload,
+# which then failed with HTTP 422 "ReleaseAsset.name already exists" although it
+# passed --clobber, and the release stopped with the wrong feed file attached.
+# cargo-dist publishes a normal release; release-tcrbar.sh marks it prerelease
+# (a 10 s watcher, and again right before its upload), uploads its own assets,
+# and only then marks it final and latest. A prerelease is never what
+# `/releases/latest/` serves, so there is nothing for this guard to protect
+# while it is one. This skip NARROWS the race and does not close it: the guard
+# can still read the release in the seconds before it is marked prerelease. The
+# close is on the other side, where release-tcrbar.sh retries its upload once
+# and reads the appcast back (`upload_release_assets`).
 #
 # KEPT, BUT REDUCED IN SCOPE — read before touching the `on:` block below.
 #
@@ -222,7 +236,7 @@ jobs:
           deadline=$(( $(date +%s) + 600 ))
           rel=""
           while :; do
-            if rel="$(gh release view "$TAG" --json isDraft,assets 2>/dev/null)"; then
+            if rel="$(gh release view "$TAG" --json isDraft,isPrerelease,assets 2>/dev/null)"; then
               break
             fi
             if [ "${EVENT_NAME}" != "workflow_run" ] || [ "$(date +%s)" -ge "$deadline" ]; then
@@ -235,6 +249,15 @@ jobs:
 
           if [ "$(printf '%s' "$rel" | jq -r .isDraft)" = "true" ]; then
             echo "$TAG is a draft — /releases/latest/ does not point at it yet; nothing to do."
+            exit 0
+          fi
+
+          # A prerelease is never `/releases/latest/`, and a TcrBar release is one
+          # while release-tcrbar.sh uploads its own appcast (see the header). The
+          # 6-hourly sweep reads `/releases/latest/` itself, so a release marked
+          # final without an appcast is still repaired.
+          if [ "$(printf '%s' "$rel" | jq -r .isPrerelease)" = "true" ]; then
+            echo "$TAG is a prerelease: /releases/latest/ does not serve it, and a TcrBar release uploads its own appcast before it is marked final; nothing to do."
             exit 0
           fi
 
