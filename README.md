@@ -4,13 +4,12 @@
 
 # teamclaude-rs (`tcr`)
 
-A quota-aware scheduler for a pool of Claude accounts.
+A local proxy that spreads Claude Code across a pool of Claude accounts.
 
-Point Claude Code (or any Anthropic API client) at it. It decides which account serves each
-request from what every account has left in every quota window, keeps a conversation on the
-account whose prompt cache is already warm, and shows you what the traffic would have cost.
+Point Claude Code (or any Anthropic API client) at it. For each request it picks an account by
+looking at what every account has left in every quota window. It keeps a conversation on the
+account whose prompt cache is already warm, and it shows you what the traffic would have cost.
 
-[![CI](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
@@ -25,71 +24,22 @@ account whose prompt cache is already warm, and shows you what the traffic would
 
 </div>
 
-## What it does
-
-Every Claude account is rate-limited by several windows at once: a rolling five-hour session
-window, a weekly one, and a weekly window scoped to a single model family. Each tracks how much
-of it you have spent and when it resets, and accounts do not reset together. `tcr` learns all
-of them for every account, and schedules against them.
-
-**It does not round-robin.** Inside a priority tier, rotation ranks by which quota window
-resets soonest, because unused weekly quota is worth nothing once that window resets.
-Least-recently-selected breaks the tie, so requests still fan out instead of parking on one
-account. An account is skipped when it is disabled, erroring, on a rate-limit hold, too close
-to a limit, held back for a group this request did not ask for, or out of the model-scoped
-window this particular request needs. The full ordering is in
-[`docs/architecture.md`](docs/architecture.md#account-selection); the reset-urgency term, and
-how to turn it off, is in
-[`docs/configuration.md`](docs/configuration.md#reseturgencytierhours-spend-the-quota-that-is-about-to-expire).
-
-**The prompt cache is the expensive part.** Anthropic keys it per account, so moving a live
-conversation to a different account re-creates its whole cached prefix. A session therefore
-pins to one account and stays there. A single request that diverts around a transient fault
-does not move the pin; only an account-level failure re-keys it. Pins are written to disk
-continuously and restored at boot, which is what stops a restart from cold-starting every live
-conversation. Anthropic holds a prefix for five minutes, or an hour if the client asks for it,
-and a session that asked for the longer one keeps its pin longer to match.
-
-**Egress is paced per organization**, because that is the unit Anthropic limits: two accounts
-sharing one org get one org's rate, not two. A looser fleet-wide ceiling sits behind it. Quota
-probes, the zero-spend reads that keep an idle account's numbers current, run on their own
-randomized per-account schedule, so the fleet does not arrive upstream in one burst on an exact
-period, and a restart re-scatters it rather than re-aligning it.
-
-**Everything is priced.** Each served request goes to a local ledger against Anthropic's list
-rates, per account and per model, split across input, output, cache reads and cache writes. The
-panel and the terminal dashboard show spend today, the last hour's burn rate, the model mix and
-the cache hit rate, and the ledger replays from disk at boot so a restart does not reset the
-day. Nothing here is a bill: these accounts are subscriptions, and list price is simply the one
-unit that compares across accounts, models and days. Traffic that could not be priced shows no
-figure rather than a zero. An account that served nothing shows a real zero. A window holding a
-mix reports the priced part alongside the count it could not price.
-
-OAuth tokens are refreshed in the background, so accounts do not expire out from under you.
-Accounts carry labels, and a labelled set can be *reserved* so only traffic that asks for it
-routes there. One account can be nominated to serve the identity and control-plane calls a
-client makes alongside its prompts; inference never selects it, so it stays clean. Accounts can
-be added, enabled, disabled and removed against the running proxy, which matters because a
-restart is what costs you the warm pins above. There is a native macOS menu-bar app
-and a terminal dashboard, and `tcr` is a drop-in for the Node
-[teamclaude](https://github.com/KarpelesLab/teamclaude) — same config, certs and port.
-
 ## Install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dhkts1/teamclaude-rs/main/install.sh | sh
 ```
 
-This installs the `tcr` CLI, and on macOS also installs TcrBar from the `.dmg` on the
-[release page](https://github.com/dhkts1/teamclaude-rs/releases/latest) — set `TCR_SKIP_UI=1` to skip that
-second step. For the `tcr` CLI only, on any platform, use the cargo-dist installer directly:
+This installs the `tcr` CLI. On macOS it also installs TcrBar from the `.dmg` on the
+[release page](https://github.com/dhkts1/teamclaude-rs/releases/latest); set `TCR_SKIP_UI=1` to skip
+that step. To install only the `tcr` CLI, on any platform, use the cargo-dist installer directly:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh | sh
 ```
 
-Or from source, with a Rust toolchain. Use the script rather than `cp`, because [`cp` onto a
-running binary rewrites the same inode and macOS then kills it](CONTRIBUTING.md#installing-it-onto-your-path):
+Or build from source with a Rust toolchain. Put the binary in place with the script and not with
+`cp`, because [`cp` onto a running binary rewrites the same inode and macOS then kills it](CONTRIBUTING.md#installing-it-onto-your-path):
 
 ```sh
 cargo build --release
@@ -104,7 +54,8 @@ scripts/install-cli.sh          # places `tcr` at ~/.local/bin/tcr by default
 | Linux aarch64, musl (`aarch64-unknown-linux-musl`) | prebuilt | no |
 | Anything else | build from source | no |
 
-Linux builds are static musl, so Alpine and glibc both work. TcrBar and `tcr ui` are macOS-only.
+The Linux builds are static musl binaries, so they run on both Alpine and glibc systems. TcrBar and
+`tcr ui` are macOS-only.
 
 ## Usage
 
@@ -114,14 +65,14 @@ tcr                # start the proxy with the live TUI (q quits)
 tcr run -- <args>  # launch Claude Code already pointed at the proxy
 ```
 
-If you already use the `claude` CLI on this machine, the first run needs no `tcr login` at
-all: `tcr status`, `tcr accounts` and the server's own boot import that existing login when
-they find no accounts configured, and `tcr login --from-claude-code` is the explicit way to
-redo it. Refresh tokens are single-use, so the first time tcr refreshes the imported
-credential, `claude` asks for a browser login once — stated on every import, and detailed in
-[`docs/cli.md`](docs/cli.md).
+If you already use the `claude` CLI on this machine, you can skip `tcr login` on the first run.
+When `tcr status`, `tcr accounts` or the server's own boot find no accounts configured, they import
+that existing login, and `tcr login --from-claude-code` does the same import on request. A refresh
+token works only once, so the first time tcr refreshes the imported credential, `claude` asks you
+to log in through the browser once. tcr says so on every import, and
+[`docs/cli.md`](docs/cli.md) has the details.
 
-To point a client yourself instead of using `tcr run`:
+To point a client at the proxy yourself instead of using `tcr run`:
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:3456   # base-URL mode
@@ -130,16 +81,16 @@ export HTTPS_PROXY=http://127.0.0.1:3456          # forward-proxy mode
 export NODE_EXTRA_CA_CERTS=<the CA path tcr logs at boot>
 ```
 
-Forward-proxy mode terminates TLS with a locally generated certificate, so the client has to
-trust it. `tcr` prints the CA path to advertise when it starts. Config lives at
-`~/.config/teamclaude.json`, where `name` and `accessToken` are the only required keys.
-Every other key, its default and the file's permissions are in
+Forward-proxy mode decrypts TLS with a locally generated certificate, so the client has to trust
+it; `tcr` prints the CA path to use when it starts. The config lives at
+`~/.config/teamclaude.json`, and `name` and `accessToken` are the only required keys. Every other
+key, its default and the file's permissions are in
 [`docs/configuration.md`](docs/configuration.md).
 
 ### Managing the fleet
 
-These act on the running proxy where one is up, so changing the pool does not cost a restart.
-Every flag is in [`docs/cli.md`](docs/cli.md).
+These commands act on the running proxy when one is up, so changing the pool does not need a
+restart. Every flag is in [`docs/cli.md`](docs/cli.md).
 
 | Command | What it does |
 |---|---|
@@ -151,39 +102,88 @@ Every flag is in [`docs/cli.md`](docs/cli.md).
 | `tcr control <account> [--clear \| --show]` | Nominate the account that serves control-plane traffic. |
 | `tcr group ls \| add \| rm \| reserve \| color` | Label accounts, and hold a labelled set back for traffic that asks for it. |
 | `tcr run --group <name>` | Start a session that prefers one group. |
-| `tcr sessions [--json]` | List the sessions the running proxy has seen in the last hour — the same feed the panel's Sessions and Tools tabs read. |
+| `tcr sessions [--json]` | List the sessions the running proxy has seen in the last hour. The panel's Sessions and Tools tabs read the same feed. |
 | `tcr wrap [--days N]` | A usage report off the on-disk ledger: cost, tokens and cache-hit ratio, broken down by model, account and day. Needs no running proxy. |
 | `tcr token <account>` | Print an account's access token to stdout, for piping. |
 | `tcr update` | Update `tcr` in place, from the checkout or the published installer. |
 
+## What it does
+
+Every Claude account has several usage limits running at once: a rolling five-hour session window,
+a weekly window, and a weekly window for a single model family. Each window tracks how much you
+have used and when it resets, and different accounts reset at different times. `tcr` learns every
+window on every account and schedules requests against them.
+
+**It does not round-robin.** Within a priority tier it prefers the account whose quota window
+resets soonest, because weekly quota you have not used is lost once that window resets. Ties go to
+the account picked least recently, so requests still spread out instead of piling onto one
+account. It skips an account that is disabled, erroring, on a rate-limit hold, too close to a
+limit, held back for a group this request did not ask for, or out of the model-scoped window this
+request needs. The full ordering is in
+[`docs/architecture.md`](docs/architecture.md#account-selection). The reset-urgency rule, and how
+to turn it off, is in
+[`docs/configuration.md`](docs/configuration.md#reseturgencytierhours-spend-the-quota-that-is-about-to-expire).
+
+**The prompt cache is the expensive part.** Anthropic keeps it per account, so moving a live
+conversation to another account rebuilds its whole cached prefix. That is why each session is
+pinned to one account and stays there. A single request that detours around a passing fault does
+not move the pin; only a failure of the account itself does. Pins are saved to disk continuously
+and restored at boot, so a restart does not cold-start every live conversation. Anthropic holds a
+cached prefix for five minutes, or an hour if the client asks for it, and a session that asked for
+the hour keeps its pin longer to match.
+
+**Outgoing traffic is paced per organization**, because that is the unit Anthropic limits: two
+accounts in one org share that org's single rate. A looser ceiling for the whole fleet sits behind
+it. Quota probes are reads that spend nothing and keep an idle account's numbers current. Each
+account runs them on its own random schedule, so the fleet never reaches Anthropic in one burst on
+a fixed period, and a restart scatters them again instead of lining them up.
+
+**Everything is priced.** Every request served goes into a local ledger at Anthropic's list prices,
+per account and per model, split into input, output, cache reads and cache writes. The panel and
+the terminal dashboard show today's spend, the burn rate over the last hour, the model mix and the
+cache hit rate. The ledger reloads from disk at boot, so a restart does not reset the day. None of
+this is a bill: these accounts are subscriptions, and list price is simply the one unit you can
+compare across accounts, models and days. Traffic that could not be priced shows no figure rather
+than a zero, an account that served nothing shows a real zero, and a window holding both reports
+the priced part next to the count it could not price.
+
+OAuth tokens refresh in the background, so accounts do not expire while you work. Accounts can
+carry labels, and a labelled set can be *reserved* so only traffic that asks for it goes there. One
+account can be named to serve the identity and control-plane calls a client makes alongside its
+prompts; inference never picks that account, so it stays clean. You can add, enable, disable and
+remove accounts while the proxy runs, which matters because a restart is what costs you warm pins.
+There is a native macOS menu-bar app and a terminal dashboard. `tcr` also drops in for the Node
+[teamclaude](https://github.com/KarpelesLab/teamclaude) proxy, with the same config, certs and port.
+
 ## Watching it
 
-`apps/macos` is a native front end over the same `tcr status --json` the TUI reads. The
-menu-bar item is the whole app: no Dock icon, no window. The glyph carries fleet-wide capacity
-rather than the worst account, because one spent account in a rotating pool is the mechanism
-working, not an alarm.
+`apps/macos` holds TcrBar, a native front end over the same `tcr status --json` the TUI reads. The
+menu-bar item is the whole app, with no Dock icon and no window. Its icon shows the capacity left
+across the whole fleet rather than the worst account, because one used-up account in a rotating
+pool is the rotation working, not an alarm.
 
-The panel has three tabs. **Accounts** is one row per account, one line per quota window on
-each — bar, percentage and the countdown to that window's reset — plus probe health, group
-tags, and a right-click menu that shells out to `tcr`, so you can steer the fleet from the
-panel. **Sessions** groups the proxy's live sessions by the account each is pinned to.
-**Tools** shows what is running now, the slowest calls today, and totals by tool. Sessions and
-Tools read from the running proxy and keep a snapshot of what they last saw, so a proxy
-restart leaves the tabs showing their last known state rather than going blank.
+The panel has four tabs. **Accounts** has one row per account, with a line for each quota window
+showing a bar, a percentage and the countdown to that window's reset. Each row also shows probe
+health and group tags, and its right-click menu runs `tcr` for you, so you can steer the fleet
+from the panel. **Sessions** lists the proxy's live sessions by project, and each one names the
+account it runs on. **Tools** shows what is running now, today's slowest calls and totals per tool.
+**Peers** shows the other Macs `tcr` has found and what is lent (see [Peers](#peers)). Sessions and
+Tools read from the running proxy and keep a copy of what they last saw, so after a proxy restart
+they show their last known state instead of going blank.
 
-Accounts rows also carry the model-scoped weekly window, Fable's on current plans, for an
-account the proxy has learned one for; an account it has not shows nothing there rather than a
-zero. That window is enforced as well as displayed: a request targeting that model skips an
-account which has exhausted it, and requests for every other model ignore it. The header and
-each card carry the spend figures described above. The footer holds a keep-awake switch and
-Quit. TcrBar can also supervise the proxy, hold the Mac awake while it does, and self-update
-through [Sparkle](https://sparkle-project.org).
+Account rows also show the model-scoped weekly window (Fable's, on current plans) once the proxy has
+learned that window for the account; until then the spot stays empty rather than showing a zero.
+The proxy enforces that window as well as showing it: a request for that model skips an account
+that has used it up, and requests for any other model ignore it. The header and each card show the
+spend figures, and the footer holds a keep-awake switch, Check for updates and Quit. TcrBar can also run the proxy for
+you, keep the Mac awake while it does, and update itself through
+[Sparkle](https://sparkle-project.org).
 
 Install it from the [latest release](https://github.com/dhkts1/teamclaude-rs/releases/latest), or run
-`tcr ui`. Build it here with `apps/macos/scripts/install.sh`; releases: [`docs/RELEASING.md`](docs/RELEASING.md).
+`tcr ui`. To build it from this repo, run `apps/macos/scripts/install.sh`. How releases are made is in [`docs/RELEASING.md`](docs/RELEASING.md).
 
-The panel never renders a blank list. It also distinguishes `tcr` being missing, a failing
-poll, an empty fleet and an offline read, because each one needs a different response.
+The panel never shows a blank list. It tells apart four cases, because each needs a different
+response: `tcr` is missing, a poll is failing, the fleet is empty, or the read is offline.
 
 <p>
   <img src="assets/tcrbar-panel-offline.png" alt="TcrBar panel showing an offline read" width="400">
@@ -197,50 +197,51 @@ poll, an empty fleet and an offline read, because each one needs a different res
 
 ![tcr live TUI](assets/tui-demo.gif)
 
-The TUI runs on macOS and Linux alike and shows everything the panel does, plus the live
-session tree: which conversation is pinned to which account, and which ones diverted.
+The TUI runs on both macOS and Linux and shows everything the panel does, plus the live session
+tree: which conversation is pinned to which account, and which ones diverted.
 
-`tcr demo` renders the real TUI against fake accounts (which is how these screenshots were
-made). It needs no config and contacts nothing.
+`tcr demo` runs the real TUI against fake accounts, which is how these screenshots were made. It
+needs no config and contacts nothing.
 
 </details>
 
 ## How it works
 
-One TCP listener serves both entry modes, decided by a non-destructive peek at the first
-eight bytes of each connection: a `CONNECT` for an Anthropic API host is TLS-terminated with
-a locally generated leaf, anything else is copied through as raw bytes, and plain HTTP is
-base-URL mode. Requests then run a bounded rotation loop: pick an eligible account, refresh
-its token if it is expiring, swap the client's credentials for the pooled one, send, and
-rotate on a 401, 429, 529 or transport failure.
+One TCP listener serves both modes. It peeks at the first eight bytes of each connection without
+consuming them and decides from those. A `CONNECT` to an Anthropic API host has its TLS terminated
+with a locally generated leaf certificate, any other `CONNECT` is copied through as raw bytes, and
+plain HTTP is base-URL mode. Each request then runs a bounded rotation loop: pick an eligible
+account, refresh its token if it is about to expire, swap the client's credentials for the pooled
+one, send, and rotate to another account on a 401, 429, 529 or transport failure.
 
-Quota comes from the response headers of traffic `tcr` already serves, kept fresh between
-requests by a zero-spend probe against Anthropic's OAuth usage endpoint. The probe makes no
-`/v1/messages` call, so an idle account's bars stay honest instead of freezing at their
-last-served value. A window that has passed its reset reads as fresh rather than full,
-computed against the clock at read time, so neither the display nor the scheduler can act on a
-stale bar. The request-flow diagram, the selection ordering and the probe schedule are in
+Quota numbers come from the response headers of traffic `tcr` already serves. Between requests, a
+probe that spends nothing against Anthropic's OAuth usage endpoint keeps them fresh. The probe
+never calls `/v1/messages`, so an idle account's bars stay accurate instead of freezing at their
+last served value. A window that has passed its reset reads as fresh rather than full, worked out
+against the clock at the moment it is read, so neither the display nor the scheduler can act on a
+stale bar. The request-flow diagram, the selection order and the probe schedule are in
 [`docs/architecture.md`](docs/architecture.md).
 
 ## Peers
 
-`tcr` can find other Macs on your network running `tcr`, trust them, and lend a trusted Mac a
-share of an account: 20 % of a group's weekly window, one account until 18:00, and so on. Off
-by default, one switch each for finding and sharing, nothing sent before you turn one on.
+`tcr` can find other Macs on your network that run `tcr`, trust them, and lend a trusted Mac part
+of an account: 20 % of a group's weekly window, for example, or one account until 18:00. It is off
+by default. Finding and sharing each have their own switch, and nothing is sent before you turn
+one on.
 
-Three rules hold the whole thing up. The beacon carries a random per-boot id and a port, never
-a key or a name unless you allow the name. Nobody is trusted until a person on each Mac has
-compared the same six digits on both screens and pressed Trust. A borrowed request is served
-on the lender's own account: the borrower's credential never leaves the borrower's machine,
-and the lender never learns it.
+The design rests on three rules. The announcement each Mac broadcasts carries a random id that
+changes every boot and a port; it never carries a key, and carries a name only if you allow it.
+Nobody is trusted until a person at each Mac has compared the same six digits on both screens and
+pressed Trust. A borrowed request is served from the lender's own account, so the borrower's
+credential never leaves the borrower's Mac and the lender never learns it.
 
 Pairing and every peer stream run over the
-[Noise Protocol Framework](https://noiseprotocol.org/noise.html): `XX` for a first pairing
-(both sides learn each other's key, the six digits come from the handshake hash), `IK` for a
-return visit to a Mac you already trust, `IKpsk1` when a join key is passed around. It is the
-handshake family WireGuard is built on, and if you want to understand how any
+[Noise Protocol Framework](https://noiseprotocol.org/noise.html). A first pairing uses `XX` (both
+sides learn each other's key, and the six digits come from the handshake hash), a return visit to
+a Mac you already trust uses `IK`, and `IKpsk1` is for when a join key has been passed around.
+WireGuard is built on the same handshake family, and if you want to understand how any
 Diffie-Hellman based authentication works, that one spec is the best hour you can spend.
-Finding, trusting, lending and what each act sends: [`docs/peers.md`](docs/peers.md).
+[`docs/peers.md`](docs/peers.md) covers finding, trusting, lending and what each step sends.
 
 ## Documentation
 
@@ -255,68 +256,67 @@ Finding, trusting, lending and what each act sends: [`docs/peers.md`](docs/peers
 
 ## Security
 
-Worth reading before you run it.
+Read this before you run it.
 
-**Bind scope is not authorization.** `tcr` binds `127.0.0.1`, but loopback is reachable by
-every process and container on the host. The forwarding path exempts loopback from the
-api-key gate, and nothing generates a `proxy.apiKey` for you, so on a default install being
-on this host is the whole gate. Set one if that is not the boundary you want.
+**Listening only on localhost does not keep other programs out.** `tcr` binds `127.0.0.1`, but
+every process and container on the host can reach loopback. The forwarding path does not ask
+loopback callers for the API key, and nothing creates a `proxy.apiKey` for you, so on a default
+install the only check is being on this host. Set a key if you want a tighter boundary than that.
 
-**The forward proxy is an open tunnel by design.** The MITM allowlist is three hosts:
-`api.anthropic.com`, `console.anthropic.com` and `platform.anthropic.com`. Every other
-`CONNECT` target is copied through as raw bytes, never decrypted and never filtered, which
-makes `tcr` an unrestricted forward proxy to any host for any local process. That is
-intentional (Claude Code needs it), but treat it as a tunnel rather than a firewall. Which
-hosts actually terminate depends on the leaf certificate in use, which
-[`MITM-DESIGN.md`](MITM-DESIGN.md) works through.
+**The forward proxy is an open tunnel on purpose.** Its allowlist of hosts it may decrypt has three entries:
+`api.anthropic.com`, `console.anthropic.com` and `platform.anthropic.com`. Every other `CONNECT`
+target is copied through as raw bytes and is never decrypted or filtered, which makes `tcr` an
+unrestricted forward proxy to any host for any local process. Claude Code needs it to work that
+way, so treat it as a tunnel and not as a firewall. Which hosts are actually decrypted depends on
+the leaf certificate in use, and [`MITM-DESIGN.md`](MITM-DESIGN.md) works through that.
 
-**Credentials.** On the two inference paths the client's own `authorization` and `x-api-key`
-headers are dropped before the pooled Bearer is injected, so a client credential is never
-forwarded alongside ours. Everything else a client sends with its own bearer — connector
-list, plugins, settings, bootstrap — is relayed under that bearer untouched, because those
-calls are about the client's identity, and the proxy checks that identity against
-`controlAccount` (`controlIdentity` in [`docs/configuration.md`](docs/configuration.md)).
-`git config core.hooksPath .githooks` enables a pre-commit secret scan and the other gates
-listed in [CONTRIBUTING.md](CONTRIBUTING.md#git-hooks). Treat it as a backstop: it only sees
-what you stage, and `--no-verify` exists.
+**Credentials.** On the two inference paths, `tcr` drops the client's own `authorization` and
+`x-api-key` headers before adding the pooled Bearer token, so a client credential is never sent
+alongside ours. Everything else a client sends under its own bearer (connector list, plugins,
+settings, bootstrap) is relayed under that bearer unchanged, because those calls are about the
+client's identity. The proxy checks that identity against `controlAccount` (see `controlIdentity`
+in [`docs/configuration.md`](docs/configuration.md)).
 
-**Peers are opt-in twice and rate-limited.** Nothing is announced until `find` is on and
-nothing is served until `share` is on. A Mac that wants to pair knocks with ephemeral keys only
-and waits in a list until you accept it; knocks are capped per address (one every 10 s, burst
-3, two unauthenticated sockets) and the list holds eight. An address you ignore is muted, one
-you block is banned by address and, once its key is known, by key. A lender sees the plaintext
-of the requests it serves, by design, and lends at most half of any window. The full table of
-what each act sends is in [`docs/peers.md`](docs/peers.md#what-leaves-this-mac).
+`git config core.hooksPath .githooks` turns on a pre-commit secret scan and the other gates
+listed in [CONTRIBUTING.md](CONTRIBUTING.md#git-hooks). Treat it as a backstop: it only sees what
+you stage, and `--no-verify` exists.
 
-Found a security issue? Please open a private report through GitHub's security advisories
-rather than a public issue.
+**Peers are opt-in twice and rate-limited.** Nothing is announced until `find` is on, and nothing
+is served until `share` is on. A Mac that wants to pair knocks with temporary keys only and waits
+in a list until you accept it. Knocks are capped per address (one every 10 s, a burst of 3, two
+unauthenticated sockets), and the list holds eight. An address you ignore is muted. One you block
+is banned by address and, once its key is known, by key. A lender sees the plaintext of the
+requests it serves, by design, and lends at most half of any window.
+[`docs/peers.md`](docs/peers.md#what-leaves-this-mac) has the full table of what each step sends.
+
+Found a security issue? Please report it privately through GitHub's security advisories rather
+than in a public issue.
 
 ## It does not phone home
 
 `tcr` has no telemetry and no crash reporting. Your config, logs, session pins and OAuth tokens are
-files on your own disk. It makes two kinds of outbound call: Anthropic, on your behalf, and GitHub,
-to check for a newer version.
+files on your own disk. It makes two kinds of outbound call: to Anthropic on your behalf, and to
+GitHub to check for a newer version.
 
-The cost lands on whoever hits a bug. There is no error stream to grep and no session to replay, so
-a good bug report is worth more here than in a project that watches its users. #323 was diagnosed
-from a screenshot and four log lines someone pasted.
+The cost falls on whoever hits a bug. There is no error stream to search and no session to replay,
+so a good bug report is worth more here than in a project that watches its users. #323 was
+diagnosed from a screenshot and four log lines someone pasted.
 
-What it does instead of watching you is sign things. The app is codesigned with a Developer ID
-certificate, notarized by Apple and stapled, and every update is signed again with a Sparkle EdDSA
-key that your installed copy checks before it will run anything. Counting the cast: seven signing
-secrets for the release, all of which were deliberately removed from this repository on 2026-08-09
-and now live on one Mac and in one 1Password item, plus a local CA on your machine that mints a
-fresh leaf certificate on every boot, plus your per-account OAuth tokens, plus the proxy's own API
-key.
+Instead of watching you, it signs things. The app is codesigned with a Developer ID certificate,
+notarized by Apple and stapled, and every update is signed again with a Sparkle EdDSA key that your
+installed copy checks before it runs anything. Counting them all, there are seven signing secrets
+for the release, all deliberately removed from this repository on 2026-08-09 and now kept on one
+Mac and in one 1Password item. On top of those come a local CA on your machine that mints a fresh
+leaf certificate on every boot, your per-account OAuth tokens, and the proxy's own API key.
 
-It is an absurd number of keys for a thing that rotates Claude accounts. The reasoning is in
-[docs/RELEASING.md](docs/RELEASING.md): this repository is public, collaborators have push, and
-Sparkle's private key does not protect a build artifact, it decides what every already-installed
-copy will execute. Nothing stored is nothing stolen.
+That is a lot of keys for a tool that rotates Claude accounts. The reasoning is in
+[docs/RELEASING.md](docs/RELEASING.md): this repository is public, collaborators have push access,
+and Sparkle's private key does more than protect a build artifact. It decides what every copy
+already installed will run. A key that is not stored here cannot be stolen from here.
 
 ## Credits and license
 
-PolyForm Noncommercial 1.0.0, see [`LICENSE`](LICENSE). This is a from-scratch Rust rewrite
-of the Node proxy [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude), which
-is MIT, and its notice is retained. The original's copyright and license are preserved in
+Licensed under PolyForm Noncommercial 1.0.0; see [`LICENSE`](LICENSE). This is a from-scratch Rust
+rewrite of the Node proxy [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude),
+which is MIT licensed. The original's copyright and license notice are kept in
 [`NOTICE`](NOTICE).
