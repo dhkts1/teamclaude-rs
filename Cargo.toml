@@ -200,7 +200,7 @@ sha2 = "0.10"
 # crate's own `getrandom`, which is a feature edge onto `crypto-common` that
 # buys nothing here, the nonce comes from the `getrandom` grant above. With it
 # off, `git diff Cargo.lock` is one line.
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 # Property tests over the peer-mesh wire's parse/decode boundary
