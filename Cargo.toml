@@ -175,7 +175,7 @@ tcr-peer-wire = { path = "crates/tcr-peer-wire" }
 # dependency EDGE and no package. A lease id is not Noise material and minting it
 # through `noise::random_secret` would make the one file that may name `snow::`
 # the source of a number that has nothing to do with a handshake.
-getrandom = "0.3"
+getrandom = "0.4"
 # HMAC-SHA256 for the opt-in network key's announcement tag
 # (`NetworkKey::announcement_tag`, src/peer/config.rs). Granted as a DIRECT
 # dependency for the same reason `getrandom` above is: 0.10.9 is already in

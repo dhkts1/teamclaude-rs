@@ -2860,7 +2860,7 @@ dependencies = [
  "eventsource-stream",
  "form_urlencoded",
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hyper",
  "hyper-util",
  "if-addrs",
