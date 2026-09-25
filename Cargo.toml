@@ -184,7 +184,7 @@ getrandom = "0.3"
 # itself is twenty lines of RFC 2104 beside the key, because `hmac` is NOT in
 # the lock (`cargo tree -i hmac` prints nothing) and would be a genuinely new
 # package; it is verified against RFC 4231's test case 2, not against itself.
-sha2 = "0.10"
+sha2 = "0.11"
 # ChaCha20-Poly1305 for the sealed per-pair record (`peer::drop::seal`).
 # Granted as a DIRECT dependency for the same reason `getrandom` and `sha2`
 # above are: 0.10.1 is already in `Cargo.lock` because `snow`'s
