@@ -297,6 +297,30 @@ impl Manager {
         if newly_known {
             self.warm_wake.notify_one();
         }
+        // One greppable sample per successful probe, so a day of logs joined
+        // with the usage ledger (`scripts/fit-quota-weights.py`) can fit how
+        // each token kind weighs against the 5h window. Nothing else records
+        // utilization over time: the headers and the usage endpoint both report
+        // whole percents, so a single request cannot move the reading and a
+        // controlled probe would cost several percent of a window; the fit
+        // reads it off real traffic for free. `-1` is "not reported", never a
+        // fabricated zero. Logged with the accounts lock released.
+        let name = self.account_name(idx).unwrap_or_default();
+        let util = |bucket: Option<crate::probe::UsageBucket>| {
+            bucket.and_then(|b| b.utilization).unwrap_or(-1.0)
+        };
+        let reset = |bucket: Option<crate::probe::UsageBucket>| {
+            bucket.and_then(|b| b.reset_at_ms).unwrap_or(-1)
+        };
+        tracing::info!(
+            account = %name,
+            five_hour = util(usage.five_hour),
+            five_hour_reset_ms = reset(usage.five_hour),
+            seven_day = util(usage.seven_day),
+            seven_day_reset_ms = reset(usage.seven_day),
+            seven_day_oi = util(usage.seven_day_oi),
+            "quota-sample: usage probe read"
+        );
     }
 
     /// Hold account `idx` out of rotation for `seconds` (a 429 quota rejection).
