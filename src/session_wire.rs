@@ -1715,6 +1715,13 @@ pub struct WireSession {
     /// [`UNKNOWN_MODEL`] when it carried none) — the source `crate::manager::wire_sessions`
     /// prices into `SessionRow::cost_usd`, one model's price at a time, then sums.
     pub by_model: std::collections::HashMap<String, ModelTokenTally>,
+    /// The prompt-cache tier of this session's most recent cache write, in seconds (3600 for
+    /// the 1-hour tier, 300 for the 5-minute one); `None` before its first write. A response
+    /// with no cache write leaves it alone, because a cache read refreshes the entry at the
+    /// tier it was written with. `#[serde(default)]` so a cache file written before this
+    /// field existed still loads.
+    #[serde(default)]
+    pub cache_ttl_secs: Option<u32>,
 }
 
 /// Tools whose `tool_use` block is the LAST content block of a turn, so the client never sends
@@ -1921,6 +1928,11 @@ impl WireSessionTracker {
         if let Some(entry) = self.sessions.get_mut(session_id) {
             entry.input_tokens += base_input;
             entry.cache_creation_tokens += cache_5m + cache_1h;
+            if cache_1h > 0 {
+                entry.cache_ttl_secs = Some(3600);
+            } else if cache_5m > 0 {
+                entry.cache_ttl_secs = Some(300);
+            }
             entry.output_tokens += output;
             entry.cache_read_tokens += cache_read;
             let tally = entry
@@ -3471,6 +3483,33 @@ mod tests {
         for (raw, expected, why) in cases {
             assert_eq!(&identity::identity(raw), expected, "{why}\n  raw: {raw:?}");
         }
+    }
+
+    /// A session's cache tier is the tier of its MOST RECENT cache write: a 1-hour write sets
+    /// 3600, a response that wrote nothing keeps it (a read refreshes the entry at the tier it
+    /// was written with), and a later 5-minute write sets 300. Absent before the first write.
+    #[test]
+    fn cache_ttl_follows_the_most_recent_cache_write() {
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_request("sess-ttl", None, None, 1_000, &[], &[]);
+        assert_eq!(tracker.snapshot(1_000)[0].1.cache_ttl_secs, None);
+
+        // Reads and base input alone do not name a tier.
+        tracker.record_usage("sess-ttl", None, 10, 0, 0, 500, 5);
+        assert_eq!(tracker.snapshot(1_000)[0].1.cache_ttl_secs, None);
+
+        tracker.record_usage("sess-ttl", None, 10, 0, 40, 0, 5);
+        assert_eq!(tracker.snapshot(1_000)[0].1.cache_ttl_secs, Some(3600));
+
+        tracker.record_usage("sess-ttl", None, 10, 0, 0, 900, 5);
+        assert_eq!(
+            tracker.snapshot(1_000)[0].1.cache_ttl_secs,
+            Some(3600),
+            "a response with no cache write keeps the last tier"
+        );
+
+        tracker.record_usage("sess-ttl", None, 10, 20, 0, 0, 5);
+        assert_eq!(tracker.snapshot(1_000)[0].1.cache_ttl_secs, Some(300));
     }
 
     /// The repair is forward, never backward. Trimming back to the last balanced position is

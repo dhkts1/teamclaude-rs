@@ -1547,6 +1547,21 @@ struct FleetView: View {
                         Text(" · \(QuotaFormat.usd(cost))").monospacedDigit()
                             .lineLimit(1).layoutPriority(1)
                     }
+                    // How long this session's prompt cache stays warm, from the server's
+                    // own tier (`SessionRow::cache_ttl_secs`) and the last request time.
+                    // Absent from the server means no clause, the same rule as the `$`
+                    // above. Re-evaluated on every render, which the 3 s poll's published
+                    // `lastPollAt` drives, so it counts down while the panel is open.
+                    if let reading = CacheCountdown.reading(
+                        lastSeenMs: row.session.lastSeenMs,
+                        ttlSecs: row.session.cacheTtlSecs,
+                        now: Date())
+                    {
+                        Text(" · " + reading.text)
+                            .foregroundStyle(cacheCountdownColor(reading.tone))
+                            .monospacedDigit()
+                            .lineLimit(1).layoutPriority(1)
+                    }
                     // `cache %` is GONE (`docs/design/panel-tabs.md` §3):
                     // measured across all ten live sessions at the time this
                     // rewrite was made, it carried exactly one distinct value
@@ -1683,6 +1698,15 @@ struct FleetView: View {
         let elapsed = max(
             0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(oldestStartedMs) / 1000)))
         return "\(running.count) running · oldest \(durationLabel(elapsed))"
+    }
+
+    private func cacheCountdownColor(_ tone: CacheCountdown.Tone) -> Color {
+        switch tone {
+        case .normal: return Tok.dim
+        case .cold: return Tok.inkFaint
+        case .near: return Tok.near
+        case .danger: return Tok.spent
+        }
     }
 
     private func activityColor(_ activity: SessionActivity) -> Color {

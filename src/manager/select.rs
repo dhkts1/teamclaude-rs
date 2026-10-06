@@ -562,6 +562,8 @@ impl Manager {
         // paced/model-class/pin-tried divert): a stable sentinel, not a real
         // deadline, so those diverts still key one shared episode per pin.
         let mut divert_until_ms: i64 = 0;
+        // Built once here, read by every hold-or-move decision below.
+        let warm = self.warm_window(affinity);
 
         // Affinity fast-path: honour an existing pin when it is still usable. Read
         // the pin under the affinity lock, then DROP that lock before taking the
@@ -639,7 +641,14 @@ impl Manager {
                     // already tried still keeps its pin for the session's Opus turns.
                     let accounts = self.accounts.read().expect("accounts lock poisoned");
                     if accounts.get(idx).is_some_and(|a| {
-                        Self::account_hard_ok(a, now_ms, group, &reserved_groups, &parked_groups)
+                        Self::account_hard_ok(
+                            a,
+                            now_ms,
+                            group,
+                            &reserved_groups,
+                            &parked_groups,
+                            warm,
+                        )
                     }) {
                         keep_pin = Some(idx);
                         divert_reason = Some("pin-tried");
@@ -761,6 +770,7 @@ impl Manager {
                                     group,
                                     &reserved_groups,
                                     &parked_groups,
+                                    warm,
                                 )
                             });
                             let model_blocked = accounts.get(idx).is_some_and(|a| {
@@ -780,7 +790,7 @@ impl Manager {
                             // the branch does not depend on the ordering above.
                             let held_briefly = accounts
                                 .get(idx)
-                                .is_some_and(|a| Self::hold_clears_while_warm(a, now_ms));
+                                .is_some_and(|a| Self::hold_clears_while_warm(a, now_ms, warm));
                             if !account_alive {
                                 // Genuinely gone: fall through and durably re-key.
                                 None
@@ -828,9 +838,7 @@ impl Manager {
                                                 &parked_groups,
                                             )
                                     });
-                                if idle_ms >= CACHE_WARM_HOLD_SECS * 1000
-                                    && has_eligible_alternative
-                                {
+                                if idle_ms >= warm.ms() && has_eligible_alternative {
                                     // Idle-cold, and there is somewhere better to go: the
                                     // prompt cache is already dead by our own clock, so
                                     // serving the pin protects nothing — fall through to
@@ -847,13 +855,13 @@ impl Manager {
                                         .unwrap_or_default();
                                     tracing::info!(
                                         idle_s = idle_ms / 1000,
-                                        cache_warm_hold_secs = CACHE_WARM_HOLD_SECS,
+                                        cache_warm_hold_secs = warm.secs(),
                                         account = %name,
                                         utilization = util,
                                         is_fable,
                                         "revalidation-rekey (idle-cold): session idle {}s >= {}s on over-threshold account {} utilization {}; re-keying",
                                         idle_ms / 1000,
-                                        CACHE_WARM_HOLD_SECS,
+                                        warm.secs(),
                                         name,
                                         util
                                     );
@@ -1607,6 +1615,7 @@ impl Manager {
         // for a HARD reservation gate: it can only ever narrow who this path
         // revalidates onto a reserved account, never widen it, so a reserved
         // account is never leaked to traffic this path cannot identify.
+        let warm = self.warm_window(affinity);
         let hard_ok = |account: &AccountRuntime| -> bool {
             Self::hard_ok(
                 account,
@@ -1618,6 +1627,7 @@ impl Manager {
                 None,
                 &reserved_groups,
                 &parked_groups,
+                warm,
             )
         };
 
@@ -1680,7 +1690,7 @@ impl Manager {
                 // the opposite decision on the identical fact and documents why
                 // (see its affinity fast-path); the two now agree.
                 if accounts.get(idx).is_some_and(|a| {
-                    Self::account_hard_ok(a, now_ms, None, &reserved_groups, &parked_groups)
+                    Self::account_hard_ok(a, now_ms, None, &reserved_groups, &parked_groups, warm)
                 }) {
                     keep_pin = Some(idx);
                     pin_until_ms = accounts
@@ -1879,9 +1889,13 @@ impl Manager {
     /// as LONG, because the prefix is gone at the same instant the account frees.
     ///
     /// Pure and lock-free; the caller holds whichever accounts lock it needs.
-    pub(super) fn hold_outlives_cache(account: &AccountRuntime, now_ms: i64) -> bool {
+    pub(super) fn hold_outlives_cache(
+        account: &AccountRuntime,
+        now_ms: i64,
+        warm: WarmWindow,
+    ) -> bool {
         Self::hold_remaining_ms(account, now_ms)
-            .is_some_and(|remaining_ms| remaining_ms >= CACHE_WARM_HOLD_SECS * 1000)
+            .is_some_and(|remaining_ms| remaining_ms >= warm.ms())
     }
 
     /// Whether a live hold clears while this account's prompt cache is still warm
@@ -1891,9 +1905,13 @@ impl Manager {
     /// divert the one request and leave the pin where it is.
     ///
     /// Pure and lock-free; the caller holds whichever accounts lock it needs.
-    pub(super) fn hold_clears_while_warm(account: &AccountRuntime, now_ms: i64) -> bool {
+    pub(super) fn hold_clears_while_warm(
+        account: &AccountRuntime,
+        now_ms: i64,
+        warm: WarmWindow,
+    ) -> bool {
         Self::hold_remaining_ms(account, now_ms)
-            .is_some_and(|remaining_ms| remaining_ms < CACHE_WARM_HOLD_SECS * 1000)
+            .is_some_and(|remaining_ms| remaining_ms < warm.ms())
     }
 
     /// The TERMINAL account-level gates — the blocks that are a fact about the
@@ -1971,6 +1989,7 @@ impl Manager {
         group: Option<&str>,
         reserved: &HashSet<String>,
         parked: &HashSet<String>,
+        warm: WarmWindow,
     ) -> bool {
         if Self::account_terminal_gate(account).is_some() {
             return false;
@@ -1978,7 +1997,7 @@ impl Manager {
         if Self::parked_blocks(account, parked) {
             return false;
         }
-        if Self::hold_outlives_cache(account, now_ms) {
+        if Self::hold_outlives_cache(account, now_ms, warm) {
             return false;
         }
         if Self::reserved_blocks(account, group, reserved) {
@@ -2087,9 +2106,10 @@ impl Manager {
         group: Option<&str>,
         reserved: &HashSet<String>,
         parked: &HashSet<String>,
+        warm: WarmWindow,
     ) -> bool {
-        Self::account_hard_ok(account, now_ms, group, reserved, parked)
-            && !Self::hold_clears_while_warm(account, now_ms)
+        Self::account_hard_ok(account, now_ms, group, reserved, parked, warm)
+            && !Self::hold_clears_while_warm(account, now_ms, warm)
             && !Self::model_blocked(
                 account,
                 global_threshold,
@@ -3925,8 +3945,14 @@ mod reserved_gate_agreement_tests {
                      disagrees with reserved_blocks"
                 );
 
-                let hard_ok =
-                    Manager::account_hard_ok(&account, now_ms, None, &reserved, &HashSet::new());
+                let hard_ok = Manager::account_hard_ok(
+                    &account,
+                    now_ms,
+                    None,
+                    &reserved,
+                    &HashSet::new(),
+                    WarmWindow::DEFAULT,
+                );
                 assert_eq!(
                     hard_ok, !blocked,
                     "groups={groups:?} reserved={reserved_list:?}: account_hard_ok \

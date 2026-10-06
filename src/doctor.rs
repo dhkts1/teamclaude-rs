@@ -695,6 +695,7 @@ mod tests {
             tools: Default::default(),
             req_per_minute,
             cost_usd: 0.0,
+            cache_ttl_secs: None,
         }
     }
 

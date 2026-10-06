@@ -1312,6 +1312,12 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
     /// `nil` draws no `$` clause; it is never read as zero.
     public let costUsd: Double?
 
+    /// How long this session's prompt cache stays warm after its last request, in seconds
+    /// (3600 or 300) — `SessionRow::cache_ttl_secs`, keyed `cacheTtlSecs`. `nil` when the
+    /// session has not written the cache yet or the server predates the field; no clause is
+    /// drawn then. See ``CacheCountdown``.
+    public let cacheTtlSecs: Int?
+
     public var id: String { sessionId }
 
     public init(
@@ -1326,7 +1332,8 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         cacheReadTokens: Int = 0,
         tools: SessionTools = SessionTools(),
         reqPerMinute: [UInt16]? = nil,
-        costUsd: Double? = nil
+        costUsd: Double? = nil,
+        cacheTtlSecs: Int? = nil
     ) {
         self.sessionId = sessionId
         self.account = account
@@ -1340,11 +1347,12 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         self.tools = tools
         self.reqPerMinute = reqPerMinute
         self.costUsd = costUsd
+        self.cacheTtlSecs = cacheTtlSecs
     }
 
     private enum CodingKeys: String, CodingKey {
         case sessionId, account, model, firstSeenMs, lastSeenMs, requests, inputTokens,
-            outputTokens, cacheReadTokens, tools, reqPerMinute, costUsd
+            outputTokens, cacheReadTokens, tools, reqPerMinute, costUsd, cacheTtlSecs
     }
 
     public init(from decoder: Decoder) throws {
@@ -1361,6 +1369,7 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         tools = try c.decodeIfPresent(SessionTools.self, forKey: .tools) ?? SessionTools()
         reqPerMinute = try c.decodeIfPresent([UInt16].self, forKey: .reqPerMinute)
         costUsd = try c.decodeIfPresent(Double.self, forKey: .costUsd)
+        cacheTtlSecs = try c.decodeIfPresent(Int.self, forKey: .cacheTtlSecs)
     }
 }
 

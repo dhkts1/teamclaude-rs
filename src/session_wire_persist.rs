@@ -273,6 +273,7 @@ mod tests {
             },
             req_per_minute: Default::default(),
             by_model: Default::default(),
+            cache_ttl_secs: None,
         }
     }
 

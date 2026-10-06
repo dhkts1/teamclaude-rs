@@ -36,7 +36,7 @@ use crate::bound_tokens::{
 use crate::config::ConfigError;
 use crate::identity;
 
-use super::Manager;
+use super::{Manager, WarmWindow};
 
 /// How long a session stays told that its held conversation is moving off one account (see
 /// [`Manager::first_switch_warning`]). The client's own retry comes within seconds; this only
@@ -145,13 +145,14 @@ impl Manager {
         now: OffsetDateTime,
         is_fable: bool,
         group: Option<&str>,
+        warm: WarmWindow,
     ) -> bool {
         let now_ms = super::odt_to_ms(now);
         let reserved = self.reserved_groups();
         let parked = self.parked_groups();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         accounts.get(idx).is_some_and(|account| {
-            Self::account_hard_ok(account, now_ms, group, &reserved, &parked)
+            Self::account_hard_ok(account, now_ms, group, &reserved, &parked, warm)
                 && !Self::model_blocked(
                     account,
                     self.global_threshold,
@@ -179,6 +180,7 @@ impl Manager {
     /// account already failed this request (`tried`), cannot serve it now, or sits outside the
     /// group this request asked for strictly: a strict group never serves from outside itself,
     /// held history included.
+    #[allow(clippy::too_many_arguments)]
     pub fn select_bound(
         &self,
         idx: usize,
@@ -187,6 +189,7 @@ impl Manager {
         is_fable: bool,
         group: Option<&str>,
         strict_group: Option<&str>,
+        warm: WarmWindow,
     ) -> Option<usize> {
         if tried.contains(&idx) {
             return None;
@@ -209,6 +212,7 @@ impl Manager {
                 group,
                 &reserved,
                 &parked,
+                warm,
             )
         {
             return None;
@@ -640,28 +644,52 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let untried = HashSet::new();
         assert_eq!(
-            manager.select_bound(0, &untried, now, false, Some("g"), Some("g")),
+            manager.select_bound(
+                0,
+                &untried,
+                now,
+                false,
+                Some("g"),
+                Some("g"),
+                WarmWindow::DEFAULT
+            ),
             Some(0),
             "a member of the strict group it asked for"
         );
         assert_eq!(
-            manager.select_bound(0, &untried, now, false, Some("other"), Some("other")),
+            manager.select_bound(
+                0,
+                &untried,
+                now,
+                false,
+                Some("other"),
+                Some("other"),
+                WarmWindow::DEFAULT
+            ),
             None,
             "outside the strict group it asked for"
         );
         assert_eq!(
-            manager.select_bound(0, &HashSet::from([0]), now, false, None, None),
+            manager.select_bound(
+                0,
+                &HashSet::from([0]),
+                now,
+                false,
+                None,
+                None,
+                WarmWindow::DEFAULT
+            ),
             None,
             "already failed this request"
         );
         assert_eq!(
-            manager.select_bound(1, &untried, now, false, None, None),
+            manager.select_bound(1, &untried, now, false, None, None, WarmWindow::DEFAULT),
             None,
             "no such account"
         );
         manager.mark_rate_limited(0, 60);
         assert_eq!(
-            manager.select_bound(0, &untried, now, false, None, None),
+            manager.select_bound(0, &untried, now, false, None, None, WarmWindow::DEFAULT),
             None,
             "on a live hold"
         );

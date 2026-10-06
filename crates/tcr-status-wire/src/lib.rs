@@ -303,6 +303,13 @@ pub struct SessionRow {
     /// before this field existed decodes as `0.0` rather than a parse failure.
     #[serde(default)]
     pub cost_usd: f64,
+    /// How long this session's prompt cache stays warm after its last request, in seconds:
+    /// 3600 or 300, the tier of the session's most recent cache write, or `None` before it has
+    /// written one. A client computes the time left as `last_seen_ms` plus this, minus now.
+    /// `#[serde(default)]` so a payload from a server built before this field existed decodes
+    /// as `None`; the key is omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_secs: Option<u32>,
 }
 
 /// One account's row on the `tcr status --json` wire.
@@ -654,6 +661,30 @@ mod tests {
             "neither refinement ever names a plan on its own: non-Max orgs carry \
              tiers, and a seat without a plan is not a plan"
         );
+    }
+
+    /// A session row from a server built before `cacheTtlSecs` existed decodes it as absent,
+    /// and one that carries it keeps it through a serialize and decode. The JSON is written
+    /// as literal text, not built from the type under test.
+    #[test]
+    fn session_cache_ttl_decodes_absent_and_round_trips() {
+        let old = r#"{"sessionId":"s1","firstSeenMs":1,"lastSeenMs":2}"#;
+        let row: SessionRow = serde_json::from_str(old).expect("old payload decodes");
+        assert_eq!(row.cache_ttl_secs, None);
+        assert!(
+            !serde_json::to_string(&row)
+                .expect("serializes")
+                .contains("cacheTtlSecs"),
+            "an absent tier is omitted, not sent as null"
+        );
+
+        let new = r#"{"sessionId":"s1","firstSeenMs":1,"lastSeenMs":2,"cacheTtlSecs":3600}"#;
+        let row: SessionRow = serde_json::from_str(new).expect("new payload decodes");
+        assert_eq!(row.cache_ttl_secs, Some(3600));
+        let again: SessionRow =
+            serde_json::from_str(&serde_json::to_string(&row).expect("serializes"))
+                .expect("round trip decodes");
+        assert_eq!(again.cache_ttl_secs, Some(3600));
     }
 }
 

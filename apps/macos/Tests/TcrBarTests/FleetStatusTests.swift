@@ -361,6 +361,21 @@ final class FleetStatusTests: XCTestCase {
         XCTAssertNil(decoded.costUsd)
     }
 
+    /// `cacheTtlSecs` is the server's camelCase key; a server that predates it sends none,
+    /// and that must read as absent, never as a tier of zero.
+    func testSessionDecodesCacheTtlSecsWithAndWithout() throws {
+        let with = """
+            {"sessionId":"aaaa","firstSeenMs":1000,"lastSeenMs":2000,"cacheTtlSecs":3600}
+            """
+        let without = """
+            {"sessionId":"aaaa","firstSeenMs":1000,"lastSeenMs":2000}
+            """
+        let decoder = JSONDecoder()
+        XCTAssertEqual(
+            try decoder.decode(Session.self, from: Data(with.utf8)).cacheTtlSecs, 3600)
+        XCTAssertNil(try decoder.decode(Session.self, from: Data(without.utf8)).cacheTtlSecs)
+    }
+
     /// `Fleet.decode` never populates `sessions`/`sessionsSupported`, on any
     /// input — including a row that happens to carry a `"sessions"` key,
     /// which a synthesized `Decodable` simply ignores as an unknown key
