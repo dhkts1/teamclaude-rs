@@ -26,9 +26,12 @@ final class TcrToolWaitTests: XCTestCase {
     ///
     /// Five runs and the MEDIAN, not one run: the run loop's step is paid on
     /// every single call, so it moves the median, while a machine that was busy
-    /// for one moment moves only one sample. Thirty milliseconds sits well
-    /// above what the spawn itself costs (single digits, measured) and well
-    /// below the step being guarded against (about 62.5, and measured at 64.8).
+    /// for one moment moves only one sample. The ceiling is `waitCeilingMs`:
+    /// above what the spawn itself costs (single digits here; a GitHub macOS
+    /// runner read a median of 30.2 on 2026-10-06, run 37460997527, with the
+    /// 30 ms ceiling this used to have) and below the step being guarded against
+    /// (about 62.5, and measured at 64.8), so a slow shared runner passes and the
+    /// run-loop tick still fails.
     func testAChildThatExitsAtOnceDoesNotCostTheMainThreadARunLoopTick() throws {
         XCTAssertTrue(
             Thread.isMainThread,
@@ -60,9 +63,14 @@ final class TcrToolWaitTests: XCTestCase {
 
         let median = samples.sorted()[samples.count / 2]
         XCTAssertLessThan(
-            median, 30,
+            median, Self.waitCeilingMs,
             "median of \(samples.map { String(format: "%.1f", $0) }) ms on the main thread")
     }
+
+    /// The most a spawn-and-wait may cost at the median: well under the 62.5 ms
+    /// run-loop step this suite exists to catch, with room for a shared CI runner
+    /// (see the doc on the main-thread test).
+    static let waitCeilingMs = 45.0
 
     /// Off the main thread the same child costs the same, which is the control:
     /// it says the number above is about the wait and not about this machine
@@ -83,6 +91,7 @@ final class TcrToolWaitTests: XCTestCase {
 
         let median = samples.sorted()[samples.count / 2]
         XCTAssertLessThan(
-            median, 30, "median of \(samples.map { String(format: "%.1f", $0) }) ms off the main thread")
+            median, Self.waitCeilingMs,
+            "median of \(samples.map { String(format: "%.1f", $0) }) ms off the main thread")
     }
 }
