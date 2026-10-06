@@ -791,16 +791,25 @@ impl Manager {
                             let held_briefly = accounts
                                 .get(idx)
                                 .is_some_and(|a| Self::hold_clears_while_warm(a, now_ms, warm));
+                            // The same shape for a 5h rejection that rolls while the
+                            // cache is warm: `account_alive` already let it through,
+                            // and it must divert the request rather than serve it.
+                            let rejected_briefly = accounts.get(idx).is_some_and(|a| {
+                                Self::rejection_clears_while_warm(a, now_ms, warm)
+                            });
                             if !account_alive {
                                 // Genuinely gone: fall through and durably re-key.
                                 None
-                            } else if held_briefly || model_blocked || paced_out {
+                            } else if held_briefly || rejected_briefly || model_blocked || paced_out
+                            {
                                 // Yield this ONE request to the fall-through pick; the
                                 // re-pin at the bottom re-inserts the OLD index and now
-                                // logs WHICH of the three per-request gates diverted it.
+                                // logs WHICH of the per-request gates diverted it.
                                 keep_pin = Some(idx);
                                 divert_reason = Some(if held_briefly {
                                     "short-hold"
+                                } else if rejected_briefly {
+                                    "rejection-clears-warm"
                                 } else if model_blocked {
                                     "model-class"
                                 } else {
@@ -808,7 +817,10 @@ impl Manager {
                                 });
                                 divert_until_ms = accounts
                                     .get(idx)
-                                    .and_then(|a| a.rate_limited_until_ms)
+                                    .and_then(|a| {
+                                        a.rate_limited_until_ms
+                                            .or_else(|| Self::rejection_reset_ms(a))
+                                    })
                                     .unwrap_or(0);
                                 None
                             } else {
@@ -1914,6 +1926,51 @@ impl Manager {
             .is_some_and(|remaining_ms| remaining_ms < warm.ms())
     }
 
+    /// When a `rejected` unified status will clear on its own, if that can be
+    /// known: the 5-hour window's reset instant, when the 5-hour window is the one
+    /// carrying the rejection (its utilization is at least the weekly's). `None`
+    /// when the account is not rejected, the weekly window is the fuller one (its
+    /// reset is days away, never inside a cache window), or no reset was reported.
+    ///
+    /// Why this is knowable at all: `rejected` is upstream's verdict on a WINDOW, and
+    /// [`crate::quota::Quota`] drops it when that window rolls (the next probe reads
+    /// a utilization that fell). So a 5h rejection is a timer with a deadline the
+    /// headers already gave us, even though it carries no `retry-after`.
+    pub(super) fn rejection_reset_ms(account: &AccountRuntime) -> Option<i64> {
+        if account.quota.status.as_deref() != Some("rejected") {
+            return None;
+        }
+        let five_hour = account.quota.five_hour?;
+        let weekly_util = account.quota.seven_day.map_or(0.0, |w| w.utilization);
+        if five_hour.utilization < weekly_util {
+            return None;
+        }
+        five_hour.reset.map(super::odt_to_ms)
+    }
+
+    /// Whether a `rejected` status clears while this session's prompt cache is still
+    /// warm: the 5h window carries it and its reset falls inside `warm`. The same
+    /// shape as [`Self::hold_clears_while_warm`], for the one terminal gate that is
+    /// really a timer: the pin survives and each request diverts, so the session
+    /// comes home to a warm prefix when the window rolls instead of paying a cold
+    /// one on a failover account it then never leaves. Measured 2026-10-06 over
+    /// five days of logs: 855 of 886 held-conversation moves fired on a terminal
+    /// gate, and `rejected` is the only one of the three that self-clears.
+    ///
+    /// Never a SERVE verdict: a rejected account cannot answer a request until the
+    /// window rolls, so [`Self::hard_ok`] and [`Self::bound_account_holds`] still
+    /// refuse it outright. Pure and lock-free.
+    pub(super) fn rejection_clears_while_warm(
+        account: &AccountRuntime,
+        now_ms: i64,
+        warm: WarmWindow,
+    ) -> bool {
+        Self::rejection_reset_ms(account).is_some_and(|reset_ms| {
+            let remaining_ms = reset_ms - now_ms;
+            remaining_ms > 0 && remaining_ms < warm.ms()
+        })
+    }
+
     /// The TERMINAL account-level gates — the blocks that are a fact about the
     /// CREDENTIAL rather than about one request or one window, and that never
     /// self-free (so they carry no clear-instant): `disabled`,
@@ -1991,8 +2048,15 @@ impl Manager {
         parked: &HashSet<String>,
         warm: WarmWindow,
     ) -> bool {
-        if Self::account_terminal_gate(account).is_some() {
-            return false;
+        match Self::account_terminal_gate(account) {
+            // The one terminal gate that is a timer in disguise: a 5h rejection
+            // whose window rolls while this session's cache is still warm keeps
+            // the pin, exactly as a short hold does. See
+            // [`Self::rejection_clears_while_warm`].
+            Some(GateReason::Rejected)
+                if Self::rejection_clears_while_warm(account, now_ms, warm) => {}
+            Some(_) => return false,
+            None => {}
         }
         if Self::parked_blocks(account, parked) {
             return false;
@@ -2109,6 +2173,10 @@ impl Manager {
         warm: WarmWindow,
     ) -> bool {
         Self::account_hard_ok(account, now_ms, group, reserved, parked, warm)
+            // A SERVE needs the account itself answering: a rejection that merely
+            // clears while the cache is warm keeps the pin above but cannot answer
+            // this request, so the terminal gate is asked again here, unsoftened.
+            && Self::account_terminal_gate(account).is_none()
             && !Self::hold_clears_while_warm(account, now_ms, warm)
             && !Self::model_blocked(
                 account,
