@@ -34,6 +34,13 @@ SAMPLE = re.compile(
     r"\s+five_hour_reset_ms=(?P<reset>-?\d+)"
 )
 KINDS = ["i", "c5", "c1", "r", "o"]
+# Two consecutive samples belong to one 5h window when their reset instants
+# agree to within this; a real roll moves the reset by hours.
+SAME_WINDOW_MS = 120_000
+# Whole-percent ticks make every interval noisy; 11 intervals on 2026-10-06 gave a
+# negative read weight and a c1/c5 of 8.5. Ten per unknown is the floor worth
+# printing.
+MIN_INTERVALS = 10 * len(KINDS)
 
 
 def parse_ts(s):
@@ -74,9 +81,13 @@ def intervals(samples, ledger):
     """(d_util, tokens-by-kind) per rising step inside one window."""
     out = []
     for account, rows in samples.items():
-        acct_rows = [r for r in ledger if r["a"].startswith(account)]
+        # Exact match: `a@x` and `a@x/henry-token` are two accounts in the
+        # ledger, and a prefix test would hand one the other's tokens.
+        acct_rows = [r for r in ledger if r["a"] == account]
         for (t0, u0, reset0), (t1, u1, reset1) in zip(rows, rows[1:]):
-            if reset0 != reset1 or u1 <= u0:
+            # The usage endpoint's reset instant drifts by milliseconds from
+            # one probe to the next; a window has rolled only when it jumps.
+            if abs(reset0 - reset1) > SAME_WINDOW_MS or u1 <= u0:
                 continue
             toks = {k: 0 for k in KINDS}
             for r in acct_rows:
@@ -125,7 +136,7 @@ def main():
     ivs = intervals(samples, ledger)
     print(f"accounts={len(samples)} samples={sum(len(v) for v in samples.values())} "
           f"rising_intervals={len(ivs)}")
-    if len(ivs) < 2 * len(KINDS):
+    if len(ivs) < MIN_INTERVALS:
         sys.exit("too few rising intervals for a fit; collect more samples")
     xs = [x for _, x in ivs]
     ys = [y for y, _ in ivs]
