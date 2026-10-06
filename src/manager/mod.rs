@@ -9269,6 +9269,52 @@ mod tests {
         );
     }
 
+    /// The 1h rewrite's default follows the fleet: on when every account is
+    /// OAuth (the window counts a 1h write like a 5m one), off as soon as one
+    /// API-key account is present (billed 2x against 1.25x on every write), and
+    /// an explicit `cacheTtlRewrite` wins either way.
+    ///
+    /// Watched red before the default read the account types: the second
+    /// assertion failed, a fleet with an API-key account still rewrote.
+    #[test]
+    fn cache_ttl_rewrite_defaults_to_the_fleets_account_types() {
+        let all_oauth = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        assert!(all_oauth.cache_ttl_rewrite_enabled(), "all OAuth: on");
+
+        let mut api_key = account("k", 0);
+        api_key.account_type = "api_key".to_string();
+        let mixed = build_manager(
+            config_with(vec![account("a", 0), api_key.clone()]),
+            pacing_refresher(),
+        );
+        assert!(
+            !mixed.cache_ttl_rewrite_enabled(),
+            "one API-key account: off, its writes are billed"
+        );
+
+        let mut forced = config_with(vec![api_key]);
+        forced
+            .extra
+            .insert("cacheTtlRewrite".to_string(), serde_json::Value::Bool(true));
+        assert!(
+            build_manager(forced, pacing_refresher()).cache_ttl_rewrite_enabled(),
+            "an explicit true overrides the default"
+        );
+
+        let mut off = config_with(vec![account("a", 0)]);
+        off.extra.insert(
+            "cacheTtlRewrite".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        assert!(
+            !build_manager(off, pacing_refresher()).cache_ttl_rewrite_enabled(),
+            "an explicit false overrides the default"
+        );
+    }
+
     /// Once a hold LONG enough to have re-keyed a session has moved it onto a
     /// failover account, the expiry of that hold does NOT bring the session home:
     /// the pin is simply the failover from then on.

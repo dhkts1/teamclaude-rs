@@ -90,21 +90,30 @@ impl Manager {
 
     /// Whether every request's `cache_control` breakpoints are rewritten to the
     /// 1-hour window before forwarding (see [`crate::cache_ttl::extend_all_ttls`]),
-    /// read from the config's unmodelled top-level `cacheTtlRewrite` (**default
-    /// `true` — ON**). Same read pattern as [`Self::session_affinity_enabled`].
+    /// read from the config's unmodelled top-level `cacheTtlRewrite`. Same read
+    /// pattern as [`Self::session_affinity_enabled`].
     ///
-    /// On because, measured 2026-10-06, a 1h write costs the subscription's 5-hour
-    /// window exactly what a 5m write does and a read costs it nothing visible, so
-    /// the longer window is free and saves the full re-write after every 5-60
-    /// minute idle gap. Set `"cacheTtlRewrite": false` to forward bodies as sent.
+    /// **Default: on when every account is OAuth, off when any is an API key.**
+    /// Measured 2026-10-06, a 1h write costs a subscription's 5-hour window exactly
+    /// what a 5m write does and a read costs it nothing visible, so for OAuth
+    /// accounts the longer window is free and saves the full re-write after every
+    /// 5-60 minute idle gap. An API-key account is billed per token at the
+    /// published rates, where a 1h write is 2x input against 1.25x for 5m: there
+    /// the rewrite would raise the bill 60% on every write, so a fleet with one
+    /// such account forwards bodies as sent unless the operator says otherwise.
+    /// The rewrite runs before an account is picked, so it cannot decide per
+    /// account; the fleet's composition is the finest grain it has. An explicit
+    /// `"cacheTtlRewrite": true` or `false` overrides the default either way.
     pub fn cache_ttl_rewrite_enabled(&self) -> bool {
-        self.config
-            .lock()
-            .expect("config lock poisoned")
+        let config = self.config.lock().expect("config lock poisoned");
+        match config
             .extra
             .get("cacheTtlRewrite")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true)
+        {
+            Some(explicit) => explicit,
+            None => config.accounts.iter().all(|a| a.account_type == "oauth"),
+        }
     }
 
     /// Max DISTINCT destination accounts one session may be diverted to inside a
