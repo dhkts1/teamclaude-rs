@@ -1646,7 +1646,7 @@ impl Manager {
                 // request upstream, so it cannot answer it. Whether the PIN MOVES is
                 // decided below, on ACCOUNT-level evidence alone — see the comment
                 // there.
-                if !tried.contains(&idx) && accounts.get(idx).is_some_and(&hard_ok) {
+                if !tried.contains(&idx) && accounts.get(idx).is_some_and(hard_ok) {
                     let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
                     let util = accounts
                         .get(idx)
@@ -1729,7 +1729,7 @@ impl Manager {
         let idx = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
 
-            let sticky_usable = sticky_pick.filter(|&s| accounts.get(s).is_some_and(&hard_ok));
+            let sticky_usable = sticky_pick.filter(|&s| accounts.get(s).is_some_and(hard_ok));
             via_sticky = sticky_usable.is_some();
 
             let idx = if let Some(sticky) = sticky_usable {
