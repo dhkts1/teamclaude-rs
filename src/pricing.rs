@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 /// USD per million tokens for one model family, all five billing dimensions
 /// resolved. Built either from [`TABLE`] plus [`CACHE_READ_MULTIPLIER`] and
-/// friends, or from a config override.
+/// friends (or a row's own cache-read rate), or from a config override.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPrice {
     /// Base (non-cached) input tokens.
@@ -52,10 +52,19 @@ const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
 /// keep the two cache-creation dimensions apart at all.
 const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
 
-/// `(model-id prefix, input USD/MTok, output USD/MTok)`, transcribed from
-/// Anthropic's published first-party API rates (the `claude-api` reference
-/// table, cached 2026-06-24). Order is irrelevant — [`PricingTable::lookup`]
-/// takes the LONGEST matching prefix, not the first.
+/// `(model-id prefix, input USD/MTok, output USD/MTok, cache read USD/MTok)`,
+/// transcribed from Anthropic's published first-party API rates (the
+/// `claude-api` reference table, cached 2026-06-24; the Opus 5.5, Sonnet 5.5,
+/// Fable 5.1 and Mythos 5.1 rows from the same table cached 2026-09-25). Order
+/// is irrelevant: [`PricingTable::lookup`] takes the LONGEST matching prefix,
+/// not the first.
+///
+/// The fourth field is `None` where the cache read is the usual tenth of input
+/// ([`CACHE_READ_MULTIPLIER`]). Opus 5.5 and Fable 5.1 publish their own read
+/// rate, a smaller fraction ($0.20 on $4 input, $0.25 on $10). Deriving it
+/// would double the price of an Opus 5.5 cache read, and cache reads are about
+/// half of what this fleet spends. Cache writes keep the 1.25x and 2x
+/// multipliers on every row.
 ///
 /// **Every row here has a source.** Models Anthropic still lists as active but
 /// whose rates are not in that table — `claude-opus-4-5`, `claude-sonnet-4-5`
@@ -70,17 +79,21 @@ const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
 /// fleet is first-party), and Opus 5 **fast mode** bills at $10/$50 rather than
 /// $5/$25. Fast mode is reported in `usage.speed`, which nothing in this crate
 /// parses yet, so a fast-mode request is priced as standard and reads low.
-const TABLE: &[(&str, f64, f64)] = &[
-    ("claude-fable-5", 10.0, 50.0),
-    // Project Glasswing's Fable 5: same capabilities, same pricing, different id.
-    ("claude-mythos-5", 10.0, 50.0),
-    ("claude-opus-5", 5.0, 25.0),
-    ("claude-opus-4-8", 5.0, 25.0),
-    ("claude-opus-4-7", 5.0, 25.0),
-    ("claude-opus-4-6", 5.0, 25.0),
-    ("claude-sonnet-5", 2.0, 10.0),
-    ("claude-sonnet-4-6", 3.0, 15.0),
-    ("claude-haiku-4-5", 1.0, 5.0),
+const TABLE: &[(&str, f64, f64, Option<f64>)] = &[
+    ("claude-fable-5-1", 10.0, 50.0, Some(0.25)),
+    ("claude-fable-5", 10.0, 50.0, None),
+    // Project Glasswing's Fable 5 and 5.1: same capabilities, same pricing, different id.
+    ("claude-mythos-5-1", 10.0, 50.0, Some(0.25)),
+    ("claude-mythos-5", 10.0, 50.0, None),
+    ("claude-opus-5-5", 4.0, 20.0, Some(0.20)),
+    ("claude-opus-5", 5.0, 25.0, None),
+    ("claude-opus-4-8", 5.0, 25.0, None),
+    ("claude-opus-4-7", 5.0, 25.0, None),
+    ("claude-opus-4-6", 5.0, 25.0, None),
+    ("claude-sonnet-5-5", 2.0, 10.0, None),
+    ("claude-sonnet-5", 2.0, 10.0, None),
+    ("claude-sonnet-4-6", 3.0, 15.0, None),
+    ("claude-haiku-4-5", 1.0, 5.0, None),
 ];
 
 /// A per-model pricing override from `~/.config/teamclaude.json`'s `pricing`
@@ -146,16 +159,16 @@ impl PricingTable {
         if let Some((_, price)) = over {
             return Some(price.resolve());
         }
-        let (_, input, output) = TABLE
+        let (_, input, output, cache_read) = TABLE
             .iter()
-            .filter(|(prefix, _, _)| model.starts_with(prefix))
-            .max_by_key(|(prefix, _, _)| prefix.len())?;
+            .filter(|(prefix, _, _, _)| model.starts_with(prefix))
+            .max_by_key(|(prefix, _, _, _)| prefix.len())?;
         Some(ModelPrice {
             input: *input,
             output: *output,
             cache_write_5m: input * CACHE_WRITE_5M_MULTIPLIER,
             cache_write_1h: input * CACHE_WRITE_1H_MULTIPLIER,
-            cache_read: input * CACHE_READ_MULTIPLIER,
+            cache_read: cache_read.unwrap_or(input * CACHE_READ_MULTIPLIER),
         })
     }
 }
@@ -273,18 +286,54 @@ mod tests {
         assert_eq!(sonnet_4_6.input, 3.0, "4-6 is its own row, not sonnet-5's");
     }
 
+    /// Opus 5.5 is its own row, not priced off Opus 5 by the shorter prefix.
+    /// Until 2026-10-06 it was: every Opus 5.5 request read as $5/$25 with
+    /// cache reads at $0.50, and `tcr wrap` showed $66,044 for a week that
+    /// cost $36,916 at the published rates.
+    #[test]
+    fn opus_5_5_is_not_priced_off_opus_5() {
+        let price = table().lookup("claude-opus-5-5").expect("in the table");
+        assert_eq!(price.input, 4.0);
+        assert_eq!(price.output, 20.0);
+        assert_eq!(
+            price.cache_read, 0.20,
+            "published read rate, not 0.1x input"
+        );
+        assert_eq!(price.cache_write_5m, 5.0, "writes keep 1.25x input");
+        let opus_5 = table().lookup("claude-opus-5").expect("in the table");
+        assert_eq!(opus_5.input, 5.0, "opus-5 itself is unchanged");
+        assert_eq!(opus_5.cache_read, 0.5);
+    }
+
+    /// The cache-read rate a row publishes is the one a read is billed at:
+    /// a million Opus 5.5 cache-read tokens is $0.20, a million Fable 5.1
+    /// ones $0.25.
+    #[test]
+    fn a_published_cache_read_rate_is_what_a_read_costs() {
+        let opus = table().lookup("claude-opus-5-5").expect("in the table");
+        assert_eq!(cost_nanos(&opus, 0, 0, 0, 1_000_000, 0), 200_000_000);
+        let fable = table().lookup("claude-fable-5-1").expect("in the table");
+        assert_eq!(cost_nanos(&fable, 0, 0, 0, 1_000_000, 0), 250_000_000);
+        let fable_5 = table().lookup("claude-fable-5").expect("in the table");
+        assert_eq!(fable_5.cache_read, 1.0, "fable-5 keeps 0.1x input");
+    }
+
     /// Every model id the cached Anthropic reference prices is priced here, at
     /// that reference's numbers. A drift in either direction is a wrong dollar
     /// figure on an operator's screen, which is worse than no figure.
     #[test]
     fn the_table_matches_the_published_rates() {
         let expected = [
+            ("claude-fable-5-1", 10.0, 50.0),
             ("claude-fable-5", 10.0, 50.0),
+            ("claude-mythos-5-1", 10.0, 50.0),
             ("claude-mythos-5", 10.0, 50.0),
+            ("claude-opus-5-5", 4.0, 20.0),
             ("claude-opus-5", 5.0, 25.0),
             ("claude-opus-4-8", 5.0, 25.0),
             ("claude-opus-4-7", 5.0, 25.0),
             ("claude-opus-4-6", 5.0, 25.0),
+            ("claude-sonnet-5-5", 2.0, 10.0),
             ("claude-sonnet-5", 2.0, 10.0),
             ("claude-sonnet-4-6", 3.0, 15.0),
             ("claude-haiku-4-5", 1.0, 5.0),
