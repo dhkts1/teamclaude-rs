@@ -22,7 +22,7 @@ use crate::affinity::{self, LoadReport, StoredPin};
 use crate::config::ConfigError;
 use crate::identity;
 
-use super::Manager;
+use super::{Manager, WarmWindow};
 
 impl Manager {
     /// Flag the pin map as changed since the last flush. Called from the
@@ -39,9 +39,9 @@ impl Manager {
 
     /// Record whether `key`'s most recent request asked Anthropic's cache for
     /// the extended `"ttl":"1h"` window (see [`crate::cache_ttl`]). Called from
-    /// the request path once per request, independent of `select()` — nothing
-    /// on the selection/routing path needs this bit, only the persistence
-    /// bridge below. A request that does NOT ask for the extended window clears
+    /// the request path once per request, before `select()`, which reads it
+    /// back through [`Self::warm_window`]; the persistence bridge below reads
+    /// it too. A request that does NOT ask for the extended window clears
     /// any prior record for that key: this always reflects the LATEST request,
     /// same as `touched_at_ms` does for the pin itself.
     pub fn note_affinity_ttl(&self, key: u64, extended: bool) {
@@ -53,6 +53,26 @@ impl Manager {
             ext.insert(key);
         } else {
             ext.remove(&key);
+        }
+    }
+
+    /// How long this session's prompt cache stays warm, for every hold-or-move
+    /// decision made about it: [`WarmWindow::EXTENDED`] when its latest request
+    /// asked for the 1h cache ([`Self::note_affinity_ttl`]), [`WarmWindow::DEFAULT`]
+    /// otherwise, and for a request with no session key at all.
+    pub fn warm_window(&self, key: Option<u64>) -> WarmWindow {
+        let Some(key) = key else {
+            return WarmWindow::DEFAULT;
+        };
+        let extended = self
+            .affinity_extended
+            .lock()
+            .expect("affinity_extended lock poisoned")
+            .contains(&key);
+        if extended {
+            WarmWindow::EXTENDED
+        } else {
+            WarmWindow::DEFAULT
         }
     }
 
