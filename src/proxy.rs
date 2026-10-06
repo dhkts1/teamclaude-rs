@@ -2714,6 +2714,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 now,
                 request_is_fable,
                 request_group.as_deref(),
+                manager.warm_window(session_key),
             )
         {
             bound_to = Some(bound_idx);
@@ -3165,6 +3166,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     now,
                                     request_is_fable,
                                     request_group.as_deref(),
+                                    manager.warm_window(session_key),
                                 ) {
                                     if let Some(warning) = switch_warning(
                                         &manager,
@@ -3201,6 +3203,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     request_is_fable,
                                     request_group.as_deref(),
                                     strict_group,
+                                    manager.warm_window(session_key),
                                 ),
                                 None if strict_group.is_none()
                                     && manager.revalidation_serve_enabled() =>
@@ -5912,7 +5915,9 @@ fn switch_warning(
     group: Option<&str>,
 ) -> Option<Response> {
     let key = session_key?;
-    if is_fable && manager.bound_account_holds(bound_idx, now, false, group) {
+    if is_fable
+        && manager.bound_account_holds(bound_idx, now, false, group, manager.warm_window(Some(key)))
+    {
         return None;
     }
     if !manager.first_switch_warning(key, bound_idx, crate::now_ms()) {

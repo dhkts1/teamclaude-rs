@@ -101,12 +101,53 @@ const MAX_RATE_LIMIT_HOLD_SECONDS: i64 = 3600;
 /// holding a long-dead pin would divert through the LRU pick on every turn and
 /// scatter the conversation cold across the fleet.
 ///
-/// 300 is the CONSERVATIVE choice. Anthropic's 1-hour extended cache would justify
-/// a much larger value (up to `MAX_RATE_LIMIT_HOLD_SECONDS`), but we cannot tell
-/// from a hold which TTL a given session's prefix was written under. Erring low
-/// costs at most one extra diverted request on a hold that would in fact have come
-/// home warm; erring high costs a whole conversation prefix.
+/// 300 is the CONSERVATIVE choice, and the one a session gets when nothing is known
+/// about its prefix. A session whose latest request asked for Anthropic's 1-hour
+/// extended cache gets [`WarmWindow::EXTENDED`] instead, through
+/// [`Manager::warm_window`]: until 2026-10-06 every session was weighed against
+/// this constant, because a hold alone cannot tell which TTL a prefix was written
+/// under, and a 1h session was moved off a 6-minute hold with 54 minutes of cache
+/// left. Erring low costs at most one extra diverted request on a hold that would
+/// in fact have come home warm; erring high costs a whole conversation prefix.
 const CACHE_WARM_HOLD_SECS: i64 = 300;
+
+/// How long one session's prompt cache stays warm after its last request: the one
+/// value every hold-or-move decision reads (the hard gate's "does this hold outlive
+/// the cache", the soft divert's "does it clear while warm", and the idle-cold
+/// re-key). Built once per request by [`Manager::warm_window`] from what that
+/// session's latest request asked of `cache_control` (see [`crate::cache_ttl`]),
+/// and passed down rather than re-derived, so no two decisions can disagree about
+/// the same session.
+///
+/// Two values, no third: [`Self::DEFAULT`] is [`CACHE_WARM_HOLD_SECS`], the 5-minute
+/// window; [`Self::EXTENDED`] is [`crate::affinity::EXTENDED_PIN_TTL_MS`], the 55
+/// minutes the pin store already trusts a 1h prefix for (derived there from 52,951
+/// usage records). A caller with no session to ask passes `DEFAULT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WarmWindow {
+    ms: i64,
+}
+
+impl WarmWindow {
+    /// The 5-minute default window.
+    pub const DEFAULT: WarmWindow = WarmWindow {
+        ms: CACHE_WARM_HOLD_SECS * 1000,
+    };
+    /// The window of a session whose latest request asked for `"ttl":"1h"`.
+    pub const EXTENDED: WarmWindow = WarmWindow {
+        ms: crate::affinity::EXTENDED_PIN_TTL_MS,
+    };
+
+    /// The window in milliseconds.
+    pub fn ms(self) -> i64 {
+        self.ms
+    }
+
+    /// The window in whole seconds, for log lines.
+    pub fn secs(self) -> i64 {
+        self.ms / 1000
+    }
+}
 
 /// How long a *transient* refresh failure holds off further refreshes of the
 /// same account. A transient failure leaves the token unchanged, so the
@@ -9080,6 +9121,13 @@ mod tests {
     /// therefore cannot express an exact remaining duration relative to the `now`
     /// the select is given — the whole point of a boundary test.
     fn rekeys_with_hold_remaining(remaining_ms: i64) -> bool {
+        rekeys_with_hold_remaining_for(remaining_ms, false)
+    }
+
+    /// [`rekeys_with_hold_remaining`] for a session whose latest request asked
+    /// for the 1h cache (`extended`), recorded the way the request path records
+    /// it, through `note_affinity_ttl`, before the hold is weighed.
+    fn rekeys_with_hold_remaining_for(remaining_ms: i64, extended: bool) -> bool {
         let manager = build_manager(
             config_with(vec![account("home", 0), account("other", 0)]),
             pacing_refresher(),
@@ -9087,6 +9135,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let now_ms = odt_to_ms(now);
         let key = 424_242u64;
+        manager.note_affinity_ttl(key, extended);
         let home = manager
             .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("an account is eligible");
@@ -9124,6 +9173,36 @@ mod tests {
             !rekeys_with_hold_remaining(boundary_ms - 1),
             "one millisecond under the line must keep the pin — the boundary is \
              `>=`, and this is the assertion that stops it drifting"
+        );
+    }
+
+    /// A session whose latest request asked for the 1h cache is weighed against
+    /// its own window ([`WarmWindow::EXTENDED`], 55 minutes), not the 5-minute
+    /// default: a 20-minute hold re-keys a default session and only diverts a 1h
+    /// one, whose prefix is still warm when the account frees. The boundary is
+    /// pinned from both sides the same way the default one is above.
+    ///
+    /// Watched red on the tree before `warm_window`, where every session got the
+    /// default: the second assertion failed, the 1h session re-keyed.
+    #[test]
+    fn an_extended_ttl_session_keeps_its_pin_through_a_hold_the_default_rekeys_on() {
+        let twenty_minutes_ms = 20 * 60 * 1000;
+        assert!(
+            rekeys_with_hold_remaining_for(twenty_minutes_ms, false),
+            "a default session re-keys: 20 minutes outlives a 5-minute cache"
+        );
+        assert!(
+            !rekeys_with_hold_remaining_for(twenty_minutes_ms, true),
+            "a 1h session keeps its pin: 20 minutes clears while its cache is warm"
+        );
+        let boundary_ms = WarmWindow::EXTENDED.ms();
+        assert!(
+            rekeys_with_hold_remaining_for(boundary_ms, true),
+            "a hold exactly as long as the extended window re-keys even a 1h session"
+        );
+        assert!(
+            !rekeys_with_hold_remaining_for(boundary_ms - 1, true),
+            "one millisecond under the extended line keeps the pin"
         );
     }
 
@@ -9923,7 +10002,14 @@ mod tests {
             (GateReason::Rejected, None)
         );
         assert!(
-            !Manager::account_hard_ok(&a, now_ms, None, &HashSet::new(), &HashSet::new()),
+            !Manager::account_hard_ok(
+                &a,
+                now_ms,
+                None,
+                &HashSet::new(),
+                &HashSet::new(),
+                WarmWindow::DEFAULT
+            ),
             "and it stays hard-gated, exactly as before"
         );
 
@@ -10091,7 +10177,14 @@ mod tests {
                 );
                 assert_eq!(gate, reason, "fixture `{label}` must exhibit {reason:?}");
 
-                let hard_ok = Manager::account_hard_ok(&runtime, now_ms, None, &reserved, &parked);
+                let hard_ok = Manager::account_hard_ok(
+                    &runtime,
+                    now_ms,
+                    None,
+                    &reserved,
+                    &parked,
+                    WarmWindow::DEFAULT,
+                );
                 assert_eq!(
                     hard_ok, account_level,
                     "`{label}`: account_hard_ok disagrees with {reason:?}'s classification"
