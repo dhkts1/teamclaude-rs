@@ -5378,6 +5378,7 @@ mod tests {
             tools: tcr_status_wire::SessionToolsRow::default(),
             req_per_minute: vec![0, 1, 2],
             cost_usd: 0.5,
+            cache_ttl_secs: Some(3600),
         };
         let rendered = render_sessions_json(true, std::slice::from_ref(&row));
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
@@ -5398,6 +5399,10 @@ mod tests {
             serde_json::json!([0, 1, 2])
         );
         assert_eq!(value["sessions"][0]["costUsd"], serde_json::json!(0.5));
+        assert_eq!(
+            value["sessions"][0]["cacheTtlSecs"],
+            serde_json::json!(3600)
+        );
 
         // The unsupported document still carries both keys, so the client
         // never has to tell "absent" from "false".

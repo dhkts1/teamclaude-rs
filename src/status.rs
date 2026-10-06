@@ -1800,6 +1800,7 @@ mod tests {
                 },
                 req_per_minute: vec![0; 29].into_iter().chain(std::iter::once(3)).collect(),
                 cost_usd: 0.0125,
+                cache_ttl_secs: Some(300),
             }],
             wire_sessions_summary: tcr_status_wire::SessionsSummary {
                 calls: 2,

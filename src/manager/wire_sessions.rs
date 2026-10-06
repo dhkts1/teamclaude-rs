@@ -217,6 +217,7 @@ impl Manager {
                 },
                 req_per_minute: s.req_per_minute.projected(now_ms),
                 cost_usd: Self::price_session(&self.usage, &s.by_model),
+                cache_ttl_secs: s.cache_ttl_secs,
             })
             .collect()
     }
