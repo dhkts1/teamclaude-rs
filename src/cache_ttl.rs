@@ -136,9 +136,128 @@ pub fn requests_extended_ttl(body: &[u8]) -> bool {
     false
 }
 
+/// The extended window every rewritten breakpoint is set to.
+const EXTENDED_TTL: &str = "1h";
+
+/// Set `"ttl":"1h"` on every `cache_control` object in the three legal
+/// positions (a `system` block, a tool definition, a message content block) that
+/// does not already carry it. `None` when nothing would change: no
+/// `cache_control` at all, every breakpoint already `1h`, or a body that is not
+/// a JSON object (the proxy then forwards the client's bytes untouched).
+///
+/// Why rewrite at all: measured 2026-10-06 on a Max 20x account with no other
+/// traffic, one token kind per run, a 1h cache write and a 5m cache write cost
+/// the 5-hour window the same (about 1.08M tokens per percent each, within one
+/// request of each other), and a cache read did not move it in 23.6M tokens.
+/// The API's 2x price for a 1h write does not apply to the subscription
+/// window, so a prefix that stays warm for an hour instead of five minutes costs
+/// nothing extra and turns every 5-60 minute idle gap from a full re-write into
+/// a near-free read.
+///
+/// Why a generic [`serde_json::Value`] here, when [`requests_extended_ttl`]
+/// deliberately avoids one: a peek only reads, and a typed shape is what keeps
+/// it from matching a lookalike inside a string. A rewrite must emit the whole
+/// body back, which the typed shape (it skips every field it does not read)
+/// cannot do. The tree is built only after a cheap byte test for
+/// `"cache_control"` says the body might carry one, and only the three legal
+/// positions are walked, so a `cache_control` shape quoted inside a string is
+/// never touched. Serialising the tree re-orders object keys (serde_json's map
+/// is sorted); the content Anthropic hashes for the cache is the blocks' text,
+/// not the key order around it.
+pub fn extend_all_ttls(body: &[u8]) -> Option<Vec<u8>> {
+    if !body
+        .windows(b"\"cache_control\"".len())
+        .any(|w| w == b"\"cache_control\"")
+    {
+        return None;
+    }
+    let mut root: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = root.as_object_mut()?;
+    let mut changed = 0usize;
+
+    let mut extend_block = |block: &mut serde_json::Value| {
+        let Some(cc) = block
+            .get_mut("cache_control")
+            .and_then(|v| v.as_object_mut())
+        else {
+            return;
+        };
+        if cc.get("ttl").and_then(|t| t.as_str()) == Some(EXTENDED_TTL) {
+            return;
+        }
+        cc.insert(
+            "ttl".to_string(),
+            serde_json::Value::String(EXTENDED_TTL.to_string()),
+        );
+        changed += 1;
+    };
+
+    if let Some(blocks) = obj.get_mut("system").and_then(|s| s.as_array_mut()) {
+        blocks.iter_mut().for_each(&mut extend_block);
+    }
+    if let Some(tools) = obj.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        tools.iter_mut().for_each(&mut extend_block);
+    }
+    if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages.iter_mut() {
+            if let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
+                blocks.iter_mut().for_each(&mut extend_block);
+            }
+        }
+    }
+
+    if changed == 0 {
+        return None;
+    }
+    serde_json::to_vec(&root).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every legal position gets `ttl: 1h`; the rewritten body reads back as
+    /// extended through the peek the proxy already trusts.
+    #[test]
+    fn extend_all_ttls_sets_1h_on_every_legal_breakpoint() {
+        let body = br#"{"model":"claude-x","system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"t","cache_control":{"type":"ephemeral","ttl":"5m"}}],"messages":[{"role":"user","content":[{"type":"text","text":"b","cache_control":{"type":"ephemeral"}},{"type":"text","text":"c"}]}]}"#;
+        let out = extend_all_ttls(body).expect("three breakpoints to extend");
+        assert!(requests_extended_ttl(&out));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["system"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(
+            v["tools"][0]["cache_control"]["ttl"], "1h",
+            "an explicit 5m becomes 1h"
+        );
+        assert_eq!(v["messages"][0]["content"][0]["cache_control"]["ttl"], "1h");
+        assert!(
+            v["messages"][0]["content"][1]
+                .get("cache_control")
+                .is_none(),
+            "a block with no breakpoint gets none"
+        );
+        assert_eq!(v["model"], "claude-x", "the rest of the body survives");
+    }
+
+    /// `None` is the no-change answer: no breakpoint, all already 1h, a string
+    /// body, or a quoted lookalike. The proxy forwards the client's bytes.
+    #[test]
+    fn extend_all_ttls_returns_none_when_nothing_changes() {
+        assert!(extend_all_ttls(br#"{"model":"claude-x","messages":[]}"#).is_none());
+        assert!(extend_all_ttls(
+            br#"{"system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#
+        )
+        .is_none());
+        assert!(extend_all_ttls(br#"{"system":"a plain string system prompt"}"#).is_none());
+        assert!(
+            extend_all_ttls(
+                br#"{"messages":[{"role":"user","content":"this quotes \"cache_control\": {\"ttl\": \"5m\"} in text"}]}"#
+            )
+            .is_none(),
+            "a string value that quotes the shape is not a breakpoint"
+        );
+        assert!(extend_all_ttls(b"not json \"cache_control\"").is_none());
+    }
 
     #[test]
     fn detects_extended_ttl_on_a_system_block() {

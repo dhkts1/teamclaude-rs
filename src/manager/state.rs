@@ -88,6 +88,25 @@ impl Manager {
             .unwrap_or(false)
     }
 
+    /// Whether every request's `cache_control` breakpoints are rewritten to the
+    /// 1-hour window before forwarding (see [`crate::cache_ttl::extend_all_ttls`]),
+    /// read from the config's unmodelled top-level `cacheTtlRewrite` (**default
+    /// `true` — ON**). Same read pattern as [`Self::session_affinity_enabled`].
+    ///
+    /// On because, measured 2026-10-06, a 1h write costs the subscription's 5-hour
+    /// window exactly what a 5m write does and a read costs it nothing visible, so
+    /// the longer window is free and saves the full re-write after every 5-60
+    /// minute idle gap. Set `"cacheTtlRewrite": false` to forward bodies as sent.
+    pub fn cache_ttl_rewrite_enabled(&self) -> bool {
+        self.config
+            .lock()
+            .expect("config lock poisoned")
+            .extra
+            .get("cacheTtlRewrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
     /// Max DISTINCT destination accounts one session may be diverted to inside a
     /// single hold episode, read from the config's unmodelled top-level
     /// `divertBudget`. Same read pattern as [`Self::session_affinity_enabled`].

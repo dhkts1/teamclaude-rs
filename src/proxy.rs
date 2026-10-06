@@ -2405,6 +2405,27 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         );
     };
 
+    // Every cache breakpoint asks for the 1-hour window from here on, BEFORE
+    // anything below reads the body: the pin's warm window (`note_affinity_ttl`),
+    // the ledger's 5m/1h split and the upstream request all see the body as sent.
+    // A longer body is fine: `build_upstream_headers` strips content-length.
+    // `None` means nothing to change and the client's bytes go out untouched.
+    let body_bytes = if manager.cache_ttl_rewrite_enabled() {
+        match crate::cache_ttl::extend_all_ttls(&body_bytes) {
+            Some(rewritten) => {
+                tracing::debug!(
+                    before = body_bytes.len(),
+                    after = rewritten.len(),
+                    "cache-ttl: breakpoints rewritten to 1h"
+                );
+                bytes::Bytes::from(rewritten)
+            }
+            None => body_bytes,
+        }
+    } else {
+        body_bytes
+    };
+
     // Parse the request's target model ONCE — it is constant across the rotation
     // loop, and drives per-model (Fable-aware) account selection below.
     let request_model = crate::model::parse_request_model(&body_bytes);
