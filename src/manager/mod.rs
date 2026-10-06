@@ -9206,6 +9206,69 @@ mod tests {
         );
     }
 
+    /// [`rekeys_with_hold_remaining_for`] for the other timer: the pinned account
+    /// carries upstream's `rejected` verdict on its 5h window, with that window's
+    /// reset `remaining_ms` away. No `rate_limited_until_ms` is armed, so the only
+    /// clock the router can read is the quota's own reset.
+    fn rekeys_with_rejection_rolling_in(remaining_ms: i64, extended: bool) -> bool {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 535_353u64;
+        manager.note_affinity_ttl(key, extended);
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an account is eligible");
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[home].quota.status = Some("rejected".to_string());
+            accounts[home].quota.five_hour = Some(crate::quota::QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now + Duration::milliseconds(remaining_ms)),
+            });
+        }
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("the un-rejected account serves this request");
+        assert_ne!(
+            served, home,
+            "a rejected account never serves, whatever its reset"
+        );
+        pin_of(&manager, key) != Some(home)
+    }
+
+    /// A `rejected` 5h status is a timer, not a death, when its window rolls while
+    /// the session's cache is still warm: the pin survives and the request diverts,
+    /// under the session's own window (5 minutes by default, 55 for a 1h session).
+    /// One that rolls after the cache is cold re-keys, as before.
+    ///
+    /// Watched red on the tree before `rejection_clears_while_warm`, where
+    /// `rejected` was terminal under every window: the first and third assertions
+    /// failed, the session re-keyed.
+    #[test]
+    fn a_5h_rejection_rolling_inside_the_warm_window_keeps_the_pin() {
+        let four_minutes_ms = 4 * 60 * 1000;
+        let twenty_minutes_ms = 20 * 60 * 1000;
+        assert!(
+            !rekeys_with_rejection_rolling_in(four_minutes_ms, false),
+            "default session: a rejection rolling in 4 minutes keeps the pin"
+        );
+        assert!(
+            rekeys_with_rejection_rolling_in(twenty_minutes_ms, false),
+            "default session: one rolling in 20 minutes outlives the cache and re-keys"
+        );
+        assert!(
+            !rekeys_with_rejection_rolling_in(twenty_minutes_ms, true),
+            "1h session: 20 minutes is inside its 55-minute window, pin kept"
+        );
+        assert!(
+            rekeys_with_rejection_rolling_in(WarmWindow::EXTENDED.ms(), true),
+            "1h session: a reset exactly at the window's edge re-keys"
+        );
+    }
+
     /// Once a hold LONG enough to have re-keyed a session has moved it onto a
     /// failover account, the expiry of that hold does NOT bring the session home:
     /// the pin is simply the failover from then on.

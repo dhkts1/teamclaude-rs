@@ -153,6 +153,12 @@ impl Manager {
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         accounts.get(idx).is_some_and(|account| {
             Self::account_hard_ok(account, now_ms, group, &reserved, &parked, warm)
+                // "Holds" means this account answers the next request itself and every
+                // other account is benched for it, so a rejection that merely clears
+                // while the cache is warm (which `account_hard_ok` lets through to keep a
+                // PIN) must still answer no here: holding a conversation on a rejected
+                // account is the 429-every-turn incident this module's doc describes.
+                && Self::account_terminal_gate(account).is_none()
                 && !Self::model_blocked(
                     account,
                     self.global_threshold,
@@ -620,6 +626,53 @@ mod tests {
         manager.record_bound_tokens(&sig("sig_fake_1"), 0, crate::now_ms());
         assert!(manager.take_bound_tokens_dirty());
         assert!(!manager.take_bound_tokens_dirty());
+    }
+
+    /// A 5h rejection that rolls while the cache is warm keeps a PIN
+    /// (`account_hard_ok`), but it never HOLDS a conversation: holding benches every
+    /// other account and sends the next request to the rejected one, which is the
+    /// 429-every-turn incident this module's doc describes. Watched red with the
+    /// terminal check removed from `bound_account_holds`.
+    #[test]
+    fn a_rejection_rolling_while_warm_still_does_not_hold_the_conversation() {
+        let manager = manager_over(&[account("a@example.com", "uuid-a")]);
+        let now = OffsetDateTime::now_utc();
+        assert!(
+            manager.bound_account_holds(0, now, false, None, WarmWindow::DEFAULT),
+            "a healthy account holds its conversation"
+        );
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].quota.status = Some("rejected".to_string());
+            // Utilization UNDER every threshold on purpose: headers go stale by
+            // minutes, so a rejection can arrive while the stored window still reads
+            // half full. At 1.0 the model-class gate would refuse the hold on its own
+            // and this test would pass without the terminal check it exists to pin.
+            accounts[0].quota.five_hour = Some(crate::quota::QuotaWindow {
+                utilization: 0.5,
+                reset: Some(now + time::Duration::minutes(4)),
+            });
+        }
+        {
+            // Positive control for the premise: the PIN predicate does let this
+            // account through, so the refusal below is the terminal check's alone.
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert!(
+                Manager::account_hard_ok(
+                    &accounts[0],
+                    super::super::odt_to_ms(now),
+                    None,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    WarmWindow::DEFAULT,
+                ),
+                "a rejection rolling in 4 minutes keeps a pin"
+            );
+        }
+        assert!(
+            !manager.bound_account_holds(0, now, false, None, WarmWindow::DEFAULT),
+            "rejected with a reset 4 minutes out: the pin may survive, the hold may not"
+        );
     }
 
     /// The log gate says yes once per session and no afterwards — a conversation held for a
