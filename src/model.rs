@@ -20,6 +20,27 @@ pub fn is_fable_model(model: &str) -> bool {
     model.to_ascii_lowercase().contains("fable")
 }
 
+/// Whether the API keeps a `thinking` block of this model only inside the organization that
+/// minted it: Claude Sonnet 5.5 and Claude Haiku 5.5. Matched the way [`is_fable_model`]
+/// matches, as a case-insensitive substring, so a dated or suffixed id still counts.
+///
+/// Measured 2026-10-10 by replaying a thinking block minted on one account, unchanged, on
+/// another, with the `thinking-binding-controls-2026-08-01` beta and
+/// `prefix_mismatch_behavior: "drop_block"`:
+///
+/// - Sonnet 5.5 (two runs) and Haiku 5.5 (one run): kept on another seat in the minting
+///   account's organization, DROPPED on an account in another organization, reason
+///   `end_user_binding_mismatch`.
+/// - Opus 5.5 (two runs): kept on both. So it is `false` here.
+///
+/// Without the beta, which is what Claude Code sends, every one of those requests is a plain 200,
+/// so a drop is silent: no 400, nothing for the client to recover from. Every other model is
+/// unmeasured and answers `false`; Anthropic's docs say earlier models' blocks are unaffected.
+pub fn thinking_is_org_bound(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("claude-sonnet-5-5") || model.contains("claude-haiku-5-5")
+}
+
 /// The top-level `model` key of a request body, if present. Only the ROOT `model`
 /// is read — a `model` nested inside message content is never the request's target
 /// model. Mirrors the `usage_from_json` parse pattern in `proxy.rs`: a lenient
@@ -48,6 +69,17 @@ mod tests {
         assert!(is_fable_model("CLAUDE-FABLE"));
         assert!(!is_fable_model("claude-opus-4-6"));
         assert!(!is_fable_model(""));
+    }
+
+    #[test]
+    fn thinking_is_org_bound_names_sonnet_and_haiku_5_5_only() {
+        assert!(thinking_is_org_bound("claude-sonnet-5-5"));
+        assert!(thinking_is_org_bound("claude-haiku-5-5"));
+        assert!(thinking_is_org_bound("CLAUDE-SONNET-5-5"));
+        assert!(!thinking_is_org_bound("claude-opus-5-5"));
+        assert!(!thinking_is_org_bound("claude-fable-5-1"));
+        assert!(!thinking_is_org_bound("claude-sonnet-5"));
+        assert!(!thinking_is_org_bound(""));
     }
 
     #[test]

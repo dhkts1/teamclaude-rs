@@ -4,18 +4,28 @@
 //! The rule this map serves: **a request whose history carries an account-bound token is served
 //! by the account that minted that token while that account can hold it**, and — when the
 //! history is bound but no token is known to this process — by the account the session is
-//! PINNED to. A thinking signature, an advisor result or server-side thread state is unusable
-//! off its minting account, so a sibling answers the first request with a 400 or a 404.
+//! PINNED to. An advisor result or server-side thread state is unusable off its minting
+//! account, so a sibling answers the first request with a 400 or a 404.
+//!
+//! A thinking signature from a 5.5 model is not rejected, and what happens to it depends on the
+//! model (measured 2026-10-10, replaying one block unchanged on another account; September's
+//! logs counted 170 thinking 400s). Opus 5.5 keeps the block on any account. Sonnet 5.5 and Haiku 5.5 keep it on
+//! another seat in the minting account's organization and, on an account in another
+//! organization, drop it silently with a 200: no error, and the conversation's earlier reasoning
+//! is gone. So a release prefers a same-organization seat for those two models
+//! ([`Manager::outside_org_of`], `proxy::same_org_release`), and for every model the hold is also
+//! what keeps the prompt cache warm.
 //!
 //! "Can hold it" is [`Manager::bound_account_holds`], and it is deliberately narrower than "is
-//! bound". Claude Code recovers from all three rejections on its own, in one extra round trip
-//! (read in the 2.1.277..2.1.280 binaries: `retry:thinking-signature-strip`,
-//! `retry:advisor-strip`, and `retry:tether-replay` on a 404 `thread_not_found`). So holding a
-//! conversation on its account is worth a short wait, and never worth one that outlasts the
-//! cache: an account that is gone, or out for longer than [`super::CACHE_WARM_HOLD_SECS`],
-//! releases the conversation to the fleet. The cost of the other choice, measured 2026-09-22: a
-//! conversation bound to a `rejected` account got a 429 on every turn, 6-11 a minute, until the
-//! operator abandoned the session, because `/compact` keeps the thread id.
+//! bound". Claude Code recovers from the advisor and thread-state rejections on its own, in one
+//! extra round trip (read in the 2.1.277..2.1.280 binaries: `retry:advisor-strip`, and
+//! `retry:tether-replay` on a 404 `thread_not_found`; `retry:thinking-signature-strip` is there
+//! too, for the 400 that no 5.5 model sent in that measurement). So holding a conversation on its account
+//! is worth a short wait, and never worth one that outlasts the cache: an account that is gone,
+//! or out for longer than [`super::CACHE_WARM_HOLD_SECS`], releases the conversation to the
+//! fleet. The cost of the other choice, measured 2026-09-22: a conversation bound to a
+//! `rejected` account got a 429 on every turn, 6-11 a minute, until the operator abandoned the
+//! session, because `/compact` keeps the thread id.
 //!
 //! Two responsibilities the store next door does not have, same as `pins.rs`:
 //!
@@ -232,6 +242,31 @@ impl Manager {
             "revalidation-serve (bound-honor): serving the account this conversation's history is bound to"
         );
         Some(idx)
+    }
+
+    /// Every account index that is NOT a same-organization sibling of `idx`: `idx` itself, and
+    /// every account whose organization ([`identity::org_key_of`]) differs from `idx`'s or is
+    /// unknown. Adding this set to a request's `tried` leaves only the siblings selectable, which
+    /// is how a released conversation is steered to a seat where its thinking survives (see this
+    /// module's doc).
+    ///
+    /// When `idx` names no account, or its organization is unknown, no account can be shown to
+    /// share it, so the set is every index and nothing is left to select.
+    pub fn outside_org_of(&self, idx: usize) -> HashSet<usize> {
+        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let org = accounts
+            .get(idx)
+            .and_then(|a| identity::org_key_of(a.org_uuid.as_deref(), a.org_name.as_deref()));
+        accounts
+            .iter()
+            .enumerate()
+            .filter(|&(i, a)| {
+                i == idx
+                    || org.is_none()
+                    || identity::org_key_of(a.org_uuid.as_deref(), a.org_name.as_deref()) != org
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Whether `tokens` name more than one distinct account — the disagreement
