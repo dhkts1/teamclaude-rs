@@ -2659,22 +2659,32 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // A conversation whose history carries ACCOUNT-BOUND state is served by the account that
     // minted that state for as long as that account can hold it.
     //
-    // An advisor result decrypts only on the org that produced it, a `thinking` signature is an
-    // attestation that org signed, and the thread state behind a `previous_message_id` lives on
-    // that account alone. Another account answers the first such request with a 400 or a 404:
-    // measured 2026-09-20..22 over 173k calls, 8,322 advisor 400s, 170 thinking 400s and 66
-    // thread-state 404s, each cluster starting where a pinned conversation was diverted (4,420
-    // diverts in the same window). So while the bound account can serve, a sibling is the wrong
-    // answer, and a short wait on the bound account is the right one.
+    // An advisor result decrypts only on the org that produced it, and the thread state behind a
+    // `previous_message_id` lives on that account alone: another account answers the first such
+    // request with a 400 or a 404 (measured 2026-09-20..22 over 173k calls, 8,322 advisor 400s
+    // and 66 thread-state 404s, each cluster starting where a pinned conversation was diverted;
+    // 4,420 diverts in the same window). So while the bound account can serve, a sibling is the
+    // wrong answer, and a short wait on the bound account is the right one.
     //
-    // But the rejection is not fatal. Claude Code recovers from each of the three in one extra
-    // round trip: it strips the thinking blocks, strips the advisor blocks, or replays the full
-    // history as a new thread (see `crate::manager::bound_tokens`'s module doc for where that was
-    // read). So the hold ends where the bound account stops being able to serve soon — gone,
-    // `rejected`, or held past the cache's life (`Manager::bound_account_holds`). Past that
-    // point a hold is a 429 on every turn until the account resets, possibly for days, and
-    // `/compact` does not clear it, because the thread id survives the compaction (2026-09-22:
-    // one `rejected` account held one conversation at 6-11 refusals a minute).
+    // A `thinking` block is different, and it depends on the model. The same September window
+    // counted 170 thinking 400s; measured 2026-10-10 by replaying one block unchanged on another
+    // account, the current models answer 200 instead:
+    //
+    //  - Opus 5.5 keeps the block on any account, in any org. Its hold earns its keep through the
+    //    warm prompt cache, which is what `switch_warning` tells the client a move costs.
+    //  - Sonnet 5.5 and Haiku 5.5 keep it on another seat in the minting account's org, and on an
+    //    account in another org DROP it silently: a 200, no error, the earlier reasoning gone,
+    //    and nothing for the client to recover from. Hence the release below prefers a same-org
+    //    seat for those two (`same_org_release`, `crate::model::thinking_is_org_bound`).
+    //
+    // The advisor and thread-state rejections are not fatal. Claude Code recovers from each in
+    // one extra round trip: it strips the advisor blocks, or replays the full history as a new
+    // thread (see `crate::manager::bound_tokens`'s module doc for where that was read). So the
+    // hold ends where the bound account stops being able to serve soon — gone, `rejected`, or
+    // held past the cache's life (`Manager::bound_account_holds`). Past that point a hold is a
+    // 429 on every turn until the account resets, possibly for days, and `/compact` does not
+    // clear it, because the thread id survives the compaction (2026-09-22: one `rejected`
+    // account held one conversation at 6-11 refusals a minute).
     //
     // Enforced by BENCHING every other account into `tried`, exactly as the account-set scope
     // above does and for the same three reasons — it can only narrow, the affinity fast-path
@@ -2723,6 +2733,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // enforcement on this path. Clearing `tried` wholesale served a lease scoped to one
     // account on another (found in review, 2026-09-24).
     let mut benched_for_hold: Vec<usize> = Vec::new();
+    // A same-organization sibling a released conversation is sent to first (`same_org_release`),
+    // already selected, so it seeds `next_idx` below.
+    let mut released_to: Option<usize> = None;
     if let Some((bound_idx, via)) = bound_candidate {
         let now = OffsetDateTime::now_utc();
         // A session already told this conversation is moving off `bound_idx` moves, even if the
@@ -2776,8 +2789,24 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 gated = ?manager
                     .exhaustion_hint_for_account(now, request_is_fable, bound_idx)
                     .gated,
-                "bound history's account cannot hold it; releasing the request to the fleet, \
-                 where the client recovers from the one rejection it gets"
+                "bound history's account cannot hold it; releasing the request to the fleet"
+            );
+            released_to = same_org_release(
+                &manager,
+                bound_idx,
+                &tried,
+                request_model.as_deref(),
+                |narrowed| {
+                    manager.select_with_group(
+                        narrowed,
+                        now,
+                        request_model.as_deref(),
+                        session_key,
+                        &path,
+                        conn_key,
+                        request_group.as_deref(),
+                    )
+                },
             );
         }
     }
@@ -2839,7 +2868,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let mut refused_403: Vec<(usize, Option<String>)> = Vec::new();
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = max_attempts_for(account_count);
-    // The account the NEXT iteration must use, bypassing select(). Two producers:
+    // The account the NEXT iteration must use, bypassing select(). Three producers:
     //
     //  - A genuine SAME-account retry (401 force-refresh, transient-429 inline wait,
     //    529 in-place backoff), which select() would otherwise rotate AWAY from the
@@ -2849,7 +2878,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //    select() next iteration would double its side effects (LRU stamp, divert
     //    log) and could race to a `None` after we already benched the 529'd account
     //    in `tried` — turning a forwardable 529 into a synthesized 429.
-    let mut next_idx: Option<usize> = None;
+    //  - A released conversation's same-organization sibling (`same_org_release`, here
+    //    and at the mid-request release), selected for the same reason as the failover.
+    let mut next_idx: Option<usize> = released_to;
     // One-shot guard: at most one transient-fleet-park soft-wait per client request.
     let mut soft_waited_exhaustion = false;
     // The subset of `tried` that is held out by a TRANSIENT 429 park and nothing
@@ -3213,6 +3244,23 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                         tried.remove(&idx);
                                     }
                                     bound_to = None;
+                                    next_idx = same_org_release(
+                                        &manager,
+                                        bound,
+                                        &tried,
+                                        request_model.as_deref(),
+                                        |narrowed| {
+                                            manager.select_with_group(
+                                                narrowed,
+                                                now,
+                                                request_model.as_deref(),
+                                                session_key,
+                                                &path,
+                                                conn_key,
+                                                request_group.as_deref(),
+                                            )
+                                        },
+                                    );
                                     continue;
                                 }
                             }
@@ -5896,6 +5944,47 @@ fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
         | GateReason::Reserved
         | GateReason::Parked => None,
     }
+}
+
+/// Where a released conversation goes first when its model's thinking survives only inside the
+/// bound account's organization ([`crate::model::thinking_is_org_bound`]): `Some(idx)` names a
+/// same-organization sibling of `bound_idx` that this request may use, and the caller serves on
+/// it without selecting again; `None` leaves the pick to the ordinary rotation, unchanged.
+///
+/// `select` is the request's own [`Manager::select_with_group`] call with `tried` left open,
+/// called once with the request's `tried` plus every account outside the bound account's
+/// organization ([`Manager::outside_org_of`], which also holds `bound_idx`). So every rule of
+/// the ordinary pick (groups, reservations, pacing, the control account, the session's pin)
+/// still applies, only to the siblings. That call mutates nothing when it answers `None`; when
+/// it answers `Some` it does what any selection does (the LRU stamp, the session's pin or
+/// divert record), which is why the caller passes the index on as `next_idx` and the loop does
+/// not select a second time.
+///
+/// Logs one line for every release of an org-bound model's conversation, `same_org` or
+/// `cross_org`; `cross_org` means the API will drop the conversation's earlier thinking. Other
+/// models log nothing here and are never steered.
+fn same_org_release(
+    manager: &Manager,
+    bound_idx: usize,
+    tried: &HashSet<usize>,
+    model: Option<&str>,
+    select: impl FnOnce(&HashSet<usize>) -> Option<usize>,
+) -> Option<usize> {
+    let model = model.filter(|m| crate::model::thinking_is_org_bound(m))?;
+    let mut narrowed = manager.outside_org_of(bound_idx);
+    narrowed.extend(tried.iter().copied());
+    let picked = select(&narrowed);
+    tracing::info!(
+        outcome = if picked.is_some() {
+            "same_org"
+        } else {
+            "cross_org"
+        },
+        model,
+        from = manager.account_name(bound_idx).as_deref().unwrap_or("?"),
+        "releasing a conversation whose thinking is bound to its organization"
+    );
+    picked
 }
 
 /// How long the client is asked to wait before retrying [`switch_warning`]'s 429.
@@ -11891,6 +11980,171 @@ mod tests {
             "served by the sibling, not the held pin"
         );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Three accounts over `upstream` in two organizations: alice (index 0, `at-aaaaaaaaaaaa`)
+    /// and carol (index 2, `at-cccccccccccc`) share one, bob (index 1, `at-bbbbbbbbbbbb`) is in
+    /// the other. Priority order is alice, bob, carol, so with alice out the ordinary pick
+    /// chooses bob, the OTHER organization, and only a same-organization preference picks carol.
+    fn two_orgs_over(upstream: &str, carol_disabled: bool) -> Config {
+        let mut config = two_accounts_over(upstream, &[false, false]);
+        let mut carol = config.accounts[0].clone();
+        carol.name = "carol@example.com".to_string();
+        carol.account_uuid = Some("44444444-c".to_string());
+        carol.access_token = "at-cccccccccccc".to_string();
+        carol.refresh_token = Some("rt-cccccccccccc".to_string());
+        carol.priority = Some(2);
+        carol.disabled = carol_disabled.then_some(true);
+        config.accounts.push(carol);
+        config
+    }
+
+    /// The `authorization` that served one turn of a conversation bound to alice by a thinking
+    /// signature she minted, with alice on a hold past the cache's life, so the turn is released
+    /// before the loop (the pre-loop release site). No session key, so no switch warning: the
+    /// release happens in this one request.
+    async fn released_turn_served_by(model: &str, carol_disabled: bool) -> String {
+        let (upstream, hits, seen) = spawn_bound_upstream().await;
+        let manager = Manager::with_live_refresher(two_orgs_over(&upstream, carol_disabled), None);
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+        manager.mark_rate_limited(0, 600);
+        let body = with_body_field(
+            &thinking_turn_body("sess-org", &["sig_held"]),
+            "model",
+            serde_json::json!(model),
+        );
+        let (status, response) = drive_unkeyed(Arc::clone(&manager), &body, &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "released and served: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let served = seen.lock().expect("recorder")[0].clone();
+        served
+    }
+
+    /// Sonnet 5.5 keeps a thinking block only inside the organization that minted it
+    /// (`crate::model::thinking_is_org_bound`), so a released conversation goes to the
+    /// same-organization seat even though the ordinary pick would choose the other organization.
+    #[tokio::test]
+    async fn a_released_sonnet_5_5_conversation_goes_to_a_same_org_seat() {
+        let served = released_turn_served_by("claude-sonnet-5-5", false).await;
+        assert!(
+            served.contains("at-cccccccccccc"),
+            "served by carol, alice's organization: {served}"
+        );
+    }
+
+    /// Opus 5.5 keeps a thinking block on any account, so its release is not steered: the
+    /// ordinary pick serves it, on the other organization.
+    #[tokio::test]
+    async fn a_released_opus_5_5_conversation_takes_the_ordinary_pick() {
+        let served = released_turn_served_by("claude-opus-5-5", false).await;
+        assert!(
+            served.contains("at-bbbbbbbbbbbb"),
+            "served by bob, the ordinary pick: {served}"
+        );
+    }
+
+    /// With no usable seat in the bound account's organization, a Sonnet 5.5 release falls back
+    /// to the ordinary pick rather than failing.
+    #[tokio::test]
+    async fn a_sonnet_5_5_release_with_no_same_org_seat_takes_the_ordinary_pick() {
+        let served = released_turn_served_by("claude-sonnet-5-5", true).await;
+        assert!(
+            served.contains("at-bbbbbbbbbbbb"),
+            "served by bob, the only account left: {served}"
+        );
+    }
+
+    /// The mid-request release site: alice holds the conversation, her upstream answers a
+    /// `rejected` 429 during the request, and the request (no session key, so no warning) is
+    /// released inside it. Sonnet 5.5 goes to carol, alice's organization, not to bob.
+    #[tokio::test]
+    async fn a_sonnet_5_5_conversation_released_mid_request_goes_to_a_same_org_seat() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let reset = (crate::now_ms() / 1000 + 3600).to_string();
+        let upstream = Router::new().fallback(move |req: Request| {
+            let (recorder, reset) = (Arc::clone(&recorder), reset.clone());
+            async move {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                recorder
+                    .lock()
+                    .expect("upstream recorder poisoned")
+                    .push(auth.clone());
+                if auth.contains("at-aaaaaaaaaaaa") {
+                    return Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("retry-after", "3600")
+                        .header("anthropic-ratelimit-unified-status", "rejected")
+                        .header("anthropic-ratelimit-unified-5h-status", "rejected")
+                        .header("anthropic-ratelimit-unified-5h-utilization", "1.0")
+                        .header("anthropic-ratelimit-unified-5h-reset", reset)
+                        .body(Body::from(
+                            r#"{"type":"error","error":{"type":"rate_limit_error","message":"out"}}"#,
+                        ))
+                        .expect("429 response");
+                }
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"msg_fake_ok","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+                    ))
+                    .expect("200 response")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let addr = listener.local_addr().expect("upstream addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        let manager =
+            Manager::with_live_refresher(two_orgs_over(&format!("http://{addr}"), false), None);
+        manager.record_bound_tokens(
+            &[(BoundTokenKind::ThinkingSignature, "sig_held".to_string())],
+            0,
+            crate::now_ms(),
+        );
+        let body = with_body_field(
+            &thinking_turn_body("sess-org-mid", &["sig_held"]),
+            "model",
+            serde_json::json!("claude-sonnet-5-5"),
+        );
+
+        let (status, response) = drive_unkeyed(Arc::clone(&manager), &body, &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "released in the same request: {}",
+            String::from_utf8_lossy(&response)
+        );
+        let seen = seen.lock().expect("recorder").clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "alice refused it, then one account served it"
+        );
+        assert!(seen[0].contains("at-aaaaaaaaaaaa"), "alice was asked first");
+        assert!(
+            seen[1].contains("at-cccccccccccc"),
+            "served by carol, alice's organization: {}",
+            seen[1]
+        );
     }
 
     /// `body` with one top-level field set, for the two places a request names thread state.
